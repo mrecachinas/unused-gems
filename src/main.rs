@@ -107,7 +107,7 @@ fn main() {
     let file_cache = if cli.no_cache {
         Arc::new(cache::FileCache::disabled())
     } else {
-        Arc::new(cache::FileCache::load(&dir))
+        Arc::new(timed!("cache_load", cache::FileCache::load(&dir)))
     };
 
     // 1. Parse Gemfile
@@ -131,11 +131,16 @@ fn main() {
     ));
 
     // Apply cache updates from the walk
-    drop(file_cache); // release Arc so we can get_mut or reconstruct
-    let mut file_cache = if cli.no_cache {
-        cache::FileCache::disabled()
-    } else {
-        cache::FileCache::load(&dir)
+    // Unwrap Arc or reload if still shared (ignore crate may hold a ref)
+    let mut file_cache = match Arc::try_unwrap(file_cache) {
+        Ok(fc) => fc,
+        Err(_arc) => {
+            if cli.no_cache {
+                cache::FileCache::disabled()
+            } else {
+                timed!("cache_reload", cache::FileCache::load(&dir))
+            }
+        }
     };
     for (rel_path, mtime, size, reqs, mods, bgroups, breq_all) in cache_updates {
         file_cache.put(rel_path, mtime, size, &reqs, mods, &bgroups, breq_all);
@@ -278,7 +283,7 @@ fn main() {
     if let Some(ref baseline_path) = cli.diff {
         let unused_count = diff::print_diff(&results, baseline_path);
         // Save cache before exit
-        file_cache.save();
+        timed!("cache_save", file_cache.save());
         std::process::exit(if unused_count == 0 { 0 } else { 1 });
     }
 
@@ -290,7 +295,7 @@ fn main() {
     };
 
     // Save cache
-    file_cache.save();
+    timed!("cache_save", file_cache.save());
 
     std::process::exit(if unused_count == 0 { 0 } else { 1 });
 }
