@@ -20,6 +20,7 @@ static INHERIT_GEM_RE: Lazy<Regex> =
 static INHERIT_GEM_KEY_RE: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"(?m)^\s+([\w-]+):").unwrap());
 
+#[cfg(test)]
 const SCANNABLE_EXTENSIONS: &[&str] = &[
     ".rb", ".rake", ".gemspec", ".ru", ".erb", ".haml", ".slim", ".jbuilder", ".builder", ".rabl",
     ".thor", ".yml", ".yaml",
@@ -45,11 +46,6 @@ const DEFAULT_SKIP_DIRS: &[&str] = &[
     "coverage",
     "pkg",
     "doc",
-];
-
-const RUBY_EXTS: &[&str] = &[
-    ".rb", ".rake", ".gemspec", ".ru", ".erb", ".haml", ".slim", ".jbuilder", ".builder", ".rabl",
-    ".thor",
 ];
 
 // ── Hand-rolled byte scanners (memchr + manual parsing) ──────────────────────
@@ -605,6 +601,7 @@ pub fn scan_source_tree(dir: &Path, skip_dirs: &[&str], cache: Arc<crate::cache:
 
     let mut builder = ignore::WalkBuilder::new(dir);
     builder
+        .threads(std::thread::available_parallelism().map_or(8, |n| n.get()))
         .standard_filters(false)
         .git_ignore(true)
         .git_global(false)
@@ -702,8 +699,8 @@ pub fn scan_source_tree(dir: &Path, skip_dirs: &[&str], cache: Arc<crate::cache:
 
                     // Check if it's a scannable source file
                     if is_scannable(&path_str, path) {
-                        // Try cache first
-                        let metadata = std::fs::metadata(path).ok();
+                        // Use metadata from DirEntry (avoids redundant stat syscall)
+                        let metadata = entry.metadata().ok();
                         let cache_hit = if use_cache {
                             if let Some(ref md) = metadata {
                                 let mtime = md.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
@@ -838,33 +835,53 @@ pub fn default_skip_dirs() -> Vec<&'static str> {
     DEFAULT_SKIP_DIRS.to_vec()
 }
 
-fn is_scannable(path: &str, full_path: &Path) -> bool {
-    let ext = Path::new(path)
-        .extension()
-        .map(|e| format!(".{}", e.to_string_lossy().to_lowercase()))
-        .unwrap_or_default();
-    let basename = Path::new(path)
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_default();
-
-    if SCANNABLE_EXTENSIONS.contains(&ext.as_str()) {
-        return true;
+fn is_scannable(_path: &str, full_path: &Path) -> bool {
+    // Fast extension check using byte-level comparison (no allocations)
+    if let Some(ext) = full_path.extension() {
+        let ext_bytes = ext.as_encoded_bytes();
+        let matches = match ext_bytes.len() {
+            2 => {
+                let lower: [u8; 2] = [ext_bytes[0] | 0x20, ext_bytes[1] | 0x20];
+                matches!(&lower, b"rb" | b"ru")
+            }
+            3 => {
+                let lower: [u8; 3] = [ext_bytes[0] | 0x20, ext_bytes[1] | 0x20, ext_bytes[2] | 0x20];
+                matches!(&lower, b"erb" | b"yml")
+            }
+            4 => {
+                let lower: [u8; 4] = [ext_bytes[0] | 0x20, ext_bytes[1] | 0x20, ext_bytes[2] | 0x20, ext_bytes[3] | 0x20];
+                matches!(&lower, b"rake" | b"haml" | b"slim" | b"rabl" | b"thor" | b"yaml")
+            }
+            7 => {
+                let ext_lower: Vec<u8> = ext_bytes.iter().map(|b| b | 0x20).collect();
+                ext_lower == b"gemspec" || ext_lower == b"builder"
+            }
+            8 => {
+                let ext_lower: Vec<u8> = ext_bytes.iter().map(|b| b | 0x20).collect();
+                ext_lower == b"jbuilder"
+            }
+            _ => false,
+        };
+        if matches { return true; }
     }
-    if SCANNABLE_FILENAMES.contains(&basename.as_str()) {
-        return true;
-    }
 
-    // Extensionless files with Ruby shebang
-    if ext.is_empty() && full_path.is_file() {
-        if let Ok(mut f) = std::fs::File::open(full_path) {
-            use std::io::Read;
-            let mut buf = [0u8; 64];
-            if let Ok(n) = f.read(&mut buf) {
-                let first_line = String::from_utf8_lossy(&buf[..n]);
-                if let Some(line) = first_line.lines().next() {
-                    if line.starts_with("#!") && line.contains("ruby") {
-                        return true;
+    if let Some(name) = full_path.file_name() {
+        let name_bytes = name.as_encoded_bytes();
+        if SCANNABLE_FILENAMES.iter().any(|f| f.as_bytes() == name_bytes) {
+            return true;
+        }
+        // Extensionless files with Ruby shebang
+        if full_path.extension().is_none() && full_path.is_file() {
+            if let Ok(mut f) = std::fs::File::open(full_path) {
+                use std::io::Read;
+                let mut buf = [0u8; 64];
+                if let Ok(n) = f.read(&mut buf) {
+                    if let Some(nl) = memchr::memchr(b'\n', &buf[..n]) {
+                        if n >= 2 && buf[0] == b'#' && buf[1] == b'!' {
+                            return buf[..nl].windows(4).any(|w| w == b"ruby");
+                        }
+                    } else if n >= 2 && buf[0] == b'#' && buf[1] == b'!' {
+                        return buf[..n].windows(4).any(|w| w == b"ruby");
                     }
                 }
             }
@@ -892,16 +909,30 @@ fn scan_file(path: &str, dir: &str, thread_modules: &mut HashMap<String, HashSet
         .display()
         .to_string();
 
-    let ext = Path::new(path)
-        .extension()
-        .map(|e| format!(".{}", e.to_string_lossy().to_lowercase()))
-        .unwrap_or_default();
-    let basename = Path::new(path)
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_default();
-
-    let is_ruby = RUBY_EXTS.contains(&ext.as_str()) || SCANNABLE_FILENAMES.contains(&basename.as_str());
+    let full_path = Path::new(path);
+    let is_ruby = if let Some(ext) = full_path.extension() {
+        let ext_bytes = ext.as_encoded_bytes();
+        match ext_bytes.len() {
+            2 => { let l = [ext_bytes[0] | 0x20, ext_bytes[1] | 0x20]; matches!(&l, b"rb" | b"ru") }
+            4 => { let l = [ext_bytes[0] | 0x20, ext_bytes[1] | 0x20, ext_bytes[2] | 0x20, ext_bytes[3] | 0x20]; matches!(&l, b"rake" | b"haml" | b"slim" | b"rabl" | b"thor") }
+            7 => { let l: Vec<u8> = ext_bytes.iter().map(|b| b | 0x20).collect(); l == b"gemspec" || l == b"builder" }
+            8 => { let l: Vec<u8> = ext_bytes.iter().map(|b| b | 0x20).collect(); l == b"jbuilder" }
+            _ => false,
+        }
+    } else {
+        let name_bytes = full_path.file_name().map(|n| n.as_encoded_bytes()).unwrap_or(b"");
+        SCANNABLE_FILENAMES.iter().any(|f| f.as_bytes() == name_bytes)
+    };
+    let is_yaml = if let Some(ext) = full_path.extension() {
+        let ext_bytes = ext.as_encoded_bytes();
+        match ext_bytes.len() {
+            3 => { let l = [ext_bytes[0] | 0x20, ext_bytes[1] | 0x20, ext_bytes[2] | 0x20]; l == *b"yml" }
+            4 => { let l = [ext_bytes[0] | 0x20, ext_bytes[1] | 0x20, ext_bytes[2] | 0x20, ext_bytes[3] | 0x20]; l == *b"yaml" }
+            _ => false,
+        }
+    } else {
+        false
+    };
 
     // Precompute block comment ranges for Ruby files (single pass)
     let block_ranges = if is_ruby {
@@ -922,7 +953,7 @@ fn scan_file(path: &str, dir: &str, thread_modules: &mut HashMap<String, HashSet
     scan_modules_filtered_into(bytes, is_ruby, &block_ranges, thread_modules, &rel_path);
 
     // YAML config patterns (keep regex — rarely hit, complex multiline patterns)
-    if ext == ".yml" || ext == ".yaml" {
+    if is_yaml {
         // Need &str for regex — borrow from bytes, no allocation if valid UTF-8
         let content_str = String::from_utf8_lossy(bytes);
         for cap in RUBOCOP_RE.captures_iter(&content_str) {
