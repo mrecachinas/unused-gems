@@ -585,7 +585,7 @@ pub fn scan_source_tree(dir: &Path, skip_dirs: &[&str]) -> ScanResults {
     let mut builder = ignore::WalkBuilder::new(dir);
     builder
         .standard_filters(false)
-        .git_ignore(false)
+        .git_ignore(true)
         .git_global(false)
         .git_exclude(false)
         .follow_links(false)
