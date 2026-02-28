@@ -17,24 +17,29 @@ High-performance scanner for unused gems in Ruby projects, built in Rust with [r
 
 ### Prebuilt binaries
 
-Download the latest release for your platform from [GitHub Releases](https://github.com/mrecachinas/unused-gems/releases):
+Download the latest release for your platform from [GitHub Releases](https://github.com/mrecachinas/unused-gems/releases).
+
+Requires [GitHub CLI](https://cli.github.com/) (`gh`):
 
 ```bash
 # macOS (Apple Silicon)
-curl -sL https://github.com/mrecachinas/unused-gems/releases/latest/download/unused-gems-aarch64-apple-darwin.tar.gz | tar xz
-sudo mv unused-gems /usr/local/bin/
+gh release download --repo mrecachinas/unused-gems --pattern 'unused-gems-aarch64-apple-darwin.tar.gz'
+tar xzf unused-gems-aarch64-apple-darwin.tar.gz && sudo mv unused-gems /usr/local/bin/
 
 # macOS (Intel)
-curl -sL https://github.com/mrecachinas/unused-gems/releases/latest/download/unused-gems-x86_64-apple-darwin.tar.gz | tar xz
-sudo mv unused-gems /usr/local/bin/
+gh release download --repo mrecachinas/unused-gems --pattern 'unused-gems-x86_64-apple-darwin.tar.gz'
+tar xzf unused-gems-x86_64-apple-darwin.tar.gz && sudo mv unused-gems /usr/local/bin/
 
 # Linux (x86_64)
-curl -sL https://github.com/mrecachinas/unused-gems/releases/latest/download/unused-gems-x86_64-unknown-linux-gnu.tar.gz | tar xz
-sudo mv unused-gems /usr/local/bin/
+gh release download --repo mrecachinas/unused-gems --pattern 'unused-gems-x86_64-unknown-linux-gnu.tar.gz'
+tar xzf unused-gems-x86_64-unknown-linux-gnu.tar.gz && sudo mv unused-gems /usr/local/bin/
 
 # Linux (aarch64)
-curl -sL https://github.com/mrecachinas/unused-gems/releases/latest/download/unused-gems-aarch64-unknown-linux-gnu.tar.gz | tar xz
-sudo mv unused-gems /usr/local/bin/
+gh release download --repo mrecachinas/unused-gems --pattern 'unused-gems-aarch64-unknown-linux-gnu.tar.gz'
+tar xzf unused-gems-aarch64-unknown-linux-gnu.tar.gz && sudo mv unused-gems /usr/local/bin/
+
+# Windows (x86_64) — extract unused-gems.exe from zip
+gh release download --repo mrecachinas/unused-gems --pattern 'unused-gems-x86_64-pc-windows-msvc.zip'
 ```
 
 ### Build from source
