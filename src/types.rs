@@ -13,7 +13,6 @@ pub struct GemEntry {
 pub struct FileResult {
     pub rel_path: String,
     pub requires: Vec<String>,
-    pub modules: Vec<String>,
     pub bundler_groups: Vec<String>,
     pub bundler_require_all: bool,
 }

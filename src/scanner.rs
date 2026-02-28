@@ -68,14 +68,18 @@ fn skip_whitespace(bytes: &[u8], mut i: usize) -> usize {
 }
 
 /// Check if position `pos` is on a line that starts with `#` (after whitespace).
-/// Walks backward to find the line start, then forward to first non-whitespace.
+/// Uses SIMD-accelerated memrchr to find line start.
 #[inline]
 fn is_line_comment(bytes: &[u8], pos: usize) -> bool {
-    // Walk backward to find line start
-    let mut line_start = pos;
-    while line_start > 0 && bytes[line_start - 1] != b'\n' {
-        line_start -= 1;
-    }
+    // SIMD-accelerated backward scan for newline
+    let line_start = if pos == 0 {
+        0
+    } else {
+        match memchr::memrchr(b'\n', &bytes[..pos]) {
+            Some(nl) => nl + 1,
+            None => 0,
+        }
+    };
     // Skip leading whitespace
     let mut i = line_start;
     while i < bytes.len() && (bytes[i] == b' ' || bytes[i] == b'\t') {
@@ -502,15 +506,22 @@ fn scan_gem_bin_filtered(bytes: &[u8], is_ruby: bool, block_ranges: &[(usize, us
     }
 }
 
-fn scan_modules_filtered(bytes: &[u8], is_ruby: bool, block_ranges: &[(usize, usize)], results: &mut Vec<String>) {
+fn scan_modules_filtered_into(
+    bytes: &[u8], is_ruby: bool, block_ranges: &[(usize, usize)],
+    modules: &mut HashMap<String, HashSet<String>>, rel_path: &str,
+) {
     if !is_ruby {
-        return scan_modules(bytes, results);
+        let mut results = Vec::new();
+        scan_modules(bytes, &mut results);
+        for name in results {
+            modules.entry(name).or_default().insert(rel_path.to_string());
+        }
+        return;
     }
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i].is_ascii_uppercase() && (i == 0 || !is_word_char(bytes[i - 1])) {
             if is_commented(bytes, i, block_ranges) {
-                // Skip to end of line
                 while i < bytes.len() && bytes[i] != b'\n' { i += 1; }
                 continue;
             }
@@ -536,8 +547,14 @@ fn scan_modules_filtered(bytes: &[u8], is_ruby: bool, block_ranges: &[(usize, us
                 continue;
             }
             if match_end > start {
-                if let Ok(name) = std::str::from_utf8(&bytes[start..match_end]) {
-                    results.push(name.to_string());
+                let slice = &bytes[start..match_end];
+                // Only allocate if this is a new module name (HashMap deduplicates)
+                if let Some(files) = modules.get_mut(std::str::from_utf8(slice).unwrap_or("")) {
+                    files.insert(rel_path.to_string());
+                } else if let Ok(name) = std::str::from_utf8(slice) {
+                    let mut files = HashSet::new();
+                    files.insert(rel_path.to_string());
+                    modules.insert(name.to_string(), files);
                 }
             }
             if i <= match_end { i = match_end; }
@@ -578,9 +595,13 @@ fn scan_bundler_require_filtered(
     }
 }
 
-pub fn scan_source_tree(dir: &Path, skip_dirs: &[&str]) -> ScanResults {
+/// Type alias for cache update entries collected during the walk
+pub type CacheUpdate = (String, std::time::SystemTime, u64, Vec<String>, Vec<String>, Vec<String>, bool);
+
+pub fn scan_source_tree(dir: &Path, skip_dirs: &[&str], cache: Arc<crate::cache::FileCache>) -> (ScanResults, Vec<CacheUpdate>) {
     let skip_set: HashSet<String> = skip_dirs.iter().map(|s| s.to_string()).collect();
     let dir_str = dir.to_string_lossy().to_string();
+    let use_cache = cache.is_enabled();
 
     let mut builder = ignore::WalkBuilder::new(dir);
     builder
@@ -605,42 +626,72 @@ pub fn scan_source_tree(dir: &Path, skip_dirs: &[&str]) -> ScanResults {
     // Also collects script files for later gem-name matching (single walk)
     let results = Arc::new(Mutex::new(Vec::<FileResult>::new()));
     let script_files = Arc::new(Mutex::new(Vec::<(String, Vec<u8>)>::new()));
+    let thread_modules = Arc::new(Mutex::new(Vec::<HashMap<String, HashSet<String>>>::new()));
+    // Cache updates collected per-thread, merged after walk
+    let cache_updates = Arc::new(Mutex::new(Vec::<(String, std::time::SystemTime, u64, Vec<String>, Vec<String>, Vec<String>, bool)>::new()));
     let results_clone = Arc::clone(&results);
     let scripts_clone = Arc::clone(&script_files);
+    let modules_clone = Arc::clone(&thread_modules);
+    let cache_updates_clone = Arc::clone(&cache_updates);
+    let cache_for_walk = Arc::clone(&cache);
     let dir_str_shared = Arc::new(dir_str);
 
     builder.build_parallel().run(move || {
         let shared = Arc::clone(&results_clone);
         let scripts = Arc::clone(&scripts_clone);
+        let modules_shared = Arc::clone(&modules_clone);
+        let cache_shared = Arc::clone(&cache_for_walk);
+        let cache_puts = Arc::clone(&cache_updates_clone);
         let dir_ref = Arc::clone(&dir_str_shared);
         struct FlushBuf {
             buf: Vec<FileResult>,
             script_buf: Vec<(String, Vec<u8>)>,
+            cache_buf: Vec<(String, std::time::SystemTime, u64, Vec<String>, Vec<String>, Vec<String>, bool)>,
             shared: Arc<Mutex<Vec<FileResult>>>,
             scripts: Arc<Mutex<Vec<(String, Vec<u8>)>>>,
+            modules_shared: Arc<Mutex<Vec<HashMap<String, HashSet<String>>>>>,
+            cache_puts: Arc<Mutex<Vec<(String, std::time::SystemTime, u64, Vec<String>, Vec<String>, Vec<String>, bool)>>>,
+            // Thread-local module accumulator: maps module_name → set of rel_paths
+            local_modules: HashMap<String, HashSet<String>>,
         }
-        impl Drop for FlushBuf {
-            fn drop(&mut self) {
+        impl FlushBuf {
+            fn flush_results(&mut self) {
                 if !self.buf.is_empty() {
                     self.shared.lock().unwrap().append(&mut self.buf);
                 }
                 if !self.script_buf.is_empty() {
                     self.scripts.lock().unwrap().append(&mut self.script_buf);
                 }
+                if !self.cache_buf.is_empty() {
+                    self.cache_puts.lock().unwrap().append(&mut self.cache_buf);
+                }
+            }
+        }
+        impl Drop for FlushBuf {
+            fn drop(&mut self) {
+                self.flush_results();
+                if !self.local_modules.is_empty() {
+                    let modules = std::mem::take(&mut self.local_modules);
+                    self.modules_shared.lock().unwrap().push(modules);
+                }
             }
         }
         let mut flush_buf = FlushBuf {
             buf: Vec::new(),
             script_buf: Vec::new(),
+            cache_buf: Vec::new(),
             shared: Arc::clone(&shared),
             scripts: Arc::clone(&scripts),
+            modules_shared: Arc::clone(&modules_shared),
+            cache_puts: Arc::clone(&cache_puts),
+            local_modules: HashMap::new(),
         };
         Box::new(move |result| {
             if let Ok(entry) = result {
                 if entry.file_type().map_or(false, |ft| ft.is_file()) {
                     let path = entry.path();
                     let path_str = path.to_string_lossy().to_string();
-                    let rel_path = path
+                    let rel_path_cow = path
                         .strip_prefix(dir_ref.as_str())
                         .unwrap_or(path)
                         .to_string_lossy();
@@ -651,18 +702,69 @@ pub fn scan_source_tree(dir: &Path, skip_dirs: &[&str]) -> ScanResults {
 
                     // Check if it's a scannable source file
                     if is_scannable(&path_str, path) {
-                        if let Some(file_result) = scan_file(&path_str, &dir_ref) {
-                            flush_buf.buf.push(file_result);
-                            if flush_buf.buf.len() >= 64 {
-                                shared.lock().unwrap().append(&mut flush_buf.buf);
+                        // Try cache first
+                        let metadata = std::fs::metadata(path).ok();
+                        let cache_hit = if use_cache {
+                            if let Some(ref md) = metadata {
+                                let mtime = md.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+                                cache_shared.get(&rel_path_cow, mtime, md.len())
+                            } else {
+                                None
                             }
+                        } else {
+                            None
+                        };
+
+                        if let Some((requires, modules, bundler_groups, bundler_require_all)) = cache_hit {
+                            // Cache hit: reconstruct FileResult + modules without reading file
+                            let rel = rel_path_cow.to_string();
+                            for m in &modules {
+                                flush_buf.local_modules
+                                    .entry(m.clone())
+                                    .or_default()
+                                    .insert(rel.clone());
+                            }
+                            flush_buf.buf.push(FileResult {
+                                rel_path: rel,
+                                requires,
+                                bundler_groups,
+                                bundler_require_all,
+                            });
+                        } else {
+                            // Cache miss: scan file
+                            
+                            if let Some(file_result) = scan_file(&path_str, &dir_ref, &mut flush_buf.local_modules) {
+                                // Collect new modules added by this file for cache
+                                if use_cache {
+                                    if let Some(ref md) = metadata {
+                                        let mtime = md.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+                                        let new_modules: Vec<String> = flush_buf.local_modules.iter()
+                                            .filter(|(_, files)| files.contains(&file_result.rel_path))
+                                            .map(|(name, _)| name.clone())
+                                            .collect();
+                                        flush_buf.cache_buf.push((
+                                            file_result.rel_path.clone(),
+                                            mtime,
+                                            md.len(),
+                                            file_result.requires.clone(),
+                                            new_modules,
+                                            file_result.bundler_groups.clone(),
+                                            file_result.bundler_require_all,
+                                        ));
+                                    }
+                                }
+                                flush_buf.buf.push(file_result);
+                            }
+                        }
+                        if flush_buf.buf.len() >= 64 {
+                            shared.lock().unwrap().append(&mut flush_buf.buf);
                         }
                     }
 
                     // Check if it's a script file (can be both — e.g. bin/setup is scannable + script)
-                    if crate::scripts::is_script_file(&rel_path, &file_name) {
+                    if crate::scripts::is_script_file(&rel_path_cow, &file_name) {
                         if let Ok(content) = std::fs::read(path) {
-                            flush_buf.script_buf.push((rel_path.to_string(), content));
+                            flush_buf.script_buf.push((rel_path_cow.to_string(), content));
                             if flush_buf.script_buf.len() >= 32 {
                                 scripts.lock().unwrap().append(&mut flush_buf.script_buf);
                             }
@@ -678,6 +780,11 @@ pub fn scan_source_tree(dir: &Path, skip_dirs: &[&str]) -> ScanResults {
         .map(|m| m.into_inner().unwrap_or_default())
         .unwrap_or_default();
 
+    // Merge thread-local module maps into global map
+    let all_thread_modules = Arc::try_unwrap(thread_modules)
+        .map(|m| m.into_inner().unwrap_or_default())
+        .unwrap_or_default();
+
     let mut requires: HashMap<String, HashSet<String>> = HashMap::new();
     let mut modules: HashMap<String, HashSet<String>> = HashMap::new();
     let mut bundler_groups: HashSet<String> = HashSet::new();
@@ -690,12 +797,6 @@ pub fn scan_source_tree(dir: &Path, skip_dirs: &[&str]) -> ScanResults {
                 .or_default()
                 .insert(r.rel_path.clone());
         }
-        for m in &r.modules {
-            modules
-                .entry(m.clone())
-                .or_default()
-                .insert(r.rel_path.clone());
-        }
         for g in &r.bundler_groups {
             bundler_groups.insert(g.clone());
         }
@@ -704,21 +805,33 @@ pub fn scan_source_tree(dir: &Path, skip_dirs: &[&str]) -> ScanResults {
         }
     }
 
+    // Merge per-thread module maps (each module name allocated once per thread, not per file)
+    for thread_map in all_thread_modules {
+        for (module_name, files) in thread_map {
+            modules.entry(module_name).or_default().extend(files);
+        }
+    }
+
     if bundler_require_all {
         bundler_groups.insert("default".to_string());
     }
+
+    // Collect cache updates (applied by caller)
+    let all_cache_updates = Arc::try_unwrap(cache_updates)
+        .map(|m| m.into_inner().unwrap_or_default())
+        .unwrap_or_default();
 
     let all_script_files = Arc::try_unwrap(script_files)
         .map(|m| m.into_inner().unwrap_or_default())
         .unwrap_or_default();
 
-    ScanResults {
+    (ScanResults {
         requires,
         modules,
         bundler_groups,
         bundler_require_all,
         script_files: all_script_files,
-    }
+    }, all_cache_updates)
 }
 
 pub fn default_skip_dirs() -> Vec<&'static str> {
@@ -763,7 +876,7 @@ fn is_scannable(path: &str, full_path: &Path) -> bool {
 
 // (FileContent enum removed — plain read() is faster for single sequential reads)
 
-fn scan_file(path: &str, dir: &str) -> Option<FileResult> {
+fn scan_file(path: &str, dir: &str, thread_modules: &mut HashMap<String, HashSet<String>>) -> Option<FileResult> {
     let metadata = std::fs::metadata(path).ok()?;
     if metadata.len() == 0 {
         return None;
@@ -798,7 +911,6 @@ fn scan_file(path: &str, dir: &str) -> Option<FileResult> {
     };
 
     let mut requires = Vec::new();
-    let mut mod_refs = Vec::new();
     let mut bundler_groups = Vec::new();
     let mut bundler_require_all = false;
 
@@ -806,7 +918,8 @@ fn scan_file(path: &str, dir: &str) -> Option<FileResult> {
     scan_requires_filtered(bytes, is_ruby, &block_ranges, &mut requires);
     scan_autoloads_filtered(bytes, is_ruby, &block_ranges, &mut requires);
     scan_gem_bin_filtered(bytes, is_ruby, &block_ranges, &mut requires);
-    scan_modules_filtered(bytes, is_ruby, &block_ranges, &mut mod_refs);
+    // Modules go directly into thread-local map (avoids per-file Vec<String> allocation)
+    scan_modules_filtered_into(bytes, is_ruby, &block_ranges, thread_modules, &rel_path);
 
     // YAML config patterns (keep regex — rarely hit, complex multiline patterns)
     if ext == ".yml" || ext == ".yaml" {
@@ -833,7 +946,6 @@ fn scan_file(path: &str, dir: &str) -> Option<FileResult> {
     Some(FileResult {
         rel_path,
         requires,
-        modules: mod_refs,
         bundler_groups,
         bundler_require_all,
     })

@@ -1,3 +1,4 @@
+mod cache;
 mod diff;
 mod gemfile;
 mod ignore;
@@ -10,6 +11,7 @@ mod scripts;
 mod types;
 
 use std::collections::HashSet;
+use std::sync::Arc;
 use std::path::Path;
 
 use clap::Parser;
@@ -48,6 +50,10 @@ struct Cli {
     /// Additional directories to skip (comma-separated)
     #[arg(long, value_delimiter = ',')]
     skip_dirs: Option<Vec<String>>,
+
+    /// Disable file cache (always scan all files fresh)
+    #[arg(long)]
+    no_cache: bool,
 
     /// Directory to scan (default: current directory)
     #[arg(default_value = ".")]
@@ -97,6 +103,13 @@ fn main() {
         eprintln!();
     }
 
+    // Load file cache
+    let file_cache = if cli.no_cache {
+        Arc::new(cache::FileCache::disabled())
+    } else {
+        Arc::new(cache::FileCache::load(&dir))
+    };
+
     // 1. Parse Gemfile
     let mut gems = timed!("parse_gemfile", gemfile::parse_gemfile(&dir));
     if !cli.quiet {
@@ -105,14 +118,26 @@ fn main() {
 
     // 2. Build gem index AND scan source tree concurrently
     let gem_names: Vec<String> = gems.iter().map(|g| g.name.clone()).collect();
-    let ((_gem_paths, gem_index), scan_results) = timed!("index+scan", rayon::join(
+    let cache_for_scan = Arc::clone(&file_cache);
+    let ((_gem_paths, gem_index), (scan_results, cache_updates)) = timed!("index+scan", rayon::join(
         || {
             let gp = introspect::find_gem_paths(&dir);
             let gi = introspect::build_gem_index(&gp);
             (gp, gi)
         },
-        || scanner::scan_source_tree(&dir, &skip_dirs),
+        || scanner::scan_source_tree(&dir, &skip_dirs, cache_for_scan),
     ));
+
+    // Apply cache updates from the walk
+    drop(file_cache); // release Arc so we can get_mut or reconstruct
+    let mut file_cache = if cli.no_cache {
+        cache::FileCache::disabled()
+    } else {
+        cache::FileCache::load(&dir)
+    };
+    for (rel_path, mtime, size, reqs, mods, bgroups, breq_all) in cache_updates {
+        file_cache.put(rel_path, mtime, size, &reqs, mods, &bgroups, breq_all);
+    }
 
     // 2b. Script scanning (uses files collected during source tree walk — no extra I/O)
     let script_refs = timed!("scan_scripts", scripts::scan_scripts_for_gem_usage(&dir, &gem_names, &gem_index, &scan_results.script_files));
@@ -238,6 +263,8 @@ fn main() {
     // 8. Diff mode: compare and exit
     if let Some(ref baseline_path) = cli.diff {
         let unused_count = diff::print_diff(&results, baseline_path);
+        // Save cache before exit
+        file_cache.save();
         std::process::exit(if unused_count == 0 { 0 } else { 1 });
     }
 
@@ -247,6 +274,9 @@ fn main() {
         "github" => output::print_results_github(&results, &dir, &lock_deps),
         _ => output::print_results_text(&results, cli.verbose, &lock_deps),
     };
+
+    // Save cache
+    file_cache.save();
 
     std::process::exit(if unused_count == 0 { 0 } else { 1 });
 }
