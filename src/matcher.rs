@@ -29,8 +29,8 @@ pub fn match_gem_usage(
 
     // Keep original module names for evidence reporting
     let modules_original: HashMap<String, &str> = modules
-        .iter()
-        .map(|(name, _)| (name.to_lowercase(), name.as_str()))
+        .keys()
+        .map(|name| (name.to_lowercase(), name.as_str()))
         .collect();
 
     let mut results = HashMap::new();
@@ -75,11 +75,7 @@ pub fn match_gem_usage(
             // Skip very short module names that cause false positives (e.g., "Cli", "Api")
             // UNLESS they match the gem name exactly (e.g. "aws", "jwt", "csv")
             if mod_down.len() < 4 {
-                let gem_simple = gem_entry
-                    .name
-                    .replace('-', "")
-                    .replace('_', "")
-                    .to_lowercase();
+                let gem_simple = gem_entry.name.replace(['-', '_'], "").to_lowercase();
                 if mod_down != gem_simple && mod_down != gem_entry.name.to_lowercase() {
                     continue;
                 }

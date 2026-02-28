@@ -233,9 +233,9 @@ fn main() {
         .enumerate()
         .filter(|(_, gem)| {
             gem.module_names.is_empty()
-                && results
+                && !results
                     .get(&gem.name)
-                    .map_or(true, |r| r.status != GemStatus::Used)
+                    .is_some_and(|r| r.status == GemStatus::Used)
         })
         .map(|(i, _)| i)
         .collect();

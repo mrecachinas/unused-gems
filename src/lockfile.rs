@@ -31,7 +31,7 @@ pub fn parse_gemfile_lock(dir: &Path) -> HashMap<String, Vec<String>> {
 
         // Top-level gem: "    gem_name (version)"
         if line.starts_with("    ") && !line.starts_with("      ") {
-            if let Some(name) = line.trim().split_whitespace().next() {
+            if let Some(name) = line.split_whitespace().next() {
                 current_gem = Some(name.to_string());
                 deps.entry(name.to_string()).or_default();
             }
@@ -39,7 +39,7 @@ pub fn parse_gemfile_lock(dir: &Path) -> HashMap<String, Vec<String>> {
         // Dependency: "      dep_name (version_constraint)"
         else if line.starts_with("      ") {
             if let Some(ref gem) = current_gem {
-                if let Some(dep_name) = line.trim().split_whitespace().next() {
+                if let Some(dep_name) = line.split_whitespace().next() {
                     deps.entry(gem.clone())
                         .or_default()
                         .push(dep_name.to_string());

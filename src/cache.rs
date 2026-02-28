@@ -7,6 +7,9 @@ use serde::{Deserialize, Serialize};
 const CACHE_VERSION: u32 = 3; // bumped: nanosecond mtime precision
 const CACHE_FILE: &str = ".unused_gems_cache";
 
+/// Return type for cache hits: (requires, modules, bundler_groups, bundler_require_all)
+type CacheHit = (Vec<String>, Vec<String>, Vec<String>, bool);
+
 #[derive(Serialize, Deserialize)]
 struct CacheEntry {
     mtime_secs: u64,
@@ -62,12 +65,7 @@ impl FileCache {
     }
 
     /// Check cache for a file. Returns Some((requires, modules, bundler_groups, bundler_require_all)) on hit.
-    pub fn get(
-        &self,
-        rel_path: &str,
-        mtime: SystemTime,
-        size: u64,
-    ) -> Option<(Vec<String>, Vec<String>, Vec<String>, bool)> {
+    pub fn get(&self, rel_path: &str, mtime: SystemTime, size: u64) -> Option<CacheHit> {
         let entry = self.entries.get(rel_path)?;
         let duration = mtime.duration_since(SystemTime::UNIX_EPOCH).ok()?;
         let mtime_secs = duration.as_secs();
@@ -86,6 +84,7 @@ impl FileCache {
     }
 
     /// Insert/update a cache entry.
+    #[allow(clippy::too_many_arguments)]
     pub fn put(
         &mut self,
         rel_path: String,

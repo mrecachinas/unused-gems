@@ -546,9 +546,11 @@ fn scan_bundler_require(
             end += 1;
         }
         let rest = std::str::from_utf8(&bytes[after..end]).unwrap_or("").trim();
-        if rest.is_empty() || rest.starts_with('#') {
-            *bundler_require_all = true;
-        } else if rest.contains("Rails.groups") || rest.contains("Rails.env") {
+        if rest.is_empty()
+            || rest.starts_with('#')
+            || rest.contains("Rails.groups")
+            || rest.contains("Rails.env")
+        {
             *bundler_require_all = true;
         } else {
             for g in GROUP_SYM_RE.captures_iter(rest) {
@@ -561,7 +563,6 @@ fn scan_bundler_require(
 
 /// Filtered wrappers that skip matches on commented lines (Ruby files).
 /// For non-Ruby files, these just call the original scanners directly.
-
 fn scan_requires_filtered(
     bytes: &[u8],
     is_ruby: bool,
@@ -829,9 +830,11 @@ fn scan_bundler_require_filtered(
             end += 1;
         }
         let rest = std::str::from_utf8(&bytes[after..end]).unwrap_or("").trim();
-        if rest.is_empty() || rest.starts_with('#') {
-            *bundler_require_all = true;
-        } else if rest.contains("Rails.groups") || rest.contains("Rails.env") {
+        if rest.is_empty()
+            || rest.starts_with('#')
+            || rest.contains("Rails.groups")
+            || rest.contains("Rails.env")
+        {
             *bundler_require_all = true;
         } else {
             for g in GROUP_SYM_RE.captures_iter(rest) {
@@ -853,6 +856,9 @@ pub type CacheUpdate = (
     bool,
 );
 
+type ScriptFileList = Vec<(String, Vec<u8>)>;
+type ModuleMap = Vec<HashMap<String, HashSet<String>>>;
+
 pub fn scan_source_tree(
     dir: &Path,
     skip_dirs: &[&str],
@@ -872,7 +878,7 @@ pub fn scan_source_tree(
         .follow_links(false)
         .hidden(false)
         .filter_entry(move |entry| {
-            if entry.file_type().map_or(false, |ft| ft.is_dir()) {
+            if entry.file_type().is_some_and(|ft| ft.is_dir()) {
                 let name = entry.file_name().to_string_lossy();
                 let depth = entry.depth();
                 if skip_set.contains(name.as_ref()) && depth < 3 {
@@ -886,17 +892,9 @@ pub fn scan_source_tree(
     // Also collects script files for later gem-name matching (single walk)
     let results = Arc::new(Mutex::new(Vec::<FileResult>::new()));
     let script_files = Arc::new(Mutex::new(Vec::<(String, Vec<u8>)>::new()));
-    let thread_modules = Arc::new(Mutex::new(Vec::<HashMap<String, HashSet<String>>>::new()));
+    let thread_modules = Arc::new(Mutex::new(ModuleMap::new()));
     // Cache updates collected per-thread, merged after walk
-    let cache_updates = Arc::new(Mutex::new(Vec::<(
-        String,
-        std::time::SystemTime,
-        u64,
-        Vec<String>,
-        Vec<String>,
-        Vec<String>,
-        bool,
-    )>::new()));
+    let cache_updates = Arc::new(Mutex::new(Vec::<CacheUpdate>::new()));
     let results_clone = Arc::clone(&results);
     let scripts_clone = Arc::clone(&script_files);
     let modules_clone = Arc::clone(&thread_modules);
@@ -914,31 +912,11 @@ pub fn scan_source_tree(
         struct FlushBuf {
             buf: Vec<FileResult>,
             script_buf: Vec<(String, Vec<u8>)>,
-            cache_buf: Vec<(
-                String,
-                std::time::SystemTime,
-                u64,
-                Vec<String>,
-                Vec<String>,
-                Vec<String>,
-                bool,
-            )>,
+            cache_buf: Vec<CacheUpdate>,
             shared: Arc<Mutex<Vec<FileResult>>>,
-            scripts: Arc<Mutex<Vec<(String, Vec<u8>)>>>,
-            modules_shared: Arc<Mutex<Vec<HashMap<String, HashSet<String>>>>>,
-            cache_puts: Arc<
-                Mutex<
-                    Vec<(
-                        String,
-                        std::time::SystemTime,
-                        u64,
-                        Vec<String>,
-                        Vec<String>,
-                        Vec<String>,
-                        bool,
-                    )>,
-                >,
-            >,
+            scripts: Arc<Mutex<ScriptFileList>>,
+            modules_shared: Arc<Mutex<ModuleMap>>,
+            cache_puts: Arc<Mutex<Vec<CacheUpdate>>>,
             // Thread-local module accumulator: maps module_name → set of rel_paths
             local_modules: HashMap<String, HashSet<String>>,
         }
@@ -976,7 +954,7 @@ pub fn scan_source_tree(
         };
         Box::new(move |result| {
             if let Ok(entry) = result {
-                if entry.file_type().map_or(false, |ft| ft.is_file()) {
+                if entry.file_type().is_some_and(|ft| ft.is_file()) {
                     let path = entry.path();
                     let path_str = path.to_string_lossy().to_string();
                     let rel_path_cow = path

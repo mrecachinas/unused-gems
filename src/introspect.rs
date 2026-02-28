@@ -540,7 +540,12 @@ fn parse_gem_metadata_yaml(yaml: &str) -> Option<GemMetadata> {
         // Collect list items
         let trimmed = line.trim();
         if trimmed.starts_with("- ") {
-            let value = trimmed[2..].trim().trim_matches('"').trim_matches('\'');
+            let value = trimmed
+                .strip_prefix("- ")
+                .unwrap_or(trimmed)
+                .trim()
+                .trim_matches('"')
+                .trim_matches('\'');
             if in_require_paths && !value.is_empty() {
                 meta.require_paths.push(value.to_string());
             }
@@ -567,7 +572,7 @@ pub fn build_vendor_cache_index(project_dir: &Path) -> HashMap<String, GemMetada
         .into_iter()
         .flatten()
         .flatten()
-        .filter(|e| e.path().extension().map_or(false, |ext| ext == "gem"))
+        .filter(|e| e.path().extension().is_some_and(|ext| ext == "gem"))
         .map(|e| e.path())
         .collect();
 

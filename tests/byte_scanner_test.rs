@@ -238,9 +238,11 @@ fn scan_bundler_require(
             end += 1;
         }
         let rest = std::str::from_utf8(&bytes[after..end]).unwrap_or("").trim();
-        if rest.is_empty() || rest.starts_with('#') {
-            *bundler_require_all = true;
-        } else if rest.contains("Rails.groups") || rest.contains("Rails.env") {
+        if rest.is_empty()
+            || rest.starts_with('#')
+            || rest.contains("Rails.groups")
+            || rest.contains("Rails.env")
+        {
             *bundler_require_all = true;
         } else {
             for g in group_sym_re.captures_iter(rest) {
@@ -282,9 +284,11 @@ fn regex_bundler(input: &str) -> (Vec<String>, bool) {
     let mut require_all = false;
     for cap in re.captures_iter(input) {
         let rest = cap[1].trim();
-        if rest.is_empty() || rest.starts_with('#') {
-            require_all = true;
-        } else if rest.contains("Rails.groups") || rest.contains("Rails.env") {
+        if rest.is_empty()
+            || rest.starts_with('#')
+            || rest.contains("Rails.groups")
+            || rest.contains("Rails.env")
+        {
             require_all = true;
         } else {
             for g in group_sym_re.captures_iter(rest) {
@@ -1048,9 +1052,7 @@ fn print_audit_summary() {
     for (input, desc) in &mod_fn_cases {
         let r = regex_modules(input);
         let b = byte_modules(input);
-        if !r.is_empty() && b.is_empty() {
-            false_negatives.push(format!("scan_modules: {desc} — regex={r:?}, bytes={b:?}"));
-        } else if r != b && !r.is_empty() {
+        if r != b && !r.is_empty() {
             false_negatives.push(format!("scan_modules: {desc} — regex={r:?}, bytes={b:?}"));
         }
     }
@@ -1063,9 +1065,7 @@ fn print_audit_summary() {
     for (input, desc) in &mod_fp_cases {
         let r = regex_modules(input);
         let b = byte_modules(input);
-        if r.is_empty() && !b.is_empty() {
-            false_positives.push(format!("scan_modules: {desc} — regex={r:?}, bytes={b:?}"));
-        } else if r != b {
+        if r != b && !b.is_empty() {
             false_positives.push(format!("scan_modules: {desc} — regex={r:?}, bytes={b:?}"));
         }
     }

@@ -140,7 +140,7 @@ fn print_diff_from_content(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{Evidence, GemEntry, GemResult, GemStatus};
+    use crate::types::{GemEntry, GemResult, GemStatus};
 
     fn make_result(name: &str, status: GemStatus) -> (String, GemResult) {
         (

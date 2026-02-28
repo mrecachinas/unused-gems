@@ -305,14 +305,14 @@ impl<'s> Visit<'_> for GemspecVisitor<'s> {
 
 fn extract_string_value(node: &Node<'_>, _source: &[u8]) -> Option<String> {
     if let Some(s) = node.as_string_node() {
-        return Some(String::from_utf8_lossy(s.unescaped().as_ref()).to_string());
+        return Some(String::from_utf8_lossy(s.unescaped()).to_string());
     }
     None
 }
 
 fn extract_symbol_value(node: &Node<'_>, _source: &[u8]) -> Option<String> {
     if let Some(s) = node.as_symbol_node() {
-        return Some(String::from_utf8_lossy(s.unescaped().as_ref()).to_string());
+        return Some(String::from_utf8_lossy(s.unescaped()).to_string());
     }
     None
 }
