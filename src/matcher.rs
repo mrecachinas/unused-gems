@@ -75,7 +75,11 @@ pub fn match_gem_usage(
             // Skip very short module names that cause false positives (e.g., "Cli", "Api")
             // UNLESS they match the gem name exactly (e.g. "aws", "jwt", "csv")
             if mod_down.len() < 4 {
-                let gem_simple = gem_entry.name.replace('-', "").replace('_', "").to_lowercase();
+                let gem_simple = gem_entry
+                    .name
+                    .replace('-', "")
+                    .replace('_', "")
+                    .to_lowercase();
                 if mod_down != gem_simple && mod_down != gem_entry.name.to_lowercase() {
                     continue;
                 }
@@ -104,12 +108,12 @@ pub fn match_gem_usage(
             GemStatus::Used
         } else if gem_entry.require_false {
             GemStatus::RequireFalse
-        } else if bundler_require_all
-            || gem_entry
-                .groups
-                .iter()
-                .any(|g| bundler_groups.contains(g))
-        {
+        } else if bundler_require_all && gem_entry.groups.contains(&"default".to_string()) {
+            // Bundler.require(*Rails.groups) only auto-loads :default + current env group.
+            // Only mark :default gems as BundlerRequired; dev/test-only gems are Unused.
+            evidence.push(Evidence::BundlerRequire);
+            GemStatus::BundlerRequired
+        } else if gem_entry.groups.iter().any(|g| bundler_groups.contains(g)) {
             evidence.push(Evidence::BundlerRequire);
             GemStatus::BundlerRequired
         } else {
@@ -154,11 +158,17 @@ mod tests {
     fn scan(requires: &[(&str, &str)], modules: &[(&str, &str)]) -> ScanResults {
         let mut req_map: HashMap<String, HashSet<String>> = HashMap::new();
         for (name, file) in requires {
-            req_map.entry(name.to_string()).or_default().insert(file.to_string());
+            req_map
+                .entry(name.to_string())
+                .or_default()
+                .insert(file.to_string());
         }
         let mut mod_map: HashMap<String, HashSet<String>> = HashMap::new();
         for (name, file) in modules {
-            mod_map.entry(name.to_string()).or_default().insert(file.to_string());
+            mod_map
+                .entry(name.to_string())
+                .or_default()
+                .insert(file.to_string());
         }
         ScanResults {
             requires: req_map,
@@ -174,7 +184,10 @@ mod tests {
         let gems = vec![gem("failbot", &["failbot"], &[])];
         let results = match_gem_usage(&gems, &scan(&[("failbot", "app.rb")], &[]));
         assert_eq!(results["failbot"].status, GemStatus::Used);
-        assert!(results["failbot"].evidence.iter().any(|e| matches!(e, Evidence::Require { path, .. } if path == "failbot")));
+        assert!(results["failbot"]
+            .evidence
+            .iter()
+            .any(|e| matches!(e, Evidence::Require { path, .. } if path == "failbot")));
     }
 
     #[test]
@@ -191,7 +204,10 @@ mod tests {
         let scan = scan(&[], &[("GraphQL", "app.rb")]);
         let results = match_gem_usage(&gems, &scan);
         assert_eq!(results["graphql"].status, GemStatus::Used);
-        assert!(results["graphql"].evidence.iter().any(|e| matches!(e, Evidence::Module { .. })));
+        assert!(results["graphql"]
+            .evidence
+            .iter()
+            .any(|e| matches!(e, Evidence::Module { .. })));
     }
 
     #[test]
@@ -213,12 +229,39 @@ mod tests {
 
     #[test]
     fn bundler_require_all() {
+        // :default group gem should be BundlerRequired when bundler_require_all is set
         let gems = vec![gem("dotenv", &["dotenv"], &[])];
         let mut scan = scan(&[], &[]);
         scan.bundler_require_all = true;
         let results = match_gem_usage(&gems, &scan);
         assert_eq!(results["dotenv"].status, GemStatus::BundlerRequired);
-        assert!(results["dotenv"].evidence.iter().any(|e| matches!(e, Evidence::BundlerRequire)));
+        assert!(results["dotenv"]
+            .evidence
+            .iter()
+            .any(|e| matches!(e, Evidence::BundlerRequire)));
+    }
+
+    #[test]
+    fn bundler_require_all_dev_only_gem_is_unused() {
+        // dev-only gem with no code references should be Unused even with bundler_require_all
+        let mut entry = gem("pry-byebug", &["pry-byebug"], &[]);
+        entry.groups = vec!["development".to_string()];
+        let gems = vec![entry];
+        let mut scan = scan(&[], &[]);
+        scan.bundler_require_all = true;
+        let results = match_gem_usage(&gems, &scan);
+        assert_eq!(results["pry-byebug"].status, GemStatus::Unused);
+    }
+
+    #[test]
+    fn bundler_require_all_test_only_gem_is_unused() {
+        let mut entry = gem("rspec", &["rspec"], &[]);
+        entry.groups = vec!["test".to_string()];
+        let gems = vec![entry];
+        let mut scan = scan(&[], &[]);
+        scan.bundler_require_all = true;
+        let results = match_gem_usage(&gems, &scan);
+        assert_eq!(results["rspec"].status, GemStatus::Unused);
     }
 
     #[test]
@@ -283,8 +326,14 @@ mod tests {
         let scan = scan(&[("failbot", "a.rb")], &[("Failbot", "b.rb")]);
         let results = match_gem_usage(&gems, &scan);
         assert_eq!(results["failbot"].status, GemStatus::Used);
-        let has_require = results["failbot"].evidence.iter().any(|e| matches!(e, Evidence::Require { .. }));
-        let has_module = results["failbot"].evidence.iter().any(|e| matches!(e, Evidence::Module { .. }));
+        let has_require = results["failbot"]
+            .evidence
+            .iter()
+            .any(|e| matches!(e, Evidence::Require { .. }));
+        let has_module = results["failbot"]
+            .evidence
+            .iter()
+            .any(|e| matches!(e, Evidence::Module { .. }));
         assert!(has_require);
         assert!(has_module);
     }

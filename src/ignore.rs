@@ -54,3 +54,79 @@ pub fn load_ignore_file(dir: &Path, override_path: Option<&str>) -> IgnoreConfig
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn missing_file_returns_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = load_ignore_file(dir.path(), None);
+        assert!(config.ignored.is_empty());
+        assert!(config.path.is_none());
+    }
+
+    #[test]
+    fn loads_default_path() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(".unused_gems.yml"),
+            "ignore:\n  - rails\n  - puma\n",
+        )
+        .unwrap();
+        let config = load_ignore_file(dir.path(), None);
+        assert!(config.ignored.contains("rails"));
+        assert!(config.ignored.contains("puma"));
+        assert_eq!(config.ignored.len(), 2);
+        assert!(config.path.is_some());
+    }
+
+    #[test]
+    fn loads_custom_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let custom = dir.path().join("custom_ignore.yml");
+        std::fs::write(&custom, "ignore:\n  - rspec\n").unwrap();
+        let config = load_ignore_file(dir.path(), Some(custom.to_str().unwrap()));
+        assert!(config.ignored.contains("rspec"));
+        assert_eq!(config.ignored.len(), 1);
+    }
+
+    #[test]
+    fn empty_ignore_list() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".unused_gems.yml"), "ignore: []\n").unwrap();
+        let config = load_ignore_file(dir.path(), None);
+        assert!(config.ignored.is_empty());
+        assert!(config.path.is_some());
+    }
+
+    #[test]
+    fn no_ignore_key() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".unused_gems.yml"), "other_key: value\n").unwrap();
+        let config = load_ignore_file(dir.path(), None);
+        assert!(config.ignored.is_empty());
+        assert!(config.path.is_some());
+    }
+
+    #[test]
+    fn invalid_yaml_returns_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".unused_gems.yml"), "{{invalid yaml").unwrap();
+        let config = load_ignore_file(dir.path(), None);
+        assert!(config.ignored.is_empty());
+        assert!(config.path.is_some());
+    }
+
+    #[test]
+    fn custom_path_not_readable() {
+        // Create a file but make it a directory to cause a read error
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("unreadable.yml");
+        std::fs::create_dir(&path).unwrap(); // directory can't be read as file
+        let config = load_ignore_file(dir.path(), Some(path.to_str().unwrap()));
+        assert!(config.ignored.is_empty());
+        assert!(config.path.is_some());
+    }
+}

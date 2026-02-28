@@ -40,7 +40,9 @@ pub fn parse_gemfile_lock(dir: &Path) -> HashMap<String, Vec<String>> {
         else if line.starts_with("      ") {
             if let Some(ref gem) = current_gem {
                 if let Some(dep_name) = line.trim().split_whitespace().next() {
-                    deps.entry(gem.clone()).or_default().push(dep_name.to_string());
+                    deps.entry(gem.clone())
+                        .or_default()
+                        .push(dep_name.to_string());
                 }
             }
         }
@@ -49,10 +51,7 @@ pub fn parse_gemfile_lock(dir: &Path) -> HashMap<String, Vec<String>> {
     deps
 }
 
-pub fn count_transitive_deps(
-    gem_name: &str,
-    lock_deps: &HashMap<String, Vec<String>>,
-) -> usize {
+pub fn count_transitive_deps(gem_name: &str, lock_deps: &HashMap<String, Vec<String>>) -> usize {
     let mut visited = HashSet::new();
     count_inner(gem_name, lock_deps, &mut visited)
 }
@@ -77,4 +76,94 @@ fn count_inner(
         count += count_inner(d, lock_deps, visited);
     }
     count
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_basic_lockfile() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Gemfile.lock"),
+            "\
+GEM
+  remote: https://rubygems.org/
+  specs:
+    actionpack (7.1.0)
+      activesupport (= 7.1.0)
+      rack (~> 3.0)
+    activesupport (7.1.0)
+      i18n (>= 1.6)
+    i18n (1.14.1)
+    rack (3.0.8)
+
+PLATFORMS
+  ruby
+",
+        )
+        .unwrap();
+        let deps = parse_gemfile_lock(dir.path());
+        assert_eq!(deps["actionpack"], vec!["activesupport", "rack"]);
+        assert_eq!(deps["activesupport"], vec!["i18n"]);
+        assert!(deps["i18n"].is_empty());
+        assert!(deps["rack"].is_empty());
+    }
+
+    #[test]
+    fn missing_lockfile_returns_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let deps = parse_gemfile_lock(dir.path());
+        assert!(deps.is_empty());
+    }
+
+    #[test]
+    fn count_transitive_deps_basic() {
+        let mut deps = HashMap::new();
+        deps.insert("a".to_string(), vec!["b".to_string(), "c".to_string()]);
+        deps.insert("b".to_string(), vec!["d".to_string()]);
+        deps.insert("c".to_string(), vec![]);
+        deps.insert("d".to_string(), vec![]);
+        // a -> b, c; b -> d; total transitive = 3 (b, c, d)
+        assert_eq!(count_transitive_deps("a", &deps), 3);
+    }
+
+    #[test]
+    fn count_transitive_deps_circular() {
+        let mut deps = HashMap::new();
+        deps.insert("a".to_string(), vec!["b".to_string()]);
+        deps.insert("b".to_string(), vec!["a".to_string()]);
+        // a -> b (1 direct), b -> a (visited, skip) = 2 total visits but 1 direct dep from b
+        assert_eq!(count_transitive_deps("a", &deps), 2);
+    }
+
+    #[test]
+    fn count_transitive_deps_missing() {
+        let deps = HashMap::new();
+        assert_eq!(count_transitive_deps("nonexistent", &deps), 0);
+    }
+
+    #[test]
+    fn parse_multiple_gem_sections() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Gemfile.lock"),
+            "\
+GEM
+  remote: https://rubygems.org/
+  specs:
+    rails (7.1.0)
+      actionpack (= 7.1.0)
+    actionpack (7.1.0)
+
+BUNDLED WITH
+   2.5.0
+",
+        )
+        .unwrap();
+        let deps = parse_gemfile_lock(dir.path());
+        assert_eq!(deps["rails"], vec!["actionpack"]);
+        assert!(deps["actionpack"].is_empty());
+    }
 }

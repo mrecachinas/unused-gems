@@ -11,8 +11,8 @@ mod scripts;
 mod types;
 
 use std::collections::HashSet;
-use std::sync::Arc;
 use std::path::Path;
+use std::sync::Arc;
 
 use clap::Parser;
 use rayon::prelude::*;
@@ -63,10 +63,12 @@ struct Cli {
 fn main() {
     let cli = Cli::parse();
 
-    let dir = Path::new(&cli.directory).canonicalize().unwrap_or_else(|_| {
-        eprintln!("Error: {} is not a valid directory", cli.directory);
-        std::process::exit(1);
-    });
+    let dir = Path::new(&cli.directory)
+        .canonicalize()
+        .unwrap_or_else(|_| {
+            eprintln!("Error: {} is not a valid directory", cli.directory);
+            std::process::exit(1);
+        });
 
     if !dir.is_dir() {
         eprintln!("Error: {} is not a directory", dir.display());
@@ -92,7 +94,11 @@ fn main() {
             let _start = std::time::Instant::now();
             let _result = $block;
             if bench {
-                eprintln!("  {:30} {:>6.2}ms", $label, _start.elapsed().as_secs_f64() * 1000.0);
+                eprintln!(
+                    "  {:30} {:>6.2}ms",
+                    $label,
+                    _start.elapsed().as_secs_f64() * 1000.0
+                );
             }
             _result
         }};
@@ -120,15 +126,18 @@ fn main() {
     let gem_names: Vec<String> = gems.iter().map(|g| g.name.clone()).collect();
     let cache_for_scan = Arc::clone(&file_cache);
     let dir_for_vendor = dir.clone();
-    let ((_gem_paths, gem_index, vendor_meta), (scan_results, cache_updates)) = timed!("index+scan", rayon::join(
-        || {
-            let gp = introspect::find_gem_paths(&dir);
-            let gi = introspect::build_gem_index(&gp);
-            let vm = introspect::build_vendor_cache_index(&dir_for_vendor);
-            (gp, gi, vm)
-        },
-        || scanner::scan_source_tree(&dir, &skip_dirs, cache_for_scan),
-    ));
+    let ((_gem_paths, gem_index, vendor_meta), (scan_results, cache_updates)) = timed!(
+        "index+scan",
+        rayon::join(
+            || {
+                let gp = introspect::find_gem_paths(&dir);
+                let gi = introspect::build_gem_index(&gp);
+                let vm = introspect::build_vendor_cache_index(&dir_for_vendor);
+                (gp, gi, vm)
+            },
+            || scanner::scan_source_tree(&dir, &skip_dirs, cache_for_scan),
+        )
+    );
 
     // Apply cache updates from the walk
     // Unwrap Arc or reload if still shared (ignore crate may hold a ref)
@@ -147,35 +156,51 @@ fn main() {
     }
 
     // 2b. Script scanning (uses files collected during source tree walk — no extra I/O)
-    let script_refs = timed!("scan_scripts", scripts::scan_scripts_for_gem_usage(&dir, &gem_names, &gem_index, &scan_results.script_files));
+    let script_refs = timed!(
+        "scan_scripts",
+        scripts::scan_scripts_for_gem_usage(
+            &dir,
+            &gem_names,
+            &gem_index,
+            &scan_results.script_files
+        )
+    );
 
     // 3. Resolve require_paths (from installed gems or vendor/cache metadata)
-    timed!("resolve_require_paths", gems.par_iter_mut().for_each(|gem| {
-        if gem.require_paths.is_empty() && !gem.require_false {
-            gem.require_paths = resolve_require_paths(gem, &gem_index);
-            // Fallback: use vendor/cache metadata if still unresolved
-            if gem.require_paths.len() <= 1 {
-                if let Some(meta) = vendor_meta.get(&gem.name) {
-                    // Vendor metadata gives us the gemspec's require_paths (e.g., ["lib", "ext"])
-                    // Use it to discover actual require names
-                    for rp in &meta.require_paths {
-                        if rp != "lib" && !gem.require_paths.contains(rp) {
-                            gem.require_paths.push(rp.clone());
+    timed!(
+        "resolve_require_paths",
+        gems.par_iter_mut().for_each(|gem| {
+            if gem.require_paths.is_empty() && !gem.require_false {
+                gem.require_paths = resolve_require_paths(gem, &gem_index);
+                // Fallback: use vendor/cache metadata if still unresolved
+                if gem.require_paths.len() <= 1 {
+                    if let Some(meta) = vendor_meta.get(&gem.name) {
+                        // Vendor metadata gives us the gemspec's require_paths (e.g., ["lib", "ext"])
+                        // Use it to discover actual require names
+                        for rp in &meta.require_paths {
+                            if rp != "lib" && !gem.require_paths.contains(rp) {
+                                gem.require_paths.push(rp.clone());
+                            }
                         }
                     }
                 }
             }
-        }
-    }));
+        })
+    );
 
     // 4. First pass match on require paths only (no module names yet)
-    let mut results = timed!("match_gem_usage", matcher::match_gem_usage(&gems, &scan_results));
+    let mut results = timed!(
+        "match_gem_usage",
+        matcher::match_gem_usage(&gems, &scan_results)
+    );
 
     // 4b. Merge database adapter evidence
     let db_adapters = scan_database_adapters(&dir);
     for (gem_name, adapter) in &db_adapters {
         if let Some(result) = results.get_mut(gem_name) {
-            result.evidence.push(types::Evidence::DatabaseAdapter { adapter: adapter.clone() });
+            result.evidence.push(types::Evidence::DatabaseAdapter {
+                adapter: adapter.clone(),
+            });
             if result.status != GemStatus::Used {
                 result.files.push("config/database.yml".to_string());
                 result.files.sort();
@@ -189,7 +214,9 @@ fn main() {
         if let Some(result) = results.get_mut(gem_name) {
             let mut all_files: HashSet<String> = result.files.iter().cloned().collect();
             for f in files {
-                result.evidence.push(types::Evidence::Script { file: f.clone() });
+                result
+                    .evidence
+                    .push(types::Evidence::Script { file: f.clone() });
                 all_files.insert(f.clone());
             }
             result.files = all_files.into_iter().collect();
@@ -206,7 +233,9 @@ fn main() {
         .enumerate()
         .filter(|(_, gem)| {
             gem.module_names.is_empty()
-                && results.get(&gem.name).map_or(true, |r| r.status != GemStatus::Used)
+                && results
+                    .get(&gem.name)
+                    .map_or(true, |r| r.status != GemStatus::Used)
         })
         .map(|(i, _)| i)
         .collect();
@@ -238,7 +267,9 @@ fn main() {
                 if result.status != GemStatus::Used && !files.is_empty() {
                     let mut all_files: HashSet<String> = result.files.iter().cloned().collect();
                     for f in files {
-                        result.evidence.push(types::Evidence::Script { file: f.clone() });
+                        result
+                            .evidence
+                            .push(types::Evidence::Script { file: f.clone() });
                         all_files.insert(f.clone());
                     }
                     result.files = all_files.into_iter().collect();
@@ -265,7 +296,10 @@ fn main() {
     }
     if let Some(ref path) = ignore_config.path {
         if !cli.quiet {
-            let ignored_count = results.values().filter(|v| v.status == GemStatus::Ignored).count();
+            let ignored_count = results
+                .values()
+                .filter(|v| v.status == GemStatus::Ignored)
+                .count();
             if ignored_count > 0 {
                 eprintln!("Loaded {} ({} ignored)", path, ignored_count);
             }
@@ -301,7 +335,10 @@ fn main() {
 }
 
 /// Resolve require paths for a gem: check installed gem first, then use heuristics.
-fn resolve_require_paths(gem: &types::GemEntry, gem_index: &std::collections::HashMap<String, std::path::PathBuf>) -> Vec<String> {
+fn resolve_require_paths(
+    gem: &types::GemEntry,
+    gem_index: &std::collections::HashMap<String, std::path::PathBuf>,
+) -> Vec<String> {
     // Try introspection first
     if let Some(discovered) = introspect::discover_gem_require_paths(&gem.name, gem_index) {
         let mut paths = discovered;
@@ -353,7 +390,10 @@ fn resolve_require_paths(gem: &types::GemEntry, gem_index: &std::collections::Ha
 }
 
 /// Resolve module names for a gem: check installed gem first, then generate candidates.
-fn resolve_module_names(gem: &types::GemEntry, gem_index: &std::collections::HashMap<String, std::path::PathBuf>) -> Vec<String> {
+fn resolve_module_names(
+    gem: &types::GemEntry,
+    gem_index: &std::collections::HashMap<String, std::path::PathBuf>,
+) -> Vec<String> {
     let discovered = introspect::discover_gem_module_names(&gem.name, gem_index);
     if !discovered.is_empty() {
         return discovered;

@@ -6,7 +6,7 @@ use once_cell::sync::Lazy;
 use regex::Regex;
 
 static MODULE_DECL_RE: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"(?m)^\s*(?:module|class)\s+([A-Z]\w+)").unwrap());
+    Lazy::new(|| Regex::new(r"(?m)^\s*(?:module|class)\s+([A-Z][\w:]+)").unwrap());
 
 /// Metadata extracted from a .gem tarball's metadata.gz
 #[derive(Debug, Default)]
@@ -18,7 +18,9 @@ pub struct GemMetadata {
 /// Compare two gem version strings numerically (e.g. "1.16.8" > "1.9.1").
 fn compare_gem_versions(a: &str, b: &str) -> std::cmp::Ordering {
     let parse = |s: &str| -> Vec<u64> {
-        s.split('.').map(|p| p.parse::<u64>().unwrap_or(0)).collect()
+        s.split('.')
+            .map(|p| p.parse::<u64>().unwrap_or(0))
+            .collect()
     };
     parse(a).cmp(&parse(b))
 }
@@ -208,7 +210,10 @@ fn probe_rbenv(project_dir: &Path) -> Option<PathBuf> {
 
 /// Walk from project_dir upward to find a .ruby-version file (same as rbenv shim).
 fn find_ruby_version_file(start_dir: &Path) -> Option<String> {
-    let mut dir = start_dir.canonicalize().ok().unwrap_or_else(|| start_dir.to_path_buf());
+    let mut dir = start_dir
+        .canonicalize()
+        .ok()
+        .unwrap_or_else(|| start_dir.to_path_buf());
     loop {
         let candidate = dir.join(".ruby-version");
         if let Ok(content) = std::fs::read_to_string(&candidate) {
@@ -288,8 +293,8 @@ pub fn build_gem_index(gem_paths: &[PathBuf]) -> HashMap<String, PathBuf> {
                                     .to_string_lossy()
                                     .to_string();
                                 // Re-extract version from existing using same approach
-                                let existing_ver = extract_gem_version(&existing_name)
-                                    .unwrap_or_default();
+                                let existing_ver =
+                                    extract_gem_version(&existing_name).unwrap_or_default();
                                 if compare_gem_versions(version_part, &existing_ver)
                                     == std::cmp::Ordering::Greater
                                 {
@@ -343,7 +348,8 @@ pub fn discover_gem_require_paths(
     let gem_dir = gem_index.get(gem_name)?;
 
     // Try reading require_paths from the gem's gemspec first
-    let require_dirs = read_gemspec_require_paths(gem_dir).unwrap_or_else(|| vec!["lib".to_string()]);
+    let require_dirs =
+        read_gemspec_require_paths(gem_dir).unwrap_or_else(|| vec!["lib".to_string()]);
 
     let mut paths = Vec::new();
     for req_dir in &require_dirs {
@@ -386,19 +392,21 @@ fn read_gemspec_require_paths(gem_dir: &Path) -> Option<Vec<String>> {
     for spec_path in glob::glob(&pattern).into_iter().flatten().flatten() {
         if let Ok(content) = std::fs::read_to_string(&spec_path) {
             // Match: s.require_paths = ["lib", "ext"] or s.require_path = "lib"
-            static REQ_PATHS_RE: Lazy<Regex> = Lazy::new(|| {
-                Regex::new(r#"require_paths?\s*=\s*\[([^\]]+)\]"#).unwrap()
-            });
-            static REQ_PATH_SINGLE_RE: Lazy<Regex> = Lazy::new(|| {
-                Regex::new(r#"require_path\s*=\s*['"]([^'"]+)['"]"#).unwrap()
-            });
+            static REQ_PATHS_RE: Lazy<Regex> =
+                Lazy::new(|| Regex::new(r#"require_paths?\s*=\s*\[([^\]]+)\]"#).unwrap());
+            static REQ_PATH_SINGLE_RE: Lazy<Regex> =
+                Lazy::new(|| Regex::new(r#"require_path\s*=\s*['"]([^'"]+)['"]"#).unwrap());
             if let Some(cap) = REQ_PATHS_RE.captures(&content) {
                 let inner = &cap[1];
                 let paths: Vec<String> = inner
                     .split(',')
                     .filter_map(|s| {
                         let trimmed = s.trim().trim_matches(|c| c == '\'' || c == '"').trim();
-                        if trimmed.is_empty() { None } else { Some(trimmed.to_string()) }
+                        if trimmed.is_empty() {
+                            None
+                        } else {
+                            Some(trimmed.to_string())
+                        }
                     })
                     .collect();
                 if !paths.is_empty() {
@@ -414,7 +422,10 @@ fn read_gemspec_require_paths(gem_dir: &Path) -> Option<Vec<String>> {
 }
 
 /// Extract top-level module/class names from a gem's lib/*.rb files using regex.
-pub fn discover_gem_module_names(gem_name: &str, gem_index: &HashMap<String, PathBuf>) -> Vec<String> {
+pub fn discover_gem_module_names(
+    gem_name: &str,
+    gem_index: &HashMap<String, PathBuf>,
+) -> Vec<String> {
     let gem_dir = match gem_index.get(gem_name) {
         Some(d) => d,
         None => return Vec::new(),
@@ -556,9 +567,7 @@ pub fn build_vendor_cache_index(project_dir: &Path) -> HashMap<String, GemMetada
         .into_iter()
         .flatten()
         .flatten()
-        .filter(|e| {
-            e.path().extension().map_or(false, |ext| ext == "gem")
-        })
+        .filter(|e| e.path().extension().map_or(false, |ext| ext == "gem"))
         .map(|e| e.path())
         .collect();
 
@@ -604,22 +613,34 @@ mod tests {
 
     #[test]
     fn version_with_platform() {
-        assert_eq!(extract_gem_version("nokogiri-1.16.0-x86_64-linux"), Some("1.16.0".into()));
+        assert_eq!(
+            extract_gem_version("nokogiri-1.16.0-x86_64-linux"),
+            Some("1.16.0".into())
+        );
     }
 
     #[test]
     fn version_with_arm_platform() {
-        assert_eq!(extract_gem_version("nokogiri-1.16.0-arm64-darwin"), Some("1.16.0".into()));
+        assert_eq!(
+            extract_gem_version("nokogiri-1.16.0-arm64-darwin"),
+            Some("1.16.0".into())
+        );
     }
 
     #[test]
     fn version_hyphenated_gem_name() {
-        assert_eq!(extract_gem_version("ruby-kafka-1.5.0"), Some("1.5.0".into()));
+        assert_eq!(
+            extract_gem_version("ruby-kafka-1.5.0"),
+            Some("1.5.0".into())
+        );
     }
 
     #[test]
     fn version_multi_hyphen_gem() {
-        assert_eq!(extract_gem_version("aws-sdk-s3-1.143.0"), Some("1.143.0".into()));
+        assert_eq!(
+            extract_gem_version("aws-sdk-s3-1.143.0"),
+            Some("1.143.0".into())
+        );
     }
 
     #[test]
@@ -630,29 +651,44 @@ mod tests {
     #[test]
     fn version_pre_release() {
         // Full version string includes pre-release suffix since it's all after the '-'
-        assert_eq!(extract_gem_version("rails-7.2.0.beta1"), Some("7.2.0.beta1".into()));
+        assert_eq!(
+            extract_gem_version("rails-7.2.0.beta1"),
+            Some("7.2.0.beta1".into())
+        );
     }
 
     // ── compare_gem_versions ──
 
     #[test]
     fn compare_versions_greater() {
-        assert_eq!(compare_gem_versions("1.16.8", "1.9.1"), std::cmp::Ordering::Greater);
+        assert_eq!(
+            compare_gem_versions("1.16.8", "1.9.1"),
+            std::cmp::Ordering::Greater
+        );
     }
 
     #[test]
     fn compare_versions_less() {
-        assert_eq!(compare_gem_versions("1.9.1", "1.16.8"), std::cmp::Ordering::Less);
+        assert_eq!(
+            compare_gem_versions("1.9.1", "1.16.8"),
+            std::cmp::Ordering::Less
+        );
     }
 
     #[test]
     fn compare_versions_equal() {
-        assert_eq!(compare_gem_versions("2.0.0", "2.0.0"), std::cmp::Ordering::Equal);
+        assert_eq!(
+            compare_gem_versions("2.0.0", "2.0.0"),
+            std::cmp::Ordering::Equal
+        );
     }
 
     #[test]
     fn compare_versions_different_lengths() {
-        assert_eq!(compare_gem_versions("1.0.0.1", "1.0.0"), std::cmp::Ordering::Greater);
+        assert_eq!(
+            compare_gem_versions("1.0.0.1", "1.0.0"),
+            std::cmp::Ordering::Greater
+        );
     }
 
     // ── read_bundle_path ──
@@ -662,8 +698,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let bundle_dir = dir.path().join(".bundle");
         std::fs::create_dir_all(&bundle_dir).unwrap();
-        std::fs::write(bundle_dir.join("config"), "---\nBUNDLE_PATH: \"vendor/gems\"\n").unwrap();
-        assert_eq!(read_bundle_path(dir.path()), Some(PathBuf::from("vendor/gems")));
+        std::fs::write(
+            bundle_dir.join("config"),
+            "---\nBUNDLE_PATH: \"vendor/gems\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            read_bundle_path(dir.path()),
+            Some(PathBuf::from("vendor/gems"))
+        );
     }
 
     #[test]
@@ -677,27 +720,605 @@ mod tests {
     #[test]
     fn gemspec_require_paths_array() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("foo.gemspec"),
-            "Gem::Specification.new do |s|\n  s.require_paths = [\"lib\", \"ext\"]\nend\n"
-        ).unwrap();
-        assert_eq!(read_gemspec_require_paths(dir.path()), Some(vec!["lib".into(), "ext".into()]));
+        std::fs::write(
+            dir.path().join("foo.gemspec"),
+            "Gem::Specification.new do |s|\n  s.require_paths = [\"lib\", \"ext\"]\nend\n",
+        )
+        .unwrap();
+        assert_eq!(
+            read_gemspec_require_paths(dir.path()),
+            Some(vec!["lib".into(), "ext".into()])
+        );
     }
 
     #[test]
     fn gemspec_require_path_single() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("bar.gemspec"),
-            "Gem::Specification.new do |s|\n  s.require_path = 'src'\nend\n"
-        ).unwrap();
-        assert_eq!(read_gemspec_require_paths(dir.path()), Some(vec!["src".into()]));
+        std::fs::write(
+            dir.path().join("bar.gemspec"),
+            "Gem::Specification.new do |s|\n  s.require_path = 'src'\nend\n",
+        )
+        .unwrap();
+        assert_eq!(
+            read_gemspec_require_paths(dir.path()),
+            Some(vec!["src".into()])
+        );
     }
 
     #[test]
     fn gemspec_require_paths_default() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("baz.gemspec"),
-            "Gem::Specification.new do |s|\n  s.name = 'baz'\nend\n"
-        ).unwrap();
+        std::fs::write(
+            dir.path().join("baz.gemspec"),
+            "Gem::Specification.new do |s|\n  s.name = 'baz'\nend\n",
+        )
+        .unwrap();
         assert_eq!(read_gemspec_require_paths(dir.path()), None);
+    }
+
+    // ── build_gem_index ──
+
+    #[test]
+    fn build_gem_index_basic() {
+        let dir = tempfile::tempdir().unwrap();
+        let gems_dir = dir.path().join("gems");
+        std::fs::create_dir_all(gems_dir.join("rails-7.1.0")).unwrap();
+        std::fs::create_dir_all(gems_dir.join("puma-6.4.0")).unwrap();
+        let index = build_gem_index(&[dir.path().to_path_buf()]);
+        assert!(index.contains_key("rails"));
+        assert!(index.contains_key("puma"));
+    }
+
+    #[test]
+    fn build_gem_index_picks_latest_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let gems_dir = dir.path().join("gems");
+        std::fs::create_dir_all(gems_dir.join("rails-7.0.0")).unwrap();
+        std::fs::create_dir_all(gems_dir.join("rails-7.1.0")).unwrap();
+        let index = build_gem_index(&[dir.path().to_path_buf()]);
+        assert!(index["rails"].to_string_lossy().contains("rails-7.1.0"));
+    }
+
+    #[test]
+    fn build_gem_index_platform_suffix() {
+        let dir = tempfile::tempdir().unwrap();
+        let gems_dir = dir.path().join("gems");
+        std::fs::create_dir_all(gems_dir.join("nokogiri-1.16.0-arm64-darwin")).unwrap();
+        let index = build_gem_index(&[dir.path().to_path_buf()]);
+        assert!(index.contains_key("nokogiri"));
+    }
+
+    #[test]
+    fn build_gem_index_hyphenated_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let gems_dir = dir.path().join("gems");
+        std::fs::create_dir_all(gems_dir.join("aws-sdk-s3-1.143.0")).unwrap();
+        let index = build_gem_index(&[dir.path().to_path_buf()]);
+        assert!(index.contains_key("aws-sdk-s3"));
+    }
+
+    #[test]
+    fn build_gem_index_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = build_gem_index(&[dir.path().to_path_buf()]);
+        assert!(index.is_empty());
+    }
+
+    // ── discover_gem_require_paths ──
+
+    #[test]
+    fn discover_require_paths_from_lib() {
+        let dir = tempfile::tempdir().unwrap();
+        let gems_dir = dir.path().join("gems");
+        let gem_dir = gems_dir.join("mygem-1.0.0");
+        let lib_dir = gem_dir.join("lib");
+        std::fs::create_dir_all(&lib_dir).unwrap();
+        std::fs::write(lib_dir.join("mygem.rb"), "# entry").unwrap();
+        std::fs::write(lib_dir.join("helpers.rb"), "# helpers").unwrap();
+        std::fs::create_dir(lib_dir.join("mygem")).unwrap();
+
+        let index = build_gem_index(&[dir.path().to_path_buf()]);
+        let paths = discover_gem_require_paths("mygem", &index);
+        assert!(paths.is_some());
+        let paths = paths.unwrap();
+        assert!(paths.contains(&"mygem".to_string()));
+        assert!(paths.contains(&"helpers".to_string()));
+    }
+
+    #[test]
+    fn discover_require_paths_missing_gem() {
+        let index = HashMap::new();
+        assert!(discover_gem_require_paths("nonexistent", &index).is_none());
+    }
+
+    // ── discover_gem_module_names ──
+
+    #[test]
+    fn discover_module_names_basic() {
+        let dir = tempfile::tempdir().unwrap();
+        let gems_dir = dir.path().join("gems");
+        let gem_dir = gems_dir.join("mygem-1.0.0");
+        let lib_dir = gem_dir.join("lib");
+        std::fs::create_dir_all(&lib_dir).unwrap();
+        std::fs::write(lib_dir.join("mygem.rb"), "module MyGem\nend\n").unwrap();
+
+        let index = build_gem_index(&[dir.path().to_path_buf()]);
+        let modules = discover_gem_module_names("mygem", &index);
+        assert!(modules.contains(&"MyGem".to_string()));
+    }
+
+    #[test]
+    fn discover_module_names_namespaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let gems_dir = dir.path().join("gems");
+        let gem_dir = gems_dir.join("google-cloud-1.0.0");
+        let lib_dir = gem_dir.join("lib");
+        std::fs::create_dir_all(&lib_dir).unwrap();
+        std::fs::write(
+            lib_dir.join("google-cloud.rb"),
+            "module Google::Cloud\nend\n",
+        )
+        .unwrap();
+
+        let index = build_gem_index(&[dir.path().to_path_buf()]);
+        let modules = discover_gem_module_names("google-cloud", &index);
+        assert!(modules.contains(&"Google::Cloud".to_string()));
+    }
+
+    #[test]
+    fn discover_module_names_deeper() {
+        let dir = tempfile::tempdir().unwrap();
+        let gems_dir = dir.path().join("gems");
+        let gem_dir = gems_dir.join("mygem-1.0.0");
+        let lib_dir = gem_dir.join("lib");
+        let sub_dir = lib_dir.join("mygem");
+        std::fs::create_dir_all(&sub_dir).unwrap();
+        // No top-level rb files — should scan one level deeper
+        std::fs::write(sub_dir.join("core.rb"), "class MyGem::Core\nend\n").unwrap();
+
+        let index = build_gem_index(&[dir.path().to_path_buf()]);
+        let modules = discover_gem_module_names("mygem", &index);
+        assert!(modules.contains(&"MyGem::Core".to_string()));
+    }
+
+    #[test]
+    fn discover_module_names_missing_gem() {
+        let index = HashMap::new();
+        let modules = discover_gem_module_names("nonexistent", &index);
+        assert!(modules.is_empty());
+    }
+
+    #[test]
+    fn discover_module_names_no_lib() {
+        let dir = tempfile::tempdir().unwrap();
+        let gems_dir = dir.path().join("gems");
+        std::fs::create_dir_all(gems_dir.join("mygem-1.0.0")).unwrap();
+
+        let index = build_gem_index(&[dir.path().to_path_buf()]);
+        let modules = discover_gem_module_names("mygem", &index);
+        assert!(modules.is_empty());
+    }
+
+    // ── parse_gem_metadata_yaml ──
+
+    #[test]
+    fn parse_metadata_yaml_basic() {
+        let yaml = "--- !ruby/object:Gem::Specification\nname: rails\nversion: !ruby/object:Gem::Version\n  version: 7.1.0\nrequire_paths:\n- lib\nexecutables:\n- rails\n";
+        let meta = parse_gem_metadata_yaml(yaml);
+        assert!(meta.is_some());
+        let meta = meta.unwrap();
+        assert_eq!(meta.require_paths, vec!["lib"]);
+        assert_eq!(meta.executables, vec!["rails"]);
+    }
+
+    #[test]
+    fn parse_metadata_yaml_inline() {
+        let yaml = "require_paths: [\"lib\", \"ext\"]\nexecutables: [\"rake\"]\n";
+        let meta = parse_gem_metadata_yaml(yaml);
+        assert!(meta.is_some());
+        let meta = meta.unwrap();
+        assert_eq!(meta.require_paths, vec!["lib", "ext"]);
+        assert_eq!(meta.executables, vec!["rake"]);
+    }
+
+    #[test]
+    fn parse_metadata_yaml_empty_executables() {
+        let yaml = "require_paths:\n- lib\nexecutables: []\n";
+        let meta = parse_gem_metadata_yaml(yaml);
+        assert!(meta.is_some());
+        let meta = meta.unwrap();
+        assert_eq!(meta.require_paths, vec!["lib"]);
+        assert!(meta.executables.is_empty());
+    }
+
+    #[test]
+    fn parse_metadata_yaml_defaults_to_lib() {
+        let yaml = "name: simple_gem\nversion: 1.0.0\n";
+        let meta = parse_gem_metadata_yaml(yaml);
+        assert!(meta.is_some());
+        assert_eq!(meta.unwrap().require_paths, vec!["lib"]);
+    }
+
+    // ── extract_gem_name_from_filename ──
+
+    #[test]
+    fn gem_name_from_filename_basic() {
+        assert_eq!(
+            extract_gem_name_from_filename("rails-7.1.0"),
+            Some("rails".to_string())
+        );
+    }
+
+    #[test]
+    fn gem_name_from_filename_hyphenated() {
+        assert_eq!(
+            extract_gem_name_from_filename("aws-sdk-s3-1.143.0"),
+            Some("aws-sdk-s3".to_string())
+        );
+    }
+
+    #[test]
+    fn gem_name_from_filename_no_version() {
+        assert_eq!(extract_gem_name_from_filename("just-a-name"), None);
+    }
+
+    // ── find_gem_paths edge cases ──
+
+    #[test]
+    fn find_gem_paths_empty_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        // No gems installed, no env vars — should return empty or fall back
+        let paths = find_gem_paths(dir.path());
+        // This may return something from the system or empty depending on env
+        // Just verify it doesn't panic
+        let _ = paths;
+    }
+
+    #[test]
+    fn find_gem_paths_with_bundle_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let bundle_dir = dir.path().join(".bundle");
+        std::fs::create_dir_all(&bundle_dir).unwrap();
+        let vendor = dir.path().join("vendor/gems/ruby/3.3.0");
+        std::fs::create_dir_all(vendor.join("gems")).unwrap();
+        std::fs::write(
+            bundle_dir.join("config"),
+            "---\nBUNDLE_PATH: \"vendor/gems\"\n",
+        )
+        .unwrap();
+
+        let paths = find_gem_paths(dir.path());
+        assert!(!paths.is_empty());
+    }
+
+    // ── build_vendor_cache_index ──
+
+    #[test]
+    fn vendor_cache_empty_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = build_vendor_cache_index(dir.path());
+        assert!(index.is_empty());
+    }
+
+    // ── find_bundler_gem_root ──
+
+    #[test]
+    fn bundler_gem_root_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let ruby_dir = dir.path().join("ruby").join("3.3.0");
+        std::fs::create_dir_all(ruby_dir.join("gems")).unwrap();
+        let result = find_bundler_gem_root(dir.path());
+        assert!(result.is_some());
+        assert!(result.unwrap().ends_with("3.3.0"));
+    }
+
+    #[test]
+    fn bundler_gem_root_no_ruby_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = find_bundler_gem_root(dir.path());
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn bundler_gem_root_no_gems_subdir() {
+        let dir = tempfile::tempdir().unwrap();
+        let ruby_dir = dir.path().join("ruby").join("3.3.0");
+        std::fs::create_dir_all(&ruby_dir).unwrap();
+        // No "gems" subdir inside version dir
+        let result = find_bundler_gem_root(dir.path());
+        assert!(result.is_none());
+    }
+
+    // ── find_ruby_version_file ──
+
+    #[test]
+    fn ruby_version_file_in_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".ruby-version"), "3.3.0\n").unwrap();
+        let result = find_ruby_version_file(dir.path());
+        assert_eq!(result, Some("3.3.0".to_string()));
+    }
+
+    #[test]
+    fn ruby_version_file_in_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".ruby-version"), "3.2.0\n").unwrap();
+        let child = dir.path().join("subdir");
+        std::fs::create_dir_all(&child).unwrap();
+        let result = find_ruby_version_file(&child);
+        assert_eq!(result, Some("3.2.0".to_string()));
+    }
+
+    #[test]
+    fn ruby_version_file_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".ruby-version"), "\n").unwrap();
+        // Empty version string — should continue walking up
+        let result = find_ruby_version_file(dir.path());
+        // May or may not find one higher up; just check it doesn't panic
+        let _ = result;
+    }
+
+    #[test]
+    fn ruby_version_file_not_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let child = dir.path().join("deep").join("nested");
+        std::fs::create_dir_all(&child).unwrap();
+        // No .ruby-version anywhere in temp dir
+        // This tests the "walk to root" path
+        let _ = find_ruby_version_file(&child);
+    }
+
+    // ── build_gem_index edge cases ──
+
+    #[test]
+    fn build_gem_index_fallback_no_dot_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let gems_dir = dir.path().join("gems");
+        // Version without a dot (rare, hits fallback path)
+        std::fs::create_dir_all(gems_dir.join("mygem-1")).unwrap();
+        let index = build_gem_index(&[dir.path().to_path_buf()]);
+        assert!(index.contains_key("mygem"));
+    }
+
+    #[test]
+    fn build_gem_index_non_dir_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let gems_dir = dir.path().join("gems");
+        std::fs::create_dir_all(&gems_dir).unwrap();
+        // A file instead of a directory — should be skipped
+        std::fs::write(gems_dir.join("rails-7.1.0"), "not a dir").unwrap();
+        let index = build_gem_index(&[dir.path().to_path_buf()]);
+        assert!(!index.contains_key("rails"));
+    }
+
+    #[test]
+    fn build_gem_index_no_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let gems_dir = dir.path().join("gems");
+        std::fs::create_dir_all(gems_dir.join("my-extension")).unwrap();
+        let index = build_gem_index(&[dir.path().to_path_buf()]);
+        // "my-extension" doesn't have a numeric version, so should not be indexed
+        assert!(!index.contains_key("my"));
+    }
+
+    #[test]
+    fn build_gem_index_multiple_paths() {
+        let dir1 = tempfile::tempdir().unwrap();
+        let dir2 = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir1.path().join("gems").join("rails-7.0.0")).unwrap();
+        std::fs::create_dir_all(dir2.path().join("gems").join("puma-6.0.0")).unwrap();
+        let index = build_gem_index(&[dir1.path().to_path_buf(), dir2.path().to_path_buf()]);
+        assert!(index.contains_key("rails"));
+        assert!(index.contains_key("puma"));
+    }
+
+    // ── discover_gem_require_paths edge cases ──
+
+    #[test]
+    fn discover_require_paths_with_custom_gemspec() {
+        let dir = tempfile::tempdir().unwrap();
+        let gems_dir = dir.path().join("gems");
+        let gem_dir = gems_dir.join("mygem-1.0.0");
+        std::fs::create_dir_all(&gem_dir).unwrap();
+        // Gemspec with custom require_paths
+        std::fs::write(
+            gem_dir.join("mygem.gemspec"),
+            "Gem::Specification.new do |s|\n  s.require_paths = [\"lib\", \"ext\"]\nend\n",
+        )
+        .unwrap();
+        let lib_dir = gem_dir.join("lib");
+        let ext_dir = gem_dir.join("ext");
+        std::fs::create_dir_all(&lib_dir).unwrap();
+        std::fs::create_dir_all(&ext_dir).unwrap();
+        std::fs::write(lib_dir.join("mygem.rb"), "# main").unwrap();
+        std::fs::write(ext_dir.join("native.rb"), "# native").unwrap();
+
+        let index = build_gem_index(&[dir.path().to_path_buf()]);
+        let paths = discover_gem_require_paths("mygem", &index).unwrap();
+        assert!(paths.contains(&"mygem".to_string()));
+        assert!(paths.contains(&"native".to_string()));
+    }
+
+    #[test]
+    fn discover_require_paths_nonexistent_require_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let gems_dir = dir.path().join("gems");
+        let gem_dir = gems_dir.join("mygem-1.0.0");
+        std::fs::create_dir_all(&gem_dir).unwrap();
+        // Gemspec points to "ext" but that dir doesn't exist
+        std::fs::write(
+            gem_dir.join("mygem.gemspec"),
+            "Gem::Specification.new do |s|\n  s.require_path = 'ext'\nend\n",
+        )
+        .unwrap();
+
+        let index = build_gem_index(&[dir.path().to_path_buf()]);
+        let paths = discover_gem_require_paths("mygem", &index);
+        assert!(paths.is_none());
+    }
+
+    #[test]
+    fn discover_require_paths_with_subdirs() {
+        let dir = tempfile::tempdir().unwrap();
+        let gems_dir = dir.path().join("gems");
+        let gem_dir = gems_dir.join("mygem-1.0.0");
+        let lib_dir = gem_dir.join("lib");
+        std::fs::create_dir_all(&lib_dir).unwrap();
+        // A subdirectory in lib/ (like "mygem/")
+        std::fs::create_dir(lib_dir.join("mygem")).unwrap();
+        // A non-.rb file should be ignored
+        std::fs::write(lib_dir.join("README.md"), "# readme").unwrap();
+
+        let index = build_gem_index(&[dir.path().to_path_buf()]);
+        let paths = discover_gem_require_paths("mygem", &index).unwrap();
+        assert!(paths.contains(&"mygem".to_string()));
+        assert!(!paths.contains(&"README".to_string()));
+    }
+
+    // ── extract_gem_metadata + build_vendor_cache_index ──
+
+    #[test]
+    fn extract_gem_metadata_from_tarball() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let gem_path = dir.path().join("test-1.0.0.gem");
+
+        // Create a minimal .gem file (tar archive with metadata.gz)
+        let yaml = "--- !ruby/object:Gem::Specification\nname: test\nversion: 1.0.0\nrequire_paths:\n- lib\nexecutables:\n- test_exe\n";
+
+        // Compress yaml with gzip
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(yaml.as_bytes()).unwrap();
+        let compressed = encoder.finish().unwrap();
+
+        // Create tar archive
+        let mut builder = tar::Builder::new(Vec::new());
+        let mut header = tar::Header::new_gnu();
+        header.set_path("metadata.gz").unwrap();
+        header.set_size(compressed.len() as u64);
+        header.set_cksum();
+        builder.append(&header, &compressed[..]).unwrap();
+        let tar_data = builder.into_inner().unwrap();
+
+        std::fs::write(&gem_path, &tar_data).unwrap();
+
+        let meta = extract_gem_metadata(&gem_path);
+        assert!(meta.is_some());
+        let meta = meta.unwrap();
+        assert_eq!(meta.require_paths, vec!["lib"]);
+        assert_eq!(meta.executables, vec!["test_exe"]);
+    }
+
+    #[test]
+    fn build_vendor_cache_index_with_gem() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let cache_dir = dir.path().join("vendor").join("cache");
+        std::fs::create_dir_all(&cache_dir).unwrap();
+
+        let yaml = "--- !ruby/object:Gem::Specification\nname: mygem\nrequire_paths:\n- lib\nexecutables:\n- myexe\n";
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(yaml.as_bytes()).unwrap();
+        let compressed = encoder.finish().unwrap();
+
+        let mut builder = tar::Builder::new(Vec::new());
+        let mut header = tar::Header::new_gnu();
+        header.set_path("metadata.gz").unwrap();
+        header.set_size(compressed.len() as u64);
+        header.set_cksum();
+        builder.append(&header, &compressed[..]).unwrap();
+        let tar_data = builder.into_inner().unwrap();
+
+        std::fs::write(cache_dir.join("mygem-1.0.0.gem"), &tar_data).unwrap();
+
+        let index = build_vendor_cache_index(dir.path());
+        assert!(index.contains_key("mygem"));
+        let meta = &index["mygem"];
+        assert_eq!(meta.executables, vec!["myexe"]);
+    }
+
+    // ── find_gem_paths with GEM_HOME bundle path ──
+
+    #[test]
+    fn find_gem_paths_bundle_path_direct_gems() {
+        let dir = tempfile::tempdir().unwrap();
+        let bundle_dir = dir.path().join(".bundle");
+        std::fs::create_dir_all(&bundle_dir).unwrap();
+        // BUNDLE_PATH with gems directly under it (no ruby/<version> subdir)
+        let vendor = dir.path().join("vendor/gems");
+        std::fs::create_dir_all(vendor.join("gems")).unwrap();
+        std::fs::write(
+            bundle_dir.join("config"),
+            "---\nBUNDLE_PATH: \"vendor/gems\"\n",
+        )
+        .unwrap();
+
+        let paths = find_gem_paths(dir.path());
+        assert!(!paths.is_empty());
+    }
+
+    // ── bundle_path edge cases ──
+
+    #[test]
+    fn bundle_path_empty_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let bundle_dir = dir.path().join(".bundle");
+        std::fs::create_dir_all(&bundle_dir).unwrap();
+        std::fs::write(bundle_dir.join("config"), "---\nBUNDLE_PATH: \"\"\n").unwrap();
+        assert_eq!(read_bundle_path(dir.path()), None);
+    }
+
+    #[test]
+    fn bundle_path_unquoted() {
+        let dir = tempfile::tempdir().unwrap();
+        let bundle_dir = dir.path().join(".bundle");
+        std::fs::create_dir_all(&bundle_dir).unwrap();
+        std::fs::write(
+            bundle_dir.join("config"),
+            "---\nBUNDLE_PATH: vendor/bundle\n",
+        )
+        .unwrap();
+        assert_eq!(
+            read_bundle_path(dir.path()),
+            Some(PathBuf::from("vendor/bundle"))
+        );
+    }
+
+    // ── parse_gem_metadata_yaml edge cases ──
+
+    #[test]
+    fn parse_metadata_yaml_multiline_executables() {
+        let yaml = "name: mygem\nrequire_paths:\n- lib\n- ext\nexecutables:\n- exe1\n- exe2\nother_field: value\n";
+        let meta = parse_gem_metadata_yaml(yaml).unwrap();
+        assert_eq!(meta.require_paths, vec!["lib", "ext"]);
+        assert_eq!(meta.executables, vec!["exe1", "exe2"]);
+    }
+
+    #[test]
+    fn parse_metadata_no_sections() {
+        // Just random YAML with no require_paths or executables
+        let yaml = "name: test\nversion: 1.0\nauthors:\n- Alice\n";
+        let meta = parse_gem_metadata_yaml(yaml).unwrap();
+        assert_eq!(meta.require_paths, vec!["lib"]); // defaults
+        assert!(meta.executables.is_empty());
+    }
+
+    // ── extract_gem_name_from_filename edge cases ──
+
+    #[test]
+    fn gem_name_platform_suffix() {
+        assert_eq!(
+            extract_gem_name_from_filename("nokogiri-1.16.0-x86_64-linux"),
+            Some("nokogiri".to_string())
+        );
+    }
+
+    #[test]
+    fn gem_name_pre_release() {
+        assert_eq!(
+            extract_gem_name_from_filename("rails-7.2.0.beta1"),
+            Some("rails".to_string())
+        );
     }
 }

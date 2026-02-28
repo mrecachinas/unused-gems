@@ -18,7 +18,14 @@ pub fn print_diff(
         }
     };
 
-    let baseline: Vec<BaselineGem> = match serde_json::from_str(&content) {
+    print_diff_from_content(results, &content)
+}
+
+fn print_diff_from_content(
+    results: &HashMap<String, crate::types::GemResult>,
+    content: &str,
+) -> usize {
+    let baseline: Vec<BaselineGem> = match serde_json::from_str(content) {
         Ok(b) => b,
         Err(e) => {
             eprintln!("Error: Could not parse baseline: {}", e);
@@ -128,4 +135,86 @@ pub fn print_diff(
     }
 
     newly_unused.len()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{Evidence, GemEntry, GemResult, GemStatus};
+
+    fn make_result(name: &str, status: GemStatus) -> (String, GemResult) {
+        (
+            name.to_string(),
+            GemResult {
+                status,
+                files: Vec::new(),
+                evidence: Vec::new(),
+                gem: GemEntry {
+                    name: name.to_string(),
+                    groups: vec!["default".to_string()],
+                    require_paths: Vec::new(),
+                    module_names: Vec::new(),
+                    require_false: false,
+                },
+            },
+        )
+    }
+
+    #[test]
+    fn no_changes() {
+        let results: HashMap<String, GemResult> = [make_result("rails", GemStatus::Used)]
+            .into_iter()
+            .collect();
+        let baseline = r#"[{"name":"rails","status":"used"}]"#;
+        assert_eq!(print_diff_from_content(&results, baseline), 0);
+    }
+
+    #[test]
+    fn newly_unused_gem() {
+        let results: HashMap<String, GemResult> = [make_result("rails", GemStatus::Unused)]
+            .into_iter()
+            .collect();
+        let baseline = r#"[{"name":"rails","status":"used"}]"#;
+        assert_eq!(print_diff_from_content(&results, baseline), 1);
+    }
+
+    #[test]
+    fn newly_used_gem() {
+        let results: HashMap<String, GemResult> = [make_result("rails", GemStatus::Used)]
+            .into_iter()
+            .collect();
+        let baseline = r#"[{"name":"rails","status":"unused"}]"#;
+        assert_eq!(print_diff_from_content(&results, baseline), 0);
+    }
+
+    #[test]
+    fn added_gem() {
+        let results: HashMap<String, GemResult> = [
+            make_result("rails", GemStatus::Used),
+            make_result("puma", GemStatus::Used),
+        ]
+        .into_iter()
+        .collect();
+        let baseline = r#"[{"name":"rails","status":"used"}]"#;
+        assert_eq!(print_diff_from_content(&results, baseline), 0);
+    }
+
+    #[test]
+    fn removed_gem() {
+        let results: HashMap<String, GemResult> = [make_result("rails", GemStatus::Used)]
+            .into_iter()
+            .collect();
+        let baseline = r#"[{"name":"rails","status":"used"},{"name":"puma","status":"used"}]"#;
+        assert_eq!(print_diff_from_content(&results, baseline), 0);
+    }
+
+    #[test]
+    fn status_change_non_unused() {
+        let results: HashMap<String, GemResult> =
+            [make_result("rails", GemStatus::BundlerRequired)]
+                .into_iter()
+                .collect();
+        let baseline = r#"[{"name":"rails","status":"used"}]"#;
+        assert_eq!(print_diff_from_content(&results, baseline), 0);
+    }
 }

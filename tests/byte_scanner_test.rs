@@ -237,9 +237,7 @@ fn scan_bundler_require(
         while end < bytes.len() && bytes[end] != b'\n' {
             end += 1;
         }
-        let rest = std::str::from_utf8(&bytes[after..end])
-            .unwrap_or("")
-            .trim();
+        let rest = std::str::from_utf8(&bytes[after..end]).unwrap_or("").trim();
         if rest.is_empty() || rest.starts_with('#') {
             *bundler_require_all = true;
         } else if rest.contains("Rails.groups") || rest.contains("Rails.env") {
@@ -256,7 +254,9 @@ fn scan_bundler_require(
 // ── Regex helpers ────────────────────────────────────────────────────────────
 
 fn regex_requires(input: &str) -> Vec<String> {
-    let re = Regex::new(r"(?:require|require_dependency)\s*[\(]?\s*['\x22]([^'\x22]+)['\x22]\s*[\)]?").unwrap();
+    let re =
+        Regex::new(r"(?:require|require_dependency)\s*[\(]?\s*['\x22]([^'\x22]+)['\x22]\s*[\)]?")
+            .unwrap();
     re.captures_iter(input).map(|c| c[1].to_string()).collect()
 }
 
@@ -332,31 +332,51 @@ fn byte_bundler(input: &str) -> (Vec<String>, bool) {
 fn assert_same_requires(input: &str) {
     let r = regex_requires(input);
     let b = byte_requires(input);
-    assert_eq!(r, b, "MISMATCH on input: {:?}\n  regex={:?}\n  bytes={:?}", input, r, b);
+    assert_eq!(
+        r, b,
+        "MISMATCH on input: {:?}\n  regex={:?}\n  bytes={:?}",
+        input, r, b
+    );
 }
 
 fn assert_same_autoloads(input: &str) {
     let r = regex_autoloads(input);
     let b = byte_autoloads(input);
-    assert_eq!(r, b, "MISMATCH on input: {:?}\n  regex={:?}\n  bytes={:?}", input, r, b);
+    assert_eq!(
+        r, b,
+        "MISMATCH on input: {:?}\n  regex={:?}\n  bytes={:?}",
+        input, r, b
+    );
 }
 
 fn assert_same_gem_bin(input: &str) {
     let r = regex_gem_bin(input);
     let b = byte_gem_bin(input);
-    assert_eq!(r, b, "MISMATCH on input: {:?}\n  regex={:?}\n  bytes={:?}", input, r, b);
+    assert_eq!(
+        r, b,
+        "MISMATCH on input: {:?}\n  regex={:?}\n  bytes={:?}",
+        input, r, b
+    );
 }
 
 fn assert_same_modules(input: &str) {
     let r = regex_modules(input);
     let b = byte_modules(input);
-    assert_eq!(r, b, "MISMATCH on input: {:?}\n  regex={:?}\n  bytes={:?}", input, r, b);
+    assert_eq!(
+        r, b,
+        "MISMATCH on input: {:?}\n  regex={:?}\n  bytes={:?}",
+        input, r, b
+    );
 }
 
 fn assert_same_bundler(input: &str) {
     let r = regex_bundler(input);
     let b = byte_bundler(input);
-    assert_eq!(r, b, "MISMATCH on input: {:?}\n  regex={:?}\n  bytes={:?}", input, r, b);
+    assert_eq!(
+        r, b,
+        "MISMATCH on input: {:?}\n  regex={:?}\n  bytes={:?}",
+        input, r, b
+    );
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -418,8 +438,15 @@ fn requires_rejects_gem_require() {
     let input = "gem_require 'foo'";
     let r = regex_requires(input);
     let b = byte_requires(input);
-    assert_eq!(r, vec!["foo"], "regex lacks word boundary — matches inside gem_require");
-    assert!(b.is_empty(), "byte scanner correctly rejects (word boundary check)");
+    assert_eq!(
+        r,
+        vec!["foo"],
+        "regex lacks word boundary — matches inside gem_require"
+    );
+    assert!(
+        b.is_empty(),
+        "byte scanner correctly rejects (word boundary check)"
+    );
 }
 
 #[test]
@@ -442,7 +469,10 @@ fn requires_false_neg_newline_before_quote() {
     let r = regex_requires(input);
     let b = byte_requires(input);
     assert_eq!(r, vec!["json"], "regex should match");
-    assert!(b.is_empty(), "FALSE NEGATIVE: byte scanner misses newline-separated require");
+    assert!(
+        b.is_empty(),
+        "FALSE NEGATIVE: byte scanner misses newline-separated require"
+    );
 }
 
 #[test]
@@ -451,7 +481,10 @@ fn requires_false_neg_newline_after_paren() {
     let r = regex_requires(input);
     let b = byte_requires(input);
     assert_eq!(r, vec!["json"], "regex should match");
-    assert!(b.is_empty(), "FALSE NEGATIVE: byte scanner misses newline after paren");
+    assert!(
+        b.is_empty(),
+        "FALSE NEGATIVE: byte scanner misses newline after paren"
+    );
 }
 
 // ── scan_requires: EDGE CASE — extract_quoted captures opposite quote ────────
@@ -466,7 +499,11 @@ fn requires_edge_opposite_quote_in_string() {
     // Regex opens with ', [^'"]+ matches "foo" (stops at "), closing quote = "
     assert_eq!(r, vec!["foo"], "regex stops at the embedded double-quote");
     // Byte scanner opens with ', reads until ' → captures foo"bar
-    assert_eq!(b, vec!["foo\"bar"], "byte scanner reads until matching quote");
+    assert_eq!(
+        b,
+        vec!["foo\"bar"],
+        "byte scanner reads until matching quote"
+    );
     assert_ne!(r, b, "EDGE CASE: different captured text for mixed quotes");
 }
 
@@ -476,7 +513,11 @@ fn requires_edge_double_quote_contains_single() {
     let r = regex_requires(input);
     let b = byte_requires(input);
     assert_eq!(r, vec!["foo"], "regex stops at embedded single-quote");
-    assert_eq!(b, vec!["foo'bar"], "byte scanner reads until matching double-quote");
+    assert_eq!(
+        b,
+        vec!["foo'bar"],
+        "byte scanner reads until matching double-quote"
+    );
     assert_ne!(r, b);
 }
 
@@ -489,9 +530,16 @@ fn requires_edge_newline_in_string() {
     let r = regex_requires(input);
     let b = byte_requires(input);
     // Regex [^'"]+ matches across newline
-    assert_eq!(r, vec!["foo\nbar"], "regex matches across newline in string");
+    assert_eq!(
+        r,
+        vec!["foo\nbar"],
+        "regex matches across newline in string"
+    );
     // Byte scanner stops at \n → no closing quote found before newline
-    assert!(b.is_empty(), "FALSE NEGATIVE: byte scanner rejects newline inside string");
+    assert!(
+        b.is_empty(),
+        "FALSE NEGATIVE: byte scanner rejects newline inside string"
+    );
 }
 
 // ── scan_autoloads: happy-path ───────────────────────────────────────────────
@@ -519,8 +567,15 @@ fn autoloads_rejects_my_autoload() {
     let input = "my_autoload :Foo, 'foo'";
     let r = regex_autoloads(input);
     let b = byte_autoloads(input);
-    assert_eq!(r, vec!["foo"], "regex lacks word boundary — matches inside my_autoload");
-    assert!(b.is_empty(), "byte scanner correctly rejects (word boundary check)");
+    assert_eq!(
+        r,
+        vec!["foo"],
+        "regex lacks word boundary — matches inside my_autoload"
+    );
+    assert!(
+        b.is_empty(),
+        "byte scanner correctly rejects (word boundary check)"
+    );
 }
 
 // ── scan_autoloads: Empty symbol correctly rejected ──────────────────────────
@@ -531,7 +586,10 @@ fn autoloads_rejects_empty_symbol() {
     let input = "autoload :, 'foo'";
     let r = regex_autoloads(input);
     let b = byte_autoloads(input);
-    assert!(r.is_empty(), "regex requires at least one word char after :");
+    assert!(
+        r.is_empty(),
+        "regex requires at least one word char after :"
+    );
     assert!(b.is_empty(), "byte scanner now also rejects empty symbol");
 }
 
@@ -554,7 +612,11 @@ fn autoloads_edge_opposite_quote() {
     let r = regex_autoloads(input);
     let b = byte_autoloads(input);
     assert_eq!(r, vec!["bar"], "regex stops at embedded double-quote");
-    assert_eq!(b, vec!["bar\"baz"], "byte scanner reads until matching single-quote");
+    assert_eq!(
+        b,
+        vec!["bar\"baz"],
+        "byte scanner reads until matching single-quote"
+    );
     assert_ne!(r, b);
 }
 
@@ -583,7 +645,10 @@ fn gem_bin_false_neg_newline() {
     let r = regex_gem_bin(input);
     let b = byte_gem_bin(input);
     assert_eq!(r, vec!["rake"], "regex \\s* matches newline");
-    assert!(b.is_empty(), "FALSE NEGATIVE: byte scanner misses newline before paren");
+    assert!(
+        b.is_empty(),
+        "FALSE NEGATIVE: byte scanner misses newline before paren"
+    );
 }
 
 // ── scan_gem_bin: EDGE CASE — mixed quotes ──────────────────────────────────
@@ -594,7 +659,11 @@ fn gem_bin_edge_opposite_quote() {
     let r = regex_gem_bin(input);
     let b = byte_gem_bin(input);
     assert_eq!(r, vec!["foo"], "regex stops at embedded double-quote");
-    assert_eq!(b, vec!["foo\"bar"], "byte scanner reads until matching quote");
+    assert_eq!(
+        b,
+        vec!["foo\"bar"],
+        "byte scanner reads until matching quote"
+    );
     assert_ne!(r, b);
 }
 
@@ -716,9 +785,16 @@ fn modules_false_pos_unicode_suffix() {
     let r = regex_modules(input);
     let b = byte_modules(input);
     // Regex: \b between 'o' and 'é' does not hold (both Unicode word chars) → no match
-    assert!(r.is_empty(), "regex sees no word boundary before Unicode letter");
+    assert!(
+        r.is_empty(),
+        "regex sees no word boundary before Unicode letter"
+    );
     // Byte scanner: 'é' is 0xC3 0xA9 in UTF-8, first byte not ASCII alnum/_ → boundary
-    assert_eq!(b, vec!["Foo"], "FALSE POSITIVE: byte scanner ignores Unicode word chars");
+    assert_eq!(
+        b,
+        vec!["Foo"],
+        "FALSE POSITIVE: byte scanner ignores Unicode word chars"
+    );
 }
 
 #[test]
@@ -727,9 +803,16 @@ fn modules_false_pos_unicode_prefix() {
     let r = regex_modules(input);
     let b = byte_modules(input);
     // Regex: \b between 'é' (word) and 'F' (word) → no boundary → no match
-    assert!(r.is_empty(), "regex sees no word boundary after Unicode letter");
+    assert!(
+        r.is_empty(),
+        "regex sees no word boundary after Unicode letter"
+    );
     // Byte scanner: byte before F is 0xA9 (last byte of é), not ASCII word char → matches
-    assert_eq!(b, vec!["Foo"], "FALSE POSITIVE: byte scanner treats UTF-8 continuation byte as non-word");
+    assert_eq!(
+        b,
+        vec!["Foo"],
+        "FALSE POSITIVE: byte scanner treats UTF-8 continuation byte as non-word"
+    );
 }
 
 #[test]
@@ -743,7 +826,11 @@ fn modules_false_pos_unicode_between_namespaces() {
     // Byte scanner: Foo matches, then 0xC3 is not word char → matches "Foo"
     // Then at position of "Bar" (after é's 2 bytes): B is uppercase, preceded by 0xA9 (not word char)
     // → matches "Bar"
-    assert_eq!(b, vec!["Foo", "Bar"], "FALSE POSITIVE: byte scanner matches both parts");
+    assert_eq!(
+        b,
+        vec!["Foo", "Bar"],
+        "FALSE POSITIVE: byte scanner matches both parts"
+    );
 }
 
 // ── scan_modules: single uppercase + single :: segment ───────────────────────
@@ -881,8 +968,14 @@ fn print_audit_summary() {
     }
 
     let cases_req_edge: Vec<(&str, &str)> = vec![
-        (r#"require 'foo"bar'"#, "opposite quote in single-quoted string"),
-        (r#"require "foo'bar""#, "opposite quote in double-quoted string"),
+        (
+            r#"require 'foo"bar'"#,
+            "opposite quote in single-quoted string",
+        ),
+        (
+            r#"require "foo'bar""#,
+            "opposite quote in double-quoted string",
+        ),
     ];
     for (input, desc) in &cases_req_edge {
         let r = regex_requires(input);
@@ -918,7 +1011,9 @@ fn print_audit_summary() {
         let r = regex_autoloads(input);
         let b = byte_autoloads(input);
         if r.is_empty() && !b.is_empty() {
-            false_positives.push(format!("scan_autoloads: empty symbol — regex={r:?}, bytes={b:?}"));
+            false_positives.push(format!(
+                "scan_autoloads: empty symbol — regex={r:?}, bytes={b:?}"
+            ));
         }
     }
     {
@@ -926,7 +1021,9 @@ fn print_audit_summary() {
         let r = regex_autoloads(input);
         let b = byte_autoloads(input);
         if !r.is_empty() && b.is_empty() {
-            false_negatives.push(format!("scan_autoloads: newline before symbol — regex={r:?}, bytes={b:?}"));
+            false_negatives.push(format!(
+                "scan_autoloads: newline before symbol — regex={r:?}, bytes={b:?}"
+            ));
         }
     }
 
@@ -936,7 +1033,9 @@ fn print_audit_summary() {
         let r = regex_gem_bin(input);
         let b = byte_gem_bin(input);
         if !r.is_empty() && b.is_empty() {
-            false_negatives.push(format!("scan_gem_bin: newline before paren — regex={r:?}, bytes={b:?}"));
+            false_negatives.push(format!(
+                "scan_gem_bin: newline before paren — regex={r:?}, bytes={b:?}"
+            ));
         }
     }
 
@@ -976,27 +1075,42 @@ fn print_audit_summary() {
     eprintln!("  BYTE SCANNER CORRECTNESS AUDIT SUMMARY");
     eprintln!("{}\n", "=".repeat(72));
 
-    eprintln!("FALSE NEGATIVES (regex matches, byte scanner misses): {}", false_negatives.len());
+    eprintln!(
+        "FALSE NEGATIVES (regex matches, byte scanner misses): {}",
+        false_negatives.len()
+    );
     for fn_ in &false_negatives {
         eprintln!("  ✗ {fn_}");
     }
 
-    eprintln!("\nREGEX FALSE POSITIVES (regex matches inside words, byte scanner correctly rejects): {}", regex_false_positives.len());
+    eprintln!(
+        "\nREGEX FALSE POSITIVES (regex matches inside words, byte scanner correctly rejects): {}",
+        regex_false_positives.len()
+    );
     for rfp in &regex_false_positives {
         eprintln!("  ✓ {rfp}");
     }
 
-    eprintln!("\nFALSE POSITIVES (byte scanner matches, regex wouldn't): {}", false_positives.len());
+    eprintln!(
+        "\nFALSE POSITIVES (byte scanner matches, regex wouldn't): {}",
+        false_positives.len()
+    );
     for fp in &false_positives {
         eprintln!("  ✗ {fp}");
     }
 
-    eprintln!("\nEDGE CASES (different captured text): {}", edge_cases.len());
+    eprintln!(
+        "\nEDGE CASES (different captured text): {}",
+        edge_cases.len()
+    );
     for ec in &edge_cases {
         eprintln!("  ⚠ {ec}");
     }
 
-    let total = false_negatives.len() + false_positives.len() + regex_false_positives.len() + edge_cases.len();
+    let total = false_negatives.len()
+        + false_positives.len()
+        + regex_false_positives.len()
+        + edge_cases.len();
     eprintln!("\nTotal discrepancies: {total}");
     eprintln!("{}\n", "=".repeat(72));
 

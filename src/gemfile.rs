@@ -15,6 +15,7 @@ pub fn parse_gemfile(dir: &Path) -> Vec<GemEntry> {
     let mut gems = Vec::new();
     let mut files_to_process = vec![dir.join("Gemfile")];
     let mut processed_files = std::collections::HashSet::new();
+    let mut has_bare_gemspec = false;
 
     while let Some(path) = files_to_process.pop() {
         if !path.exists() {
@@ -40,10 +41,14 @@ pub fn parse_gemfile(dir: &Path) -> Vec<GemEntry> {
             source: &source,
             eval_gemfiles: Vec::new(),
             gemspec_paths: Vec::new(),
+            has_bare_gemspec: false,
         };
         visitor.visit(&parse_result.node());
 
         gems.extend(visitor.gems);
+        if visitor.has_bare_gemspec {
+            has_bare_gemspec = true;
+        }
 
         let parent = path.parent().unwrap_or(dir);
         for eval_path in visitor.eval_gemfiles {
@@ -61,10 +66,12 @@ pub fn parse_gemfile(dir: &Path) -> Vec<GemEntry> {
         }
     }
 
-    // Also parse gemspec in the root directory (default gemspec with no path: arg)
-    let pattern = dir.join("*.gemspec").display().to_string();
-    for entry in glob::glob(&pattern).into_iter().flatten().flatten() {
-        parse_gemspec_deps(&entry, &mut gems);
+    // Only parse root gemspecs if a bare `gemspec` directive (no path: arg) was found
+    if has_bare_gemspec {
+        let pattern = dir.join("*.gemspec").display().to_string();
+        for entry in glob::glob(&pattern).into_iter().flatten().flatten() {
+            parse_gemspec_deps(&entry, &mut gems);
+        }
     }
 
     gems
@@ -76,6 +83,7 @@ struct GemfileVisitor<'s> {
     source: &'s [u8],
     eval_gemfiles: Vec<String>,
     gemspec_paths: Vec<String>,
+    has_bare_gemspec: bool,
 }
 
 impl<'s> GemfileVisitor<'s> {
@@ -122,8 +130,7 @@ impl<'s> GemfileVisitor<'s> {
                                 }
                             }
                             Some("group") | Some("groups") => {
-                                if let Some(sym) =
-                                    extract_symbol_value(&assoc.value(), self.source)
+                                if let Some(sym) = extract_symbol_value(&assoc.value(), self.source)
                                 {
                                     groups.push(sym);
                                 } else if let Some(arr) = assoc.value().as_array_node() {
@@ -148,7 +155,11 @@ impl<'s> GemfileVisitor<'s> {
         self.gems.push(GemEntry {
             name,
             groups,
-            require_paths: if require_false { Vec::new() } else { require_paths },
+            require_paths: if require_false {
+                Vec::new()
+            } else {
+                require_paths
+            },
             module_names: Vec::new(),
             require_false,
         });
@@ -182,15 +193,16 @@ impl<'s> Visit<'_> for GemfileVisitor<'s> {
             self.current_groups.truncate(prev_len);
             return;
         } else if name_bytes == b"eval_gemfile" && node.receiver().is_none() {
-             if let Some(args) = node.arguments() {
+            if let Some(args) = node.arguments() {
                 if let Some(first) = args.arguments().iter().next() {
                     if let Some(path) = extract_string_value(&first, self.source) {
                         self.eval_gemfiles.push(path);
                     }
                 }
-             }
+            }
         } else if name_bytes == b"gemspec" && node.receiver().is_none() {
             // Extract path: argument for gemspec directives
+            let mut has_path = false;
             if let Some(args) = node.arguments() {
                 for arg in args.arguments().iter() {
                     if let Some(hash) = arg.as_keyword_hash_node() {
@@ -198,14 +210,20 @@ impl<'s> Visit<'_> for GemfileVisitor<'s> {
                             if let Some(assoc) = elem.as_assoc_node() {
                                 let key_name = extract_key_name(&assoc.key(), self.source);
                                 if key_name.as_deref() == Some("path") {
-                                    if let Some(p) = extract_string_value(&assoc.value(), self.source) {
+                                    if let Some(p) =
+                                        extract_string_value(&assoc.value(), self.source)
+                                    {
                                         self.gemspec_paths.push(p);
+                                        has_path = true;
                                     }
                                 }
                             }
                         }
                     }
                 }
+            }
+            if !has_path {
+                self.has_bare_gemspec = true;
             }
         }
 
@@ -315,7 +333,9 @@ mod tests {
     }
 
     fn find_gem<'a>(gems: &'a [GemEntry], name: &str) -> &'a GemEntry {
-        gems.iter().find(|g| g.name == name).unwrap_or_else(|| panic!("gem '{}' not found", name))
+        gems.iter()
+            .find(|g| g.name == name)
+            .unwrap_or_else(|| panic!("gem '{}' not found", name))
     }
 
     #[test]
@@ -383,14 +403,22 @@ mod tests {
     #[test]
     fn gemspec_deps() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("Gemfile"), "source 'https://rubygems.org'\ngemspec\n").unwrap();
-        std::fs::write(dir.path().join("foo.gemspec"), r#"
+        std::fs::write(
+            dir.path().join("Gemfile"),
+            "source 'https://rubygems.org'\ngemspec\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("foo.gemspec"),
+            r#"
 Gem::Specification.new do |s|
   s.name = 'foo'
   s.add_dependency 'faraday'
   s.add_development_dependency 'rspec'
 end
-"#).unwrap();
+"#,
+        )
+        .unwrap();
         let gems = parse_gemfile(dir.path());
         let faraday = find_gem(&gems, "faraday");
         assert_eq!(faraday.groups, vec!["default"]);
@@ -401,7 +429,11 @@ end
     #[test]
     fn eval_gemfile() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("Gemfile"), "eval_gemfile('Gemfile.shared')\ngem 'rails'\n").unwrap();
+        std::fs::write(
+            dir.path().join("Gemfile"),
+            "eval_gemfile('Gemfile.shared')\ngem 'rails'\n",
+        )
+        .unwrap();
         std::fs::write(dir.path().join("Gemfile.shared"), "gem 'puma'\n").unwrap();
         let gems = parse_gemfile(dir.path());
         assert_eq!(gems.len(), 2);
@@ -416,11 +448,15 @@ end
         let sub = dir.path().join("engines/core");
         std::fs::create_dir_all(&sub).unwrap();
         std::fs::write(dir.path().join("Gemfile"), "gemspec path: 'engines/core'\n").unwrap();
-        std::fs::write(sub.join("core.gemspec"), r#"
+        std::fs::write(
+            sub.join("core.gemspec"),
+            r#"
 Gem::Specification.new do |s|
   s.add_dependency 'activesupport'
 end
-"#).unwrap();
+"#,
+        )
+        .unwrap();
         let gems = parse_gemfile(dir.path());
         assert!(gems.iter().any(|g| g.name == "activesupport"));
     }
@@ -429,14 +465,149 @@ end
     fn deduplicates_gemspec_and_gemfile() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("Gemfile"), "gemspec\ngem 'faraday'\n").unwrap();
-        std::fs::write(dir.path().join("foo.gemspec"), r#"
+        std::fs::write(
+            dir.path().join("foo.gemspec"),
+            r#"
 Gem::Specification.new do |s|
   s.add_dependency 'faraday'
 end
-"#).unwrap();
+"#,
+        )
+        .unwrap();
         let gems = parse_gemfile(dir.path());
         let faraday_count = gems.iter().filter(|g| g.name == "faraday").count();
         // Should appear once from Gemfile, gemspec dep skipped because it already exists
         assert_eq!(faraday_count, 1);
+    }
+
+    #[test]
+    fn root_gemspec_not_parsed_without_directive() {
+        let dir = tempfile::tempdir().unwrap();
+        // Gemfile with NO gemspec directive
+        std::fs::write(dir.path().join("Gemfile"), "gem 'rails'\n").unwrap();
+        // Root gemspec that shouldn't be analyzed
+        std::fs::write(
+            dir.path().join("stale.gemspec"),
+            r#"
+Gem::Specification.new do |s|
+  s.add_dependency 'phantom_dep'
+end
+"#,
+        )
+        .unwrap();
+        let gems = parse_gemfile(dir.path());
+        assert!(
+            !gems.iter().any(|g| g.name == "phantom_dep"),
+            "root gemspec should not be parsed without gemspec directive"
+        );
+        assert!(gems.iter().any(|g| g.name == "rails"));
+    }
+
+    #[test]
+    fn root_gemspec_parsed_with_bare_gemspec_directive() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Gemfile"), "gemspec\ngem 'rails'\n").unwrap();
+        std::fs::write(
+            dir.path().join("foo.gemspec"),
+            r#"
+Gem::Specification.new do |s|
+  s.add_dependency 'faraday'
+end
+"#,
+        )
+        .unwrap();
+        let gems = parse_gemfile(dir.path());
+        assert!(
+            gems.iter().any(|g| g.name == "faraday"),
+            "root gemspec should be parsed when gemspec directive exists"
+        );
+        assert!(gems.iter().any(|g| g.name == "rails"));
+    }
+
+    #[test]
+    fn gem_groups_keyword_array() {
+        let gems = parse_gems("gem 'rspec', groups: [:test, :development]\n");
+        let g = find_gem(&gems, "rspec");
+        assert!(g.groups.contains(&"test".to_string()));
+        assert!(g.groups.contains(&"development".to_string()));
+    }
+
+    #[test]
+    fn gem_require_array_of_paths() {
+        let gems = parse_gems(
+            "gem 'ddtrace', require: ['datadog/profiling', 'ddtrace/auto_instrument']\n",
+        );
+        let g = find_gem(&gems, "ddtrace");
+        assert_eq!(g.require_paths.len(), 2);
+    }
+
+    #[test]
+    fn gemspec_add_runtime_dependency() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Gemfile"), "gemspec\n").unwrap();
+        std::fs::write(
+            dir.path().join("test.gemspec"),
+            r#"
+Gem::Specification.new do |s|
+  s.add_runtime_dependency 'activesupport', '>= 5.0'
+end
+"#,
+        )
+        .unwrap();
+        let gems = parse_gemfile(dir.path());
+        let dep = find_gem(&gems, "activesupport");
+        assert_eq!(dep.groups, vec!["default"]);
+    }
+
+    #[test]
+    fn gemspec_development_dependency_group() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Gemfile"), "gemspec\n").unwrap();
+        std::fs::write(
+            dir.path().join("test.gemspec"),
+            r#"
+Gem::Specification.new do |s|
+  s.add_development_dependency 'rubocop'
+end
+"#,
+        )
+        .unwrap();
+        let gems = parse_gemfile(dir.path());
+        let dep = find_gem(&gems, "rubocop");
+        assert_eq!(dep.groups, vec!["development"]);
+    }
+
+    #[test]
+    fn eval_gemfile_nonexistent() {
+        let dir = tempfile::tempdir().unwrap();
+        // eval_gemfile pointing to non-existent file should not crash
+        std::fs::write(
+            dir.path().join("Gemfile"),
+            "eval_gemfile('nonexistent')\ngem 'rails'\n",
+        )
+        .unwrap();
+        let gems = parse_gemfile(dir.path());
+        assert!(gems.iter().any(|g| g.name == "rails"));
+    }
+
+    #[test]
+    fn gemspec_with_path_and_dep() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine_dir = dir.path().join("engines/auth");
+        std::fs::create_dir_all(&engine_dir).unwrap();
+        std::fs::write(dir.path().join("Gemfile"), "gemspec path: 'engines/auth'\n").unwrap();
+        std::fs::write(
+            engine_dir.join("auth.gemspec"),
+            r#"
+Gem::Specification.new do |s|
+  s.add_dependency 'devise'
+  s.add_development_dependency 'factory_bot'
+end
+"#,
+        )
+        .unwrap();
+        let gems = parse_gemfile(dir.path());
+        assert!(gems.iter().any(|g| g.name == "devise"));
+        assert!(gems.iter().any(|g| g.name == "factory_bot"));
     }
 }
