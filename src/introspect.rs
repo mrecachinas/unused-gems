@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use once_cell::sync::Lazy;
@@ -6,6 +7,13 @@ use regex::Regex;
 
 static MODULE_DECL_RE: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"(?m)^\s*(?:module|class)\s+([A-Z]\w+)").unwrap());
+
+/// Metadata extracted from a .gem tarball's metadata.gz
+#[derive(Debug, Default)]
+pub struct GemMetadata {
+    pub require_paths: Vec<String>,
+    pub executables: Vec<String>,
+}
 
 /// Compare two gem version strings numerically (e.g. "1.16.8" > "1.9.1").
 fn compare_gem_versions(a: &str, b: &str) -> std::cmp::Ordering {
@@ -446,6 +454,141 @@ fn scan_rb_files_for_modules(dir: &Path, re: &Regex, modules: &mut HashSet<Strin
             }
         }
     }
+}
+
+/// Extract gemspec metadata from a .gem tarball (tar archive containing metadata.gz).
+fn extract_gem_metadata(gem_path: &Path) -> Option<GemMetadata> {
+    let file = std::fs::File::open(gem_path).ok()?;
+    let mut archive = tar::Archive::new(file);
+    for entry in archive.entries().ok()? {
+        let mut entry = entry.ok()?;
+        let path = entry.path().ok()?.to_string_lossy().to_string();
+        if path == "metadata.gz" {
+            let mut compressed = Vec::new();
+            entry.read_to_end(&mut compressed).ok()?;
+            let mut decoder = flate2::read::GzDecoder::new(&compressed[..]);
+            let mut yaml = String::new();
+            decoder.read_to_string(&mut yaml).ok()?;
+            return parse_gem_metadata_yaml(&yaml);
+        }
+    }
+    None
+}
+
+/// Parse the YAML gemspec metadata for require_paths and executables.
+fn parse_gem_metadata_yaml(yaml: &str) -> Option<GemMetadata> {
+    let mut meta = GemMetadata::default();
+    let mut in_require_paths = false;
+    let mut in_executables = false;
+
+    for line in yaml.lines() {
+        // Detect section starts
+        if line.starts_with("require_paths:") {
+            in_require_paths = true;
+            in_executables = false;
+            // Check inline value: require_paths: ["lib"]
+            if let Some(rest) = line.strip_prefix("require_paths:") {
+                let rest = rest.trim();
+                if rest.starts_with('[') {
+                    for item in rest.trim_matches(|c| c == '[' || c == ']').split(',') {
+                        let item = item.trim().trim_matches('"').trim_matches('\'');
+                        if !item.is_empty() {
+                            meta.require_paths.push(item.to_string());
+                        }
+                    }
+                    in_require_paths = false;
+                }
+            }
+            continue;
+        }
+        if line.starts_with("executables:") {
+            in_executables = true;
+            in_require_paths = false;
+            if let Some(rest) = line.strip_prefix("executables:") {
+                let rest = rest.trim();
+                if rest == "[]" {
+                    in_executables = false;
+                } else if rest.starts_with('[') {
+                    for item in rest.trim_matches(|c| c == '[' || c == ']').split(',') {
+                        let item = item.trim().trim_matches('"').trim_matches('\'');
+                        if !item.is_empty() {
+                            meta.executables.push(item.to_string());
+                        }
+                    }
+                    in_executables = false;
+                }
+            }
+            continue;
+        }
+        // New top-level key ends current section
+        if !line.starts_with(' ') && !line.starts_with('-') && line.contains(':') {
+            in_require_paths = false;
+            in_executables = false;
+            continue;
+        }
+        // Collect list items
+        let trimmed = line.trim();
+        if trimmed.starts_with("- ") {
+            let value = trimmed[2..].trim().trim_matches('"').trim_matches('\'');
+            if in_require_paths && !value.is_empty() {
+                meta.require_paths.push(value.to_string());
+            }
+            if in_executables && !value.is_empty() {
+                meta.executables.push(value.to_string());
+            }
+        }
+    }
+
+    if meta.require_paths.is_empty() {
+        meta.require_paths.push("lib".to_string());
+    }
+    Some(meta)
+}
+
+/// Build a gem metadata index from vendor/cache/*.gem tarballs.
+/// Returns gem_name → GemMetadata with require_paths and executables.
+pub fn build_vendor_cache_index(project_dir: &Path) -> HashMap<String, GemMetadata> {
+    let cache_dir = project_dir.join("vendor").join("cache");
+    if !cache_dir.is_dir() {
+        return HashMap::new();
+    }
+    let gem_files: Vec<PathBuf> = std::fs::read_dir(&cache_dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| {
+            e.path().extension().map_or(false, |ext| ext == "gem")
+        })
+        .map(|e| e.path())
+        .collect();
+
+    // Extract in parallel
+    use rayon::prelude::*;
+    let results: Vec<(String, GemMetadata)> = gem_files
+        .par_iter()
+        .filter_map(|path| {
+            let filename = path.file_stem()?.to_string_lossy().to_string();
+            // Parse gem_name from "gem_name-version" filename
+            let gem_name = extract_gem_name_from_filename(&filename)?;
+            let meta = extract_gem_metadata(path)?;
+            Some((gem_name, meta))
+        })
+        .collect();
+
+    results.into_iter().collect()
+}
+
+/// Extract gem name from a "name-version" filename (e.g., "activesupport-8.1.1" → "activesupport").
+fn extract_gem_name_from_filename(filename: &str) -> Option<String> {
+    let mut search_end = filename.len();
+    while let Some(idx) = filename[..search_end].rfind('-') {
+        let version_part = &filename[idx + 1..search_end];
+        if version_part.starts_with(|c: char| c.is_ascii_digit()) && version_part.contains('.') {
+            return Some(filename[..idx].to_string());
+        }
+        search_end = idx;
+    }
+    None
 }
 
 #[cfg(test)]

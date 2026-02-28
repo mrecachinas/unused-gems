@@ -119,11 +119,13 @@ fn main() {
     // 2. Build gem index AND scan source tree concurrently
     let gem_names: Vec<String> = gems.iter().map(|g| g.name.clone()).collect();
     let cache_for_scan = Arc::clone(&file_cache);
-    let ((_gem_paths, gem_index), (scan_results, cache_updates)) = timed!("index+scan", rayon::join(
+    let dir_for_vendor = dir.clone();
+    let ((_gem_paths, gem_index, vendor_meta), (scan_results, cache_updates)) = timed!("index+scan", rayon::join(
         || {
             let gp = introspect::find_gem_paths(&dir);
             let gi = introspect::build_gem_index(&gp);
-            (gp, gi)
+            let vm = introspect::build_vendor_cache_index(&dir_for_vendor);
+            (gp, gi, vm)
         },
         || scanner::scan_source_tree(&dir, &skip_dirs, cache_for_scan),
     ));
@@ -142,10 +144,22 @@ fn main() {
     // 2b. Script scanning (uses files collected during source tree walk — no extra I/O)
     let script_refs = timed!("scan_scripts", scripts::scan_scripts_for_gem_usage(&dir, &gem_names, &gem_index, &scan_results.script_files));
 
-    // 3. Resolve require_paths (fast: just readdir of lib/)
+    // 3. Resolve require_paths (from installed gems or vendor/cache metadata)
     timed!("resolve_require_paths", gems.par_iter_mut().for_each(|gem| {
         if gem.require_paths.is_empty() && !gem.require_false {
             gem.require_paths = resolve_require_paths(gem, &gem_index);
+            // Fallback: use vendor/cache metadata if still unresolved
+            if gem.require_paths.len() <= 1 {
+                if let Some(meta) = vendor_meta.get(&gem.name) {
+                    // Vendor metadata gives us the gemspec's require_paths (e.g., ["lib", "ext"])
+                    // Use it to discover actual require names
+                    for rp in &meta.require_paths {
+                        if rp != "lib" && !gem.require_paths.contains(rp) {
+                            gem.require_paths.push(rp.clone());
+                        }
+                    }
+                }
+            }
         }
     }));
 
