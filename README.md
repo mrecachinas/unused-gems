@@ -15,13 +15,37 @@ High-performance scanner for unused gems in Ruby projects, built in Rust with [r
 
 ## Installation
 
+### Prebuilt binaries
+
+Download the latest release for your platform from [GitHub Releases](https://github.com/mrecachinas/unused-gems/releases):
+
 ```bash
-cargo install --path .
+# macOS (Apple Silicon)
+curl -sL https://github.com/mrecachinas/unused-gems/releases/latest/download/unused-gems-aarch64-apple-darwin.tar.gz | tar xz
+sudo mv unused-gems /usr/local/bin/
+
+# macOS (Intel)
+curl -sL https://github.com/mrecachinas/unused-gems/releases/latest/download/unused-gems-x86_64-apple-darwin.tar.gz | tar xz
+sudo mv unused-gems /usr/local/bin/
+
+# Linux (x86_64)
+curl -sL https://github.com/mrecachinas/unused-gems/releases/latest/download/unused-gems-x86_64-unknown-linux-gnu.tar.gz | tar xz
+sudo mv unused-gems /usr/local/bin/
+
+# Linux (aarch64)
+curl -sL https://github.com/mrecachinas/unused-gems/releases/latest/download/unused-gems-aarch64-unknown-linux-gnu.tar.gz | tar xz
+sudo mv unused-gems /usr/local/bin/
 ```
 
-Or build a release binary:
+### Build from source
+
+Requires [Rust](https://www.rust-lang.org/tools/install) 1.70+.
 
 ```bash
+# Install to ~/.cargo/bin
+cargo install --path .
+
+# Or build a release binary
 cargo build --release
 # Binary at ./target/release/unused-gems
 ```
