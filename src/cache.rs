@@ -215,10 +215,11 @@ mod tests {
     fn cache_miss_different_nanos() {
         let dir = tempfile::tempdir().unwrap();
         let mut cache = FileCache::load(dir.path());
-        let mtime = SystemTime::UNIX_EPOCH + Duration::new(1000000, 500);
+        let mtime = SystemTime::UNIX_EPOCH + Duration::new(1000000, 1000);
         cache.put("f.rb".to_string(), mtime, 42, &[], vec![], &[], false);
 
-        let other_mtime = SystemTime::UNIX_EPOCH + Duration::new(1000000, 501);
+        // Use a difference >= 200ns to exceed Windows FILETIME 100ns granularity
+        let other_mtime = SystemTime::UNIX_EPOCH + Duration::new(1000000, 1200);
         assert!(cache.get("f.rb", other_mtime, 42).is_none());
     }
 

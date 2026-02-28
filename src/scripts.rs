@@ -7,6 +7,8 @@ use regex::Regex;
 
 /// Check if a path matches our script file patterns.
 pub(crate) fn is_script_file(rel_path: &str, file_name: &str) -> bool {
+    // Normalize path separators for cross-platform support
+    let rel_path = &rel_path.replace('\\', "/");
     // Exact top-level filenames
     match file_name {
         "Makefile" | "makefile" | "GNUmakefile" | "Dockerfile" | "Procfile" => return true,
