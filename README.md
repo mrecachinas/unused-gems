@@ -60,6 +60,7 @@ unused-gems --skip-dirs tmp,cache /path/to/project
 -j, --jobs <N>            Number of parallel scanning threads (default: CPU count)
 -v, --verbose             Show file locations and require paths
 -q, --quiet               Suppress progress messages
+    --no-cache            Disable file scan cache
     --ignore-file <PATH>  Path to ignore file (default: .unused_gems.yml)
     --diff <BASELINE>     Compare against previous JSON output
     --skip-dirs <DIRS>    Additional directories to skip (comma-separated)
@@ -71,11 +72,12 @@ unused-gems --skip-dirs tmp,cache /path/to/project
 | Module | Purpose |
 |--------|---------|
 | `gemfile.rs` | Parses Gemfile/gemspec using ruby-prism AST |
-| `scanner.rs` | Parallel source tree scanning with rayon + compiled regex |
-| `introspect.rs` | Discovers gem require paths and module names from installed gems |
+| `scanner.rs` | Parallel source tree scanning with hand-rolled byte scanners |
+| `introspect.rs` | Discovers gem require paths and module names from installed gems or vendor/cache tarballs |
 | `matcher.rs` | Matches gems against scan results to determine usage |
 | `scripts.rs` | Scans Makefiles, Dockerfiles, CI configs for gem references |
 | `lockfile.rs` | Parses Gemfile.lock for transitive dependency counting |
+| `cache.rs` | Bincode file cache — skips re-scanning unchanged files |
 | `output.rs` | Text, JSON, GitHub Actions output formatters |
 | `diff.rs` | Baseline comparison mode |
 | `ignore.rs` | `.unused_gems.yml` ignore file support |
@@ -84,8 +86,10 @@ unused-gems --skip-dirs tmp,cache /path/to/project
 
 Built with Rust for maximum performance:
 - **ruby-prism** for accurate Gemfile AST parsing (same parser as CRuby 3.3+)
-- **rayon** for parallel file scanning across all CPU cores
-- **Pre-compiled regex** via `once_cell` for zero per-file compilation overhead
-- **Release profile** with LTO and single codegen unit for optimal binary size
+- **Hand-rolled byte scanners** with SIMD-accelerated `memchr` — no per-file regex overhead
+- **Parallel file walking** via `ignore` crate (respects `.gitignore`)
+- **Bincode file cache** — unchanged files skip scanning on repeat runs
+- **Zero-alloc hot path** — extension checks, comment detection all avoid heap allocation
+- **vendor/cache support** — extracts gemspec metadata from packed `.gem` tarballs
 
-Typically **4-6x faster** than the equivalent Ruby implementation.
+On github/github (~53K Ruby files): **~2.8s** (vs scc line counting at 1.85s).
