@@ -761,37 +761,17 @@ fn is_scannable(path: &str, full_path: &Path) -> bool {
     false
 }
 
-/// File content holder — either owned bytes (small files) or mmap'd.
-/// Avoids copying file content into a String.
-enum FileContent {
-    Owned(Vec<u8>),
-    Mapped(memmap2::Mmap),
-}
-
-impl FileContent {
-    fn as_bytes(&self) -> &[u8] {
-        match self {
-            FileContent::Owned(v) => v,
-            FileContent::Mapped(m) => m,
-        }
-    }
-}
+// (FileContent enum removed — plain read() is faster for single sequential reads)
 
 fn scan_file(path: &str, dir: &str) -> Option<FileResult> {
-    let file = std::fs::File::open(path).ok()?;
-    let metadata = file.metadata().ok()?;
+    let metadata = std::fs::metadata(path).ok()?;
     if metadata.len() == 0 {
         return None;
     }
 
-    // Zero-copy: keep bytes as &[u8], no String conversion
-    let content = if metadata.len() < 4096 {
-        FileContent::Owned(std::fs::read(path).ok()?)
-    } else {
-        // SAFETY: file is opened read-only, we don't modify the mapping
-        FileContent::Mapped(unsafe { memmap2::Mmap::map(&file) }.ok()?)
-    };
-    let bytes = content.as_bytes();
+    // Plain read() is faster than mmap for single sequential reads (no VMA/TLB overhead)
+    let bytes = std::fs::read(path).ok()?;
+    let bytes = bytes.as_slice();
 
     let rel_path = Path::new(path)
         .strip_prefix(dir)
