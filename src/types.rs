@@ -24,6 +24,8 @@ pub struct ScanResults {
     pub modules: HashMap<String, HashSet<String>>,
     pub bundler_groups: HashSet<String>,
     pub bundler_require_all: bool,
+    /// Script file contents collected during the walk: (rel_path, content_bytes)
+    pub script_files: Vec<(String, Vec<u8>)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]

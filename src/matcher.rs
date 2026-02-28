@@ -165,6 +165,7 @@ mod tests {
             modules: mod_map,
             bundler_groups: HashSet::new(),
             bundler_require_all: false,
+            script_files: Vec::new(),
         }
     }
 

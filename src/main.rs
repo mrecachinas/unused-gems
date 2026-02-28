@@ -114,8 +114,8 @@ fn main() {
         || scanner::scan_source_tree(&dir, &skip_dirs),
     ));
 
-    // 2b. Script scanning (needs gem_index for exe→gem mapping)
-    let script_refs = timed!("scan_scripts", scripts::scan_scripts_for_gem_usage(&dir, &gem_names, &gem_index));
+    // 2b. Script scanning (uses files collected during source tree walk — no extra I/O)
+    let script_refs = timed!("scan_scripts", scripts::scan_scripts_for_gem_usage(&dir, &gem_names, &gem_index, &scan_results.script_files));
 
     // 3. Resolve require_paths (fast: just readdir of lib/)
     timed!("resolve_require_paths", gems.par_iter_mut().for_each(|gem| {

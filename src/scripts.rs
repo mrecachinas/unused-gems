@@ -1,13 +1,12 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use std::sync::{Arc, Mutex};
 
 use memchr::memmem;
 use rayon::prelude::*;
 use regex::Regex;
 
 /// Check if a path matches our script file patterns.
-fn is_script_file(rel_path: &str, file_name: &str) -> bool {
+pub(crate) fn is_script_file(rel_path: &str, file_name: &str) -> bool {
     // Exact top-level filenames
     match file_name {
         "Makefile" | "makefile" | "GNUmakefile" | "Dockerfile" | "Procfile" => return true,
@@ -118,10 +117,12 @@ fn scan_bin_refs(bytes: &[u8]) -> Vec<String> {
 
 /// Scan non-Ruby files (Makefile, Dockerfile, CI configs, scripts)
 /// for `bundle exec <gem>` invocations and bare gem CLI references.
+/// Uses pre-collected script files from the source tree walk (single-walk mode).
 pub fn scan_scripts_for_gem_usage(
-    dir: &Path,
+    _dir: &Path,
     gem_names: &[String],
     gem_index: &HashMap<String, std::path::PathBuf>,
+    script_files: &[(String, Vec<u8>)],
 ) -> HashMap<String, HashSet<String>> {
     let gem_name_set: HashSet<&str> = gem_names.iter().map(|s| s.as_str()).collect();
 
@@ -136,113 +137,42 @@ pub fn scan_scripts_for_gem_usage(
     let gem_regex_set = regex::RegexSet::new(&gem_pattern_strs).unwrap();
     let gem_names_indexed: Vec<&str> = gem_names.iter().map(|s| s.as_str()).collect();
 
-    let dir_str = dir.to_string_lossy().to_string();
+    // Process pre-collected script files in parallel
+    let per_file_refs: Vec<Vec<(String, String)>> = script_files
+        .par_iter()
+        .filter_map(|(rel_path, content)| {
+            let mut refs = Vec::new();
 
-    // Single parallel walk instead of 18 sequential glob calls
-    let skip_dirs: HashSet<&str> = ["vendor", ".bundle", "node_modules", ".git", "tmp", "log", "coverage", "pkg"]
-        .iter().copied().collect();
-    let mut builder = ignore::WalkBuilder::new(dir);
-    builder
-        .standard_filters(false)
-        .git_ignore(false)
-        .git_global(false)
-        .git_exclude(false)
-        .follow_links(false)
-        .hidden(false)
-        .max_depth(Some(5))
-        .filter_entry(move |entry| {
-            if entry.file_type().map_or(false, |ft| ft.is_dir()) {
-                let name = entry.file_name().to_string_lossy();
-                if skip_dirs.contains(name.as_ref()) {
-                    return false;
+            // Byte scanner: bundle exec
+            for cmd in scan_bundle_exec(content) {
+                if gem_name_set.contains(cmd.as_str()) {
+                    refs.push((cmd, rel_path.clone()));
+                } else if let Some(gem_name) = exe_to_gem.get(&cmd) {
+                    refs.push((gem_name.clone(), rel_path.clone()));
                 }
             }
-            true
-        });
 
-    let results = Arc::new(Mutex::new(Vec::<Vec<(String, String)>>::new()));
-    let results_clone = Arc::clone(&results);
-    let dir_shared = Arc::new(dir_str);
-    let gem_name_set = Arc::new(gem_name_set);
-    let exe_to_gem = Arc::new(exe_to_gem);
-    let gem_regex_set = Arc::new(gem_regex_set);
-    let gem_names_indexed = Arc::new(gem_names_indexed);
-
-    builder.build_parallel().run(move || {
-        let shared = Arc::clone(&results_clone);
-        let dir_ref = Arc::clone(&dir_shared);
-        let names = Arc::clone(&gem_name_set);
-        let exe_map = Arc::clone(&exe_to_gem);
-        let rset = Arc::clone(&gem_regex_set);
-        let gnames = Arc::clone(&gem_names_indexed);
-        let mut buf = Vec::new();
-
-        Box::new(move |result| {
-            if let Ok(entry) = result {
-                if !entry.file_type().map_or(false, |ft| ft.is_file()) {
-                    return ignore::WalkState::Continue;
-                }
-                let path = entry.path();
-                let rel_path = path
-                    .strip_prefix(dir_ref.as_str())
-                    .unwrap_or(path)
-                    .to_string_lossy();
-                let file_name = path
-                    .file_name()
-                    .map(|n| n.to_string_lossy())
-                    .unwrap_or_default();
-
-                if !is_script_file(&rel_path, &file_name) {
-                    return ignore::WalkState::Continue;
-                }
-
-                if let Ok(content) = std::fs::read(path) {
-                    let mut refs = Vec::new();
-                    let rel = rel_path.to_string();
-
-                    // Byte scanner: bundle exec
-                    for cmd in scan_bundle_exec(&content) {
-                        if names.contains(cmd.as_str()) {
-                            refs.push((cmd, rel.clone()));
-                        } else if let Some(gem_name) = exe_map.get(&cmd) {
-                            refs.push((gem_name.clone(), rel.clone()));
-                        }
-                    }
-
-                    // Byte scanner: bin/ references
-                    for cmd in scan_bin_refs(&content) {
-                        if names.contains(cmd.as_str()) {
-                            refs.push((cmd, rel.clone()));
-                        } else if let Some(gem_name) = exe_map.get(&cmd) {
-                            refs.push((gem_name.clone(), rel.clone()));
-                        }
-                    }
-
-                    // RegexSet: single-pass match for all gem name patterns
-                    let content_str = String::from_utf8_lossy(&content);
-                    for idx in rset.matches(&content_str).into_iter() {
-                        refs.push((gnames[idx].to_string(), rel.clone()));
-                    }
-
-                    if !refs.is_empty() {
-                        buf.push(refs);
-                        if buf.len() >= 32 {
-                            shared.lock().unwrap().append(&mut buf);
-                        }
-                    }
+            // Byte scanner: bin/ references
+            for cmd in scan_bin_refs(content) {
+                if gem_name_set.contains(cmd.as_str()) {
+                    refs.push((cmd, rel_path.clone()));
+                } else if let Some(gem_name) = exe_to_gem.get(&cmd) {
+                    refs.push((gem_name.clone(), rel_path.clone()));
                 }
             }
-            ignore::WalkState::Continue
+
+            // RegexSet: gem name word-boundary match
+            let content_str = String::from_utf8_lossy(content);
+            for idx in gem_regex_set.matches(&content_str).into_iter() {
+                refs.push((gem_names_indexed[idx].to_string(), rel_path.clone()));
+            }
+
+            if refs.is_empty() { None } else { Some(refs) }
         })
-    });
-
-    // Flush remaining
-    let all_batches = Arc::try_unwrap(results)
-        .map(|m| m.into_inner().unwrap_or_default())
-        .unwrap_or_default();
+        .collect();
 
     let mut gem_refs: HashMap<String, HashSet<String>> = HashMap::new();
-    for refs in all_batches {
+    for refs in per_file_refs {
         for (gem_name, file) in refs {
             gem_refs.entry(gem_name).or_default().insert(file);
         }
