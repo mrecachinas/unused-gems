@@ -4,6 +4,7 @@ use std::collections::{HashMap, HashSet};
 pub struct GemEntry {
     pub name: String,
     pub groups: Vec<String>,
+    pub platforms: Vec<String>,
     pub require_paths: Vec<String>,
     pub module_names: Vec<String>,
     pub require_false: bool,
@@ -35,6 +36,7 @@ pub enum GemStatus {
     BundlerRequired,
     RequireFalse,
     Ignored,
+    PlatformExcluded,
 }
 
 impl std::fmt::Display for GemStatus {
@@ -45,11 +47,12 @@ impl std::fmt::Display for GemStatus {
             GemStatus::BundlerRequired => write!(f, "bundler_required"),
             GemStatus::RequireFalse => write!(f, "require_false"),
             GemStatus::Ignored => write!(f, "ignored"),
+            GemStatus::PlatformExcluded => write!(f, "platform_excluded"),
         }
     }
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize)]
 #[serde(rename_all = "snake_case", tag = "type")]
 pub enum Evidence {
     Require { path: String, file: String },

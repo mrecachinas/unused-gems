@@ -152,6 +152,7 @@ mod tests {
                 gem: GemEntry {
                     name: name.to_string(),
                     groups: vec!["default".to_string()],
+                    platforms: Vec::new(),
                     require_paths: Vec::new(),
                     module_names: Vec::new(),
                     require_false: false,

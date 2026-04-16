@@ -3,6 +3,7 @@ use std::path::Path;
 
 use memchr::memmem;
 use rayon::prelude::*;
+use aho_corasick::AhoCorasick;
 use regex::Regex;
 
 /// Check if a path matches our script file patterns.
@@ -170,13 +171,8 @@ pub fn scan_scripts_for_gem_usage(
     // Build executable→gem name mapping from installed gemspecs (parallel)
     let exe_to_gem = build_exe_to_gem_map(gem_names, gem_index);
 
-    // Use RegexSet for single-pass multi-pattern matching
-    let gem_pattern_strs: Vec<String> = gem_names
-        .iter()
-        .map(|n| format!(r"\b{}\b", regex::escape(n)))
-        .collect();
-    let gem_regex_set = regex::RegexSet::new(&gem_pattern_strs).unwrap();
-    let gem_names_indexed: Vec<&str> = gem_names.iter().map(|s| s.as_str()).collect();
+    // Build AhoCorasick automaton for multi-pattern byte matching
+    let ac = AhoCorasick::new(gem_names).unwrap();
 
     // Process pre-collected script files in parallel
     let per_file_refs: Vec<Vec<(String, String)>> = script_files
@@ -205,10 +201,26 @@ pub fn scan_scripts_for_gem_usage(
                 }
             }
 
-            // RegexSet: gem name word-boundary match (on stripped content)
-            let content_str = String::from_utf8_lossy(&stripped);
-            for idx in gem_regex_set.matches(&content_str).into_iter() {
-                refs.push((gem_names_indexed[idx].to_string(), rel_path.clone()));
+            // AhoCorasick: gem name byte match with manual word boundaries
+            let mut seen = HashSet::new();
+            for mat in ac.find_overlapping_iter(&stripped) {
+                let pid = mat.pattern().as_usize();
+                if !seen.insert(pid) {
+                    continue;
+                }
+                let start = mat.start();
+                let end = mat.end();
+                let before_ok = start == 0 || {
+                    let b = stripped[start - 1];
+                    !b.is_ascii_alphanumeric() && b != b'_'
+                };
+                let after_ok = end >= stripped.len() || {
+                    let b = stripped[end];
+                    !b.is_ascii_alphanumeric() && b != b'_'
+                };
+                if before_ok && after_ok {
+                    refs.push((gem_names[pid].clone(), rel_path.clone()));
+                }
             }
 
             if refs.is_empty() {

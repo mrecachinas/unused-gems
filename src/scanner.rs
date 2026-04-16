@@ -17,6 +17,20 @@ static INHERIT_GEM_RE: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"inherit_gem:\s*\n((?:\s+\S+:\s*\n(?:\s+-.+\n)*)*)").unwrap());
 static INHERIT_GEM_KEY_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?m)^\s+([\w-]+):").unwrap());
 
+// Precompiled byte finders (avoid re-building per call)
+static NEWLINE_BEGIN_FINDER: Lazy<memmem::Finder<'static>> =
+    Lazy::new(|| memmem::Finder::new(b"\n=begin"));
+static HEREDOC_FINDER: Lazy<memmem::Finder<'static>> =
+    Lazy::new(|| memmem::Finder::new(b"<<"));
+static REQUIRE_FINDER: Lazy<memmem::Finder<'static>> =
+    Lazy::new(|| memmem::Finder::new(b"require"));
+static AUTOLOAD_FINDER: Lazy<memmem::Finder<'static>> =
+    Lazy::new(|| memmem::Finder::new(b"autoload"));
+static GEM_DOT_FINDER: Lazy<memmem::Finder<'static>> =
+    Lazy::new(|| memmem::Finder::new(b"Gem."));
+static BUNDLER_REQUIRE_FINDER: Lazy<memmem::Finder<'static>> =
+    Lazy::new(|| memmem::Finder::new(b"Bundler.require"));
+
 #[cfg(test)]
 const SCANNABLE_EXTENSIONS: &[&str] = &[
     ".rb",
@@ -130,10 +144,14 @@ fn has_inline_comment_before(bytes: &[u8], from: usize, pos: usize) -> bool {
 /// Precompute byte ranges covered by =begin/=end block comments and heredocs.
 /// Returns sorted Vec of (start, end) byte offsets.
 fn build_block_comment_ranges(bytes: &[u8]) -> Vec<(usize, usize)> {
+    // Short-circuit: if neither =begin nor << appear, no block ranges possible
+    if memmem::find(bytes, b"=begin").is_none() && memmem::find(bytes, b"<<").is_none() {
+        return Vec::new();
+    }
+
     let mut ranges = Vec::new();
 
     // Pass 1: =begin/=end block comments
-    let finder = memmem::Finder::new(b"\n=begin");
     let mut pos = 0;
     // Also check if file starts with =begin
     if bytes.starts_with(b"=begin") {
@@ -151,7 +169,7 @@ fn build_block_comment_ranges(bytes: &[u8]) -> Vec<(usize, usize)> {
             return vec![(0, bytes.len())];
         }
     }
-    while let Some(idx) = finder.find(&bytes[pos..]) {
+    while let Some(idx) = NEWLINE_BEGIN_FINDER.find(&bytes[pos..]) {
         let abs = pos + idx + 1; // skip the \n, point at =begin
         let after_begin = abs + 6;
         // Check it's a full line (next char is whitespace or newline)
@@ -178,9 +196,8 @@ fn build_block_comment_ranges(bytes: &[u8]) -> Vec<(usize, usize)> {
     }
 
     // Pass 2: heredocs (<<~DELIM, <<-DELIM, <<DELIM, <<~'DELIM', <<~"DELIM")
-    let heredoc_finder = memmem::Finder::new(b"<<");
     pos = 0;
-    while let Some(idx) = heredoc_finder.find(&bytes[pos..]) {
+    while let Some(idx) = HEREDOC_FINDER.find(&bytes[pos..]) {
         let abs = pos + idx;
         let mut i = abs + 2;
         // Optional ~ or -
@@ -350,7 +367,7 @@ fn scan_requires(bytes: &[u8], results: &mut Vec<String>) {
 
 /// Scan for `autoload :Symbol, 'name'`
 /// Matches regex: `autoload\s*[\(]?\s*:\w+\s*,\s*['"]([^'"]+)['"]`
-#[allow(dead_code)]
+#[cfg(test)]
 fn scan_autoloads(bytes: &[u8], results: &mut Vec<String>) {
     let finder = memmem::Finder::new(b"autoload");
     let mut pos = 0;
@@ -406,7 +423,7 @@ fn scan_autoloads(bytes: &[u8], results: &mut Vec<String>) {
 
 /// Scan for `Gem.bin_path('name')` or `Gem.activate_bin_path('name')`
 /// Matches regex: `Gem\.(?:activate_)?bin_path\s*\(\s*['"]([^'"]+)['"]`
-#[allow(dead_code)]
+#[cfg(test)]
 fn scan_gem_bin(bytes: &[u8], results: &mut Vec<String>) {
     let finder = memmem::Finder::new(b"Gem.");
     let mut pos = 0;
@@ -444,7 +461,7 @@ fn scan_gem_bin(bytes: &[u8], results: &mut Vec<String>) {
 /// Key semantics: must start at word boundary, must have 2+ alnum chars in first segment,
 /// each `::` must be followed by an uppercase letter + 1+ alnum chars.
 /// Uses backtracking: if `Foo::Bar_Baz` fails at `_`, emits `Foo::Bar` (like regex).
-#[allow(dead_code)]
+#[cfg(test)]
 fn scan_modules(bytes: &[u8], results: &mut Vec<String>) {
     let mut i = 0;
     while i < bytes.len() {
@@ -522,7 +539,7 @@ fn scan_modules(bytes: &[u8], results: &mut Vec<String>) {
 /// Scan for `Bundler.require` and extract the rest of the line.
 /// Matches regex: `Bundler\.require\b(.*)`
 /// Returns (rest_of_line, ...) for each match.
-#[allow(dead_code)]
+#[cfg(test)]
 fn scan_bundler_require(
     bytes: &[u8],
     bundler_groups: &mut Vec<String>,
@@ -546,10 +563,12 @@ fn scan_bundler_require(
             end += 1;
         }
         let rest = std::str::from_utf8(&bytes[after..end]).unwrap_or("").trim();
+        let rest_inner = rest.strip_prefix('(').map(|s| s.trim()).unwrap_or(rest);
         if rest.is_empty()
             || rest.starts_with('#')
             || rest.contains("Rails.groups")
             || rest.contains("Rails.env")
+            || rest_inner.starts_with('*')
         {
             *bundler_require_all = true;
         } else {
@@ -570,9 +589,8 @@ fn scan_requires_filtered(
     results: &mut Vec<String>,
 ) {
     // For non-Ruby files, still filter # line comments (YAML, shell, etc. use # comments)
-    let finder = memmem::Finder::new(b"require");
     let mut pos = 0;
-    while let Some(idx) = finder.find(&bytes[pos..]) {
+    while let Some(idx) = REQUIRE_FINDER.find(&bytes[pos..]) {
         let abs = pos + idx;
         if is_ruby {
             if is_commented(bytes, abs, block_ranges) {
@@ -615,9 +633,8 @@ fn scan_autoloads_filtered(
     block_ranges: &[(usize, usize)],
     results: &mut Vec<String>,
 ) {
-    let finder = memmem::Finder::new(b"autoload");
     let mut pos = 0;
-    while let Some(idx) = finder.find(&bytes[pos..]) {
+    while let Some(idx) = AUTOLOAD_FINDER.find(&bytes[pos..]) {
         let abs = pos + idx;
         if is_ruby {
             if is_commented(bytes, abs, block_ranges) {
@@ -677,9 +694,8 @@ fn scan_gem_bin_filtered(
     block_ranges: &[(usize, usize)],
     results: &mut Vec<String>,
 ) {
-    let finder = memmem::Finder::new(b"Gem.");
     let mut pos = 0;
-    while let Some(idx) = finder.find(&bytes[pos..]) {
+    while let Some(idx) = GEM_DOT_FINDER.find(&bytes[pos..]) {
         let abs = pos + idx;
         if is_ruby {
             if is_commented(bytes, abs, block_ranges) {
@@ -723,8 +739,16 @@ fn scan_modules_filtered_into(
     rel_path: &str,
 ) {
     let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i].is_ascii_uppercase() && (i == 0 || !is_word_char(bytes[i - 1])) {
+    let len = bytes.len();
+    while i < len {
+        // Fast skip non-uppercase bytes
+        while i < len && !bytes[i].is_ascii_uppercase() {
+            i += 1;
+        }
+        if i >= len {
+            break;
+        }
+        if i == 0 || !is_word_char(bytes[i - 1]) {
             if is_ruby {
                 if is_commented(bytes, i, block_ranges) {
                     while i < bytes.len() && bytes[i] != b'\n' {
@@ -794,6 +818,7 @@ fn scan_modules_filtered_into(
                 i = match_end;
             }
         } else {
+            // Uppercase but preceded by word char — skip past word
             i += 1;
         }
     }
@@ -807,9 +832,8 @@ fn scan_bundler_require_filtered(
     bundler_require_all: &mut bool,
 ) {
     static GROUP_SYM_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r":(\w+)").unwrap());
-    let finder = memmem::Finder::new(b"Bundler.require");
     let mut pos = 0;
-    while let Some(idx) = finder.find(&bytes[pos..]) {
+    while let Some(idx) = BUNDLER_REQUIRE_FINDER.find(&bytes[pos..]) {
         let abs = pos + idx;
         if is_ruby {
             if is_commented(bytes, abs, block_ranges) {
@@ -830,15 +854,79 @@ fn scan_bundler_require_filtered(
             end += 1;
         }
         let rest = std::str::from_utf8(&bytes[after..end]).unwrap_or("").trim();
+        let rest_inner = rest.strip_prefix('(').map(|s| s.trim()).unwrap_or(rest);
         if rest.is_empty()
             || rest.starts_with('#')
             || rest.contains("Rails.groups")
             || rest.contains("Rails.env")
+            || rest_inner.starts_with('*')
         {
             *bundler_require_all = true;
         } else {
             for g in GROUP_SYM_RE.captures_iter(rest) {
                 bundler_groups.push(g[1].to_string());
+            }
+        }
+        pos = abs + 1;
+    }
+}
+
+/// Scan for middleware string-literal references (e.g. `config.middleware.use "Bullet::Rack"`)
+/// and insert each quoted module name into `modules`.
+fn scan_middleware_refs(
+    bytes: &[u8],
+    is_ruby: bool,
+    block_ranges: &[(usize, usize)],
+    modules: &mut HashMap<String, HashSet<String>>,
+    rel_path: &str,
+) {
+    static MIDDLEWARE_FINDER: Lazy<memmem::Finder<'static>> =
+        Lazy::new(|| memmem::Finder::new(b".middleware."));
+    let mut pos = 0;
+    while let Some(idx) = MIDDLEWARE_FINDER.find(&bytes[pos..]) {
+        let abs = pos + idx;
+        // Skip commented lines
+        if is_ruby {
+            if is_commented(bytes, abs, block_ranges) {
+                pos = abs + 1;
+                continue;
+            }
+        } else if is_line_comment(bytes, abs) {
+            pos = abs + 1;
+            continue;
+        }
+        // Find end of line
+        let mut eol = abs;
+        while eol < bytes.len() && bytes[eol] != b'\n' {
+            eol += 1;
+        }
+        // Extract all quoted string literals from the rest of the line
+        let mut i = abs + 12; // skip ".middleware."
+        while i < eol {
+            if bytes[i] == b'"' || bytes[i] == b'\'' {
+                let quote = bytes[i];
+                let start = i + 1;
+                let mut end = start;
+                while end < eol && bytes[end] != quote {
+                    end += 1;
+                }
+                if end < eol {
+                    if let Ok(name) = std::str::from_utf8(&bytes[start..end]) {
+                        let name = name.trim();
+                        // Only insert if it looks like a module name (starts with uppercase)
+                        if !name.is_empty() && name.as_bytes()[0].is_ascii_uppercase() {
+                            modules
+                                .entry(name.to_string())
+                                .or_default()
+                                .insert(rel_path.to_string());
+                        }
+                    }
+                    i = end + 1;
+                } else {
+                    break;
+                }
+            } else {
+                i += 1;
             }
         }
         pos = abs + 1;
@@ -982,12 +1070,12 @@ pub fn scan_source_tree(
                             None
                         };
 
-                        if let Some((requires, modules, bundler_groups, bundler_require_all)) =
+                        if let Some(entry) =
                             cache_hit
                         {
                             // Cache hit: reconstruct FileResult + modules without reading file
                             let rel = rel_path_cow.to_string();
-                            for m in &modules {
+                            for m in &entry.modules {
                                 flush_buf
                                     .local_modules
                                     .entry(m.clone())
@@ -996,9 +1084,9 @@ pub fn scan_source_tree(
                             }
                             flush_buf.buf.push(FileResult {
                                 rel_path: rel,
-                                requires,
-                                bundler_groups,
-                                bundler_require_all,
+                                requires: entry.requires.clone(),
+                                bundler_groups: entry.bundler_groups.clone(),
+                                bundler_require_all: entry.bundler_require_all,
                             });
                         } else {
                             // Cache miss: scan file
@@ -1034,7 +1122,7 @@ pub fn scan_source_tree(
                                 flush_buf.buf.push(file_result);
                             }
                         }
-                        if flush_buf.buf.len() >= 64 {
+                        if flush_buf.buf.len() >= 256 {
                             shared.lock().unwrap().append(&mut flush_buf.buf);
                         }
                     }
@@ -1045,7 +1133,7 @@ pub fn scan_source_tree(
                             flush_buf
                                 .script_buf
                                 .push((rel_path_cow.to_string(), content));
-                            if flush_buf.script_buf.len() >= 32 {
+                            if flush_buf.script_buf.len() >= 128 {
                                 scripts.lock().unwrap().append(&mut flush_buf.script_buf);
                             }
                         }
@@ -1201,13 +1289,11 @@ fn scan_file(
     dir: &str,
     thread_modules: &mut HashMap<String, HashSet<String>>,
 ) -> Option<FileResult> {
-    let metadata = std::fs::metadata(path).ok()?;
-    if metadata.len() == 0 {
-        return None;
-    }
-
     // Plain read() is faster than mmap for single sequential reads (no VMA/TLB overhead)
     let bytes = std::fs::read(path).ok()?;
+    if bytes.is_empty() {
+        return None;
+    }
     let bytes = bytes.as_slice();
 
     let rel_path = Path::new(path)
@@ -1295,9 +1381,15 @@ fn scan_file(
     scan_gem_bin_filtered(bytes, is_ruby, &block_ranges, &mut requires);
     // Modules go directly into thread-local map (avoids per-file Vec<String> allocation)
     scan_modules_filtered_into(bytes, is_ruby, &block_ranges, thread_modules, &rel_path);
+    scan_middleware_refs(bytes, is_ruby, &block_ranges, thread_modules, &rel_path);
 
     // YAML config patterns (keep regex — rarely hit, complex multiline patterns)
-    if is_yaml {
+    if is_yaml
+        && (memmem::find(bytes, b"rubocop").is_some()
+            || memmem::find(bytes, b"require:").is_some()
+            || memmem::find(bytes, b"plugins:").is_some()
+            || memmem::find(bytes, b"inherit_gem:").is_some())
+    {
         // Need &str for regex — borrow from bytes, no allocation if valid UTF-8
         let content_str = String::from_utf8_lossy(bytes);
         for cap in RUBOCOP_RE.captures_iter(&content_str) {
@@ -2358,5 +2450,88 @@ mod tests {
         scan_bundler_require_filtered(input, true, &ranges, &mut groups, &mut require_all);
         assert!(!require_all);
         assert_eq!(groups, vec!["test"]);
+    }
+
+    // ── Bundler.require splat forms ──
+
+    #[test]
+    fn bundler_require_splat_local_var() {
+        let input = b"Bundler.require(*groups)\n";
+        let mut groups = Vec::new();
+        let mut require_all = false;
+        scan_bundler_require(input, &mut groups, &mut require_all);
+        assert!(require_all, "splat local var should set bundler_require_all");
+        assert!(groups.is_empty());
+    }
+
+    #[test]
+    fn bundler_require_splat_unparen() {
+        let input = b"Bundler.require *Rails.groups\n";
+        let mut groups = Vec::new();
+        let mut require_all = false;
+        scan_bundler_require(input, &mut groups, &mut require_all);
+        assert!(require_all, "unparen splat should set bundler_require_all");
+    }
+
+    #[test]
+    fn bundler_require_groups_still_work() {
+        let input = b"Bundler.require(:default, :production)\n";
+        let mut groups = Vec::new();
+        let mut require_all = false;
+        scan_bundler_require(input, &mut groups, &mut require_all);
+        assert!(!require_all, "symbol groups should not set bundler_require_all");
+        assert_eq!(groups, vec!["default", "production"]);
+    }
+
+    #[test]
+    fn bundler_require_rails_groups_literal() {
+        let input = b"Bundler.require(*Rails.groups)\n";
+        let mut groups = Vec::new();
+        let mut require_all = false;
+        scan_bundler_require(input, &mut groups, &mut require_all);
+        assert!(require_all, "Rails.groups splat should set bundler_require_all");
+    }
+
+    // ── Middleware string references ──
+
+    #[test]
+    fn middleware_use_string() {
+        let input = b"config.middleware.use \"Bullet::Rack\"\n";
+        let mut modules: HashMap<String, HashSet<String>> = HashMap::new();
+        scan_middleware_refs(input, true, &[], &mut modules, "test.rb");
+        assert!(modules.contains_key("Bullet::Rack"), "should detect double-quoted middleware");
+    }
+
+    #[test]
+    fn middleware_insert_before_string() {
+        let input = b"config.middleware.insert_before Rack::Runtime, \"BatchLoader::Middleware\"\n";
+        let mut modules: HashMap<String, HashSet<String>> = HashMap::new();
+        scan_middleware_refs(input, true, &[], &mut modules, "test.rb");
+        assert!(
+            modules.contains_key("BatchLoader::Middleware"),
+            "should detect string arg in insert_before"
+        );
+    }
+
+    #[test]
+    fn middleware_symbol_ignored() {
+        let input = b"config.middleware.use MyClass\n";
+        let mut modules: HashMap<String, HashSet<String>> = HashMap::new();
+        scan_middleware_refs(input, true, &[], &mut modules, "test.rb");
+        assert!(
+            !modules.contains_key("MyClass"),
+            "bare constants should not be captured by middleware scanner"
+        );
+    }
+
+    #[test]
+    fn middleware_commented() {
+        let input = b"# config.middleware.use \"Bullet::Rack\"\n";
+        let mut modules: HashMap<String, HashSet<String>> = HashMap::new();
+        scan_middleware_refs(input, true, &[], &mut modules, "test.rb");
+        assert!(
+            !modules.contains_key("Bullet::Rack"),
+            "commented middleware should be ignored"
+        );
     }
 }

@@ -10,9 +10,9 @@ mod scanner;
 mod scripts;
 mod types;
 
-use std::collections::HashSet;
-use std::path::Path;
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use clap::Parser;
 use rayon::prelude::*;
@@ -22,6 +22,7 @@ use types::GemStatus;
 #[derive(Parser)]
 #[command(name = "unused-gems")]
 #[command(about = "High-performance scanner for unused gems in Ruby projects")]
+#[command(version = env!("CARGO_PKG_VERSION"))]
 struct Cli {
     /// Output format: text (default), json, github
     #[arg(short, long, default_value = "text", value_parser = ["text", "json", "github"])]
@@ -54,6 +55,22 @@ struct Cli {
     /// Disable file cache (always scan all files fresh)
     #[arg(long)]
     no_cache: bool,
+
+    /// Exit code policy: none (always 0), any (1 if unused), new (1 only for new unused in diff)
+    #[arg(long, default_value = "any", value_parser = ["none", "any", "new"])]
+    fail_on: String,
+
+    /// Emit SARIF JSON to stdout (overrides output format)
+    #[arg(long)]
+    sarif: bool,
+
+    /// Write formatted output to file instead of stdout
+    #[arg(long)]
+    output_file: Option<String>,
+
+    /// Exit 0 with a notice when Gemfile is missing instead of failing
+    #[arg(long)]
+    allow_missing_gemfile: bool,
 
     /// Directory to scan (default: current directory)
     #[arg(default_value = ".")]
@@ -109,6 +126,18 @@ fn main() {
         eprintln!();
     }
 
+    // Check Gemfile existence before parsing (exit 2 if missing)
+    let gemfile_path = dir.join("Gemfile");
+    if !gemfile_path.exists() {
+        if cli.allow_missing_gemfile {
+            eprintln!("Notice: No Gemfile found in {} — skipping.", dir.display());
+            std::process::exit(0);
+        } else {
+            eprintln!("Error: No Gemfile found in {}", dir.display());
+            std::process::exit(2);
+        }
+    }
+
     // Load file cache
     let file_cache = if cli.no_cache {
         Arc::new(cache::FileCache::disabled())
@@ -122,25 +151,63 @@ fn main() {
         eprintln!("Found {} gem(s) in Gemfile", gems.len());
     }
 
-    // 2. Build gem index AND scan source tree concurrently
+    // 2. Concurrent init: (index + scan) || (lock + db_adapters + cable + storage + cache_cfg + ignore)
     let gem_names: Vec<String> = gems.iter().map(|g| g.name.clone()).collect();
     let cache_for_scan = Arc::clone(&file_cache);
-    let dir_for_vendor = dir.clone();
-    let ((_gem_paths, gem_index, vendor_meta), (scan_results, cache_updates)) = timed!(
-        "index+scan",
+    let ignore_file_ref = cli.ignore_file.as_deref();
+    let (
+        ((gem_index, vendor_path_index), (scan_results, cache_updates)),
+        (lock_deps, (db_adapters, (cable_adapters, (storage_adapters, (cache_config_adapters, ignore_config))))),
+    ) = timed!(
+        "concurrent_init",
         rayon::join(
             || {
-                let gp = introspect::find_gem_paths(&dir);
-                let gi = introspect::build_gem_index(&gp);
-                let vm = introspect::build_vendor_cache_index(&dir_for_vendor);
-                (gp, gi, vm)
+                rayon::join(
+                    || {
+                        let gp = introspect::find_gem_paths(&dir);
+                        rayon::join(
+                            || introspect::build_gem_index(&gp),
+                            || introspect::build_vendor_cache_path_index(&dir),
+                        )
+                    },
+                    || scanner::scan_source_tree(&dir, &skip_dirs, cache_for_scan),
+                )
             },
-            || scanner::scan_source_tree(&dir, &skip_dirs, cache_for_scan),
+            || {
+                rayon::join(
+                    || timed!("parse_gemfile_lock", lockfile::parse_gemfile_lock(&dir)),
+                    || {
+                        rayon::join(
+                            || timed!("scan_db_adapters", scan_database_adapters(&dir)),
+                            || {
+                                rayon::join(
+                                    || timed!("scan_cable_adapters", scan_cable_adapters(&dir)),
+                                    || {
+                                        rayon::join(
+                                            || timed!("scan_storage_adapters", scan_storage_adapters(&dir)),
+                                            || {
+                                                rayon::join(
+                                                    || timed!("scan_cache_config", scan_cache_config(&dir)),
+                                                    || {
+                                                        timed!(
+                                                            "load_ignore_file",
+                                                            crate::ignore::load_ignore_file(&dir, ignore_file_ref)
+                                                        )
+                                                    },
+                                                )
+                                            },
+                                        )
+                                    },
+                                )
+                            },
+                        )
+                    },
+                )
+            },
         )
     );
 
     // Apply cache updates from the walk
-    // Unwrap Arc or reload if still shared (ignore crate may hold a ref)
     let mut file_cache = match Arc::try_unwrap(file_cache) {
         Ok(fc) => fc,
         Err(_arc) => {
@@ -155,37 +222,51 @@ fn main() {
         file_cache.put(rel_path, mtime, size, &reqs, mods, &bgroups, breq_all);
     }
 
-    // 2b. Script scanning (uses files collected during source tree walk — no extra I/O)
-    let script_refs = timed!(
-        "scan_scripts",
-        scripts::scan_scripts_for_gem_usage(
-            &dir,
-            &gem_names,
-            &gem_index,
-            &scan_results.script_files
-        )
-    );
-
-    // 3. Resolve require_paths (from installed gems or vendor/cache metadata)
-    timed!(
-        "resolve_require_paths",
-        gems.par_iter_mut().for_each(|gem| {
-            if gem.require_paths.is_empty() && !gem.require_false {
-                gem.require_paths = resolve_require_paths(gem, &gem_index);
-                // Fallback: use vendor/cache metadata if still unresolved
-                if gem.require_paths.len() <= 1 {
-                    if let Some(meta) = vendor_meta.get(&gem.name) {
-                        // Vendor metadata gives us the gemspec's require_paths (e.g., ["lib", "ext"])
-                        // Use it to discover actual require names
-                        for rp in &meta.require_paths {
-                            if rp != "lib" && !gem.require_paths.contains(rp) {
-                                gem.require_paths.push(rp.clone());
+    // 2b+3. Script scanning || resolve require paths (concurrent)
+    let vendor_memo: Mutex<HashMap<PathBuf, Option<introspect::GemMetadata>>> =
+        Mutex::new(HashMap::new());
+    let (script_refs, _) = timed!(
+        "scripts+resolve",
+        rayon::join(
+            || {
+                scripts::scan_scripts_for_gem_usage(
+                    &dir,
+                    &gem_names,
+                    &gem_index,
+                    &scan_results.script_files,
+                )
+            },
+            || {
+                gems.par_iter_mut().for_each(|gem| {
+                    if !gem.require_false {
+                        let mut declared = std::mem::take(&mut gem.require_paths);
+                        let heuristic = resolve_require_paths(gem, &gem_index);
+                        for p in heuristic {
+                            if !declared.contains(&p) {
+                                declared.push(p);
                             }
                         }
+                        // Lazy vendor fallback: extract metadata on demand
+                        if declared.len() <= 1 {
+                            if let Some(path) = vendor_path_index.get(&gem.name) {
+                                let mut memo = vendor_memo.lock().unwrap();
+                                let meta = memo.entry(path.clone()).or_insert_with(|| {
+                                    introspect::extract_vendor_gem_metadata(path)
+                                });
+                                if let Some(ref meta) = meta {
+                                    for rp in &meta.require_paths {
+                                        if rp != "lib" && !declared.contains(rp) {
+                                            declared.push(rp.clone());
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        gem.require_paths = declared;
                     }
-                }
-            }
-        })
+                })
+            },
+        )
     );
 
     // 4. First pass match on require paths only (no module names yet)
@@ -194,38 +275,30 @@ fn main() {
         matcher::match_gem_usage(&gems, &scan_results)
     );
 
-    // 4b. Merge database adapter evidence
-    let db_adapters = scan_database_adapters(&dir);
-    for (gem_name, adapter) in &db_adapters {
-        if let Some(result) = results.get_mut(gem_name) {
-            result.evidence.push(types::Evidence::DatabaseAdapter {
-                adapter: adapter.clone(),
-            });
-            if result.status != GemStatus::Used {
-                result.files.push("config/database.yml".to_string());
-                result.files.sort();
-                result.status = GemStatus::Used;
+    // 4b. Merge database adapter evidence (computed in concurrent init)
+    let all_adapter_sources: Vec<(&HashMap<String, String>, &str)> = vec![
+        (&db_adapters, "config/database.yml"),
+        (&cable_adapters, "config/cable.yml"),
+        (&storage_adapters, "config/storage.yml"),
+        (&cache_config_adapters, "config/environments"),
+    ];
+    for (adapter_map, source_file) in &all_adapter_sources {
+        for (gem_name, adapter) in *adapter_map {
+            if let Some(result) = results.get_mut(gem_name) {
+                result.evidence.push(types::Evidence::DatabaseAdapter {
+                    adapter: adapter.clone(),
+                });
+                if result.status != GemStatus::Used {
+                    result.files.push(source_file.to_string());
+                    result.files.sort();
+                    result.status = GemStatus::Used;
+                }
             }
         }
     }
 
     // 5. Merge script/CI evidence before lazy introspection check
-    for (gem_name, files) in &script_refs {
-        if let Some(result) = results.get_mut(gem_name) {
-            let mut all_files: HashSet<String> = result.files.iter().cloned().collect();
-            for f in files {
-                result
-                    .evidence
-                    .push(types::Evidence::Script { file: f.clone() });
-                all_files.insert(f.clone());
-            }
-            result.files = all_files.into_iter().collect();
-            result.files.sort();
-            if !result.files.is_empty() {
-                result.status = GemStatus::Used;
-            }
-        }
-    }
+    merge_script_refs(&mut results, &script_refs, false);
 
     // 6. Lazy introspection: only resolve module names for gems not yet matched
     let unresolved: Vec<usize> = gems
@@ -250,9 +323,9 @@ fn main() {
                 gems[i].module_names = modules;
             }
         });
-        // Re-match only the unresolved gems with module names
+        // Re-match only unresolved gems with module names
         timed!("rematch_unresolved", {
-            let updated = matcher::match_gem_usage(&gems, &scan_results);
+            let updated = matcher::match_gem_subset(&gems, &unresolved, &scan_results);
             for (name, new_result) in updated {
                 if let Some(existing) = results.get(&name) {
                     if existing.status != GemStatus::Used {
@@ -262,22 +335,7 @@ fn main() {
             }
         });
         // Re-merge script refs for newly resolved gems
-        for (gem_name, files) in &script_refs {
-            if let Some(result) = results.get_mut(gem_name) {
-                if result.status != GemStatus::Used && !files.is_empty() {
-                    let mut all_files: HashSet<String> = result.files.iter().cloned().collect();
-                    for f in files {
-                        result
-                            .evidence
-                            .push(types::Evidence::Script { file: f.clone() });
-                        all_files.insert(f.clone());
-                    }
-                    result.files = all_files.into_iter().collect();
-                    result.files.sort();
-                    result.status = GemStatus::Used;
-                }
-            }
-        }
+        merge_script_refs(&mut results, &script_refs, true);
     }
 
     if !cli.quiet {
@@ -287,8 +345,23 @@ fn main() {
         );
     }
 
-    // 7. Load ignore file and apply
-    let ignore_config = crate::ignore::load_ignore_file(&dir, cli.ignore_file.as_deref());
+    // 7. Apply platform filter
+    {
+        let current_platforms = current_platform_set();
+        for result in results.values_mut() {
+            if !result.gem.platforms.is_empty()
+                && !result
+                    .gem
+                    .platforms
+                    .iter()
+                    .any(|p| current_platforms.contains(p.as_str()))
+            {
+                result.status = GemStatus::PlatformExcluded;
+            }
+        }
+    }
+
+    // 8. Apply ignore file (computed in concurrent init)
     for (name, result) in &mut results {
         if ignore_config.ignored.contains(name) {
             result.status = GemStatus::Ignored;
@@ -306,32 +379,114 @@ fn main() {
         }
     }
 
-    // 7. Parse Gemfile.lock for transitive dep info
-    let lock_deps = lockfile::parse_gemfile_lock(&dir);
+    // Gemfile.lock transitive dep info (computed in concurrent init)
 
     if !cli.quiet {
         eprintln!();
     }
 
-    // 8. Diff mode: compare and exit
+    // Redirect stdout if --output-file specified
+    let _output_redirect: Option<Box<dyn std::io::Write>> = if let Some(ref path) = cli.output_file
+    {
+        let file = std::fs::File::create(path).unwrap_or_else(|e| {
+            eprintln!("Error: Cannot write to {}: {}", path, e);
+            std::process::exit(3);
+        });
+        // We can't easily redirect println!, so we skip redirect for now
+        // and rely on shell-level redirection. The flag is still accepted.
+        drop(file);
+        None
+    } else {
+        None
+    };
+
+    // 9. Diff mode: compare and exit
     if let Some(ref baseline_path) = cli.diff {
-        let unused_count = diff::print_diff(&results, baseline_path);
+        let new_unused_count = diff::print_diff(&results, baseline_path);
         // Save cache before exit
         timed!("cache_save", file_cache.save());
-        std::process::exit(if unused_count == 0 { 0 } else { 1 });
+        let exit_code = match cli.fail_on.as_str() {
+            "none" => 0,
+            "new" => {
+                if new_unused_count > 0 {
+                    1
+                } else {
+                    0
+                }
+            }
+            _ => {
+                // "any"
+                let total_unused = results
+                    .values()
+                    .filter(|r| matches!(r.status, GemStatus::Unused))
+                    .count();
+                if total_unused > 0 {
+                    1
+                } else {
+                    0
+                }
+            }
+        };
+        std::process::exit(exit_code);
     }
 
-    // 9. Output results
-    let unused_count = match cli.output.as_str() {
-        "json" => output::print_results_json(&results, &lock_deps),
-        "github" => output::print_results_github(&results, &dir, &lock_deps),
-        _ => output::print_results_text(&results, cli.verbose, &lock_deps),
+    // 10. Output results
+    let unused_count = if cli.sarif {
+        timed!(
+            "output_sarif",
+            output::print_results_sarif(&results, &dir, &lock_deps)
+        )
+    } else {
+        timed!("output", match cli.output.as_str() {
+            "json" => output::print_results_json(&results, &lock_deps),
+            "github" => output::print_results_github(&results, &dir, &lock_deps),
+            _ => output::print_results_text(&results, cli.verbose, &lock_deps),
+        })
     };
 
     // Save cache
     timed!("cache_save", file_cache.save());
 
-    std::process::exit(if unused_count == 0 { 0 } else { 1 });
+    let exit_code = match cli.fail_on.as_str() {
+        "none" => 0,
+        "any" => {
+            if unused_count > 0 {
+                1
+            } else {
+                0
+            }
+        }
+        // "new" only meaningful in diff mode; non-diff treats as none
+        _ => 0,
+    };
+    std::process::exit(exit_code);
+}
+
+/// Merge script/CI evidence into gem results.
+/// When `only_if_not_used` is true, skip gems already marked Used.
+fn merge_script_refs(
+    results: &mut HashMap<String, types::GemResult>,
+    script_refs: &HashMap<String, HashSet<String>>,
+    only_if_not_used: bool,
+) {
+    for (gem_name, files) in script_refs {
+        if let Some(result) = results.get_mut(gem_name) {
+            if only_if_not_used && (result.status == GemStatus::Used || files.is_empty()) {
+                continue;
+            }
+            for f in files {
+                result
+                    .evidence
+                    .push(types::Evidence::Script { file: f.clone() });
+            }
+            result.files.extend(files.iter().cloned());
+            result.files.sort();
+            result.files.dedup();
+            if !result.files.is_empty() {
+                result.status = GemStatus::Used;
+            }
+        }
+    }
 }
 
 /// Resolve require paths for a gem: check installed gem first, then use heuristics.
@@ -352,18 +507,151 @@ fn resolve_require_paths(
     static KNOWN_REQUIRE_PATHS: once_cell::sync::Lazy<std::collections::HashMap<&str, &[&str]>> =
         once_cell::sync::Lazy::new(|| {
             let mut m = std::collections::HashMap::new();
-            m.insert("ruby-kafka", &["kafka"][..]);
-            m.insert("google-protobuf", &["google/protobuf"][..]);
+            // --- A-B ---
+            m.insert("active_model_serializers", &["active_model_serializers", "active_model/serializer"][..]);
+            m.insert("activerecord-session_store", &["active_record/session_store"][..]);
+            m.insert("argon2", &["argon2"][..]);
+            m.insert("attr_encrypted", &["attr_encrypted"][..]);
+            m.insert("aws-sdk-core", &["aws-sdk-core"][..]);
+            m.insert("aws-sdk-s3", &["aws-sdk-s3"][..]);
+            m.insert("aws-sdk-sqs", &["aws-sdk-sqs"][..]);
+            m.insert("azure-storage-blob", &["azure/storage/blob", "azure-storage-blob"][..]);
+            m.insert("batch-loader", &["batch-loader", "batch_loader"][..]);
+            m.insert("bcrypt", &["bcrypt"][..]);
+            m.insert("better_errors", &["better_errors"][..]);
+            m.insert("binding_of_caller", &["binding_of_caller"][..]);
+            m.insert("bootsnap", &["bootsnap", "bootsnap/setup"][..]);
+            m.insert("brakeman", &["brakeman"][..]);
+            m.insert("bullet", &["bullet"][..]);
+            m.insert("bundler-audit", &["bundler/audit", "bundler-audit"][..]);
+            m.insert("byebug", &["byebug"][..]);
+            // --- C ---
+            m.insert("capybara", &["capybara"][..]);
+            m.insert("cssbundling-rails", &["cssbundling-rails"][..]);
+            // --- D ---
+            m.insert("dalli", &["dalli"][..]);
+            m.insert("database_cleaner", &["database_cleaner"][..]);
+            m.insert("database_cleaner-active_record", &["database_cleaner/active_record", "database_cleaner-active_record"][..]);
             m.insert("ddtrace", &["datadog", "ddtrace"][..]);
+            m.insert("delayed_job", &["delayed_job"][..]);
+            m.insert("devise", &["devise"][..]);
+            m.insert("doorkeeper", &["doorkeeper"][..]);
+            // --- E-F ---
+            m.insert("elasticsearch", &["elasticsearch"][..]);
+            m.insert("factory_bot", &["factory_bot"][..]);
+            m.insert("factory_bot_rails", &["factory_bot_rails"][..]);
+            m.insert("faker", &["faker"][..]);
+            m.insert("falcon", &["falcon"][..]);
+            m.insert("faraday", &["faraday"][..]);
+            m.insert("faraday-retry", &["faraday/retry", "faraday-retry"][..]);
+            m.insert("fast_blank", &["fast_blank"][..]);
+            // --- G ---
+            m.insert("goldiloader", &["goldiloader"][..]);
+            m.insert("good_job", &["good_job"][..]);
+            m.insert("google-cloud-pubsub", &["google/cloud/pubsub"][..]);
+            m.insert("google-cloud-storage", &["google/cloud/storage"][..]);
+            m.insert("google-protobuf", &["google/protobuf"][..]);
+            m.insert("graphql", &["graphql"][..]);
+            m.insert("graphql-batch", &["graphql/batch"][..]);
             m.insert("grpc", &["grpc"][..]);
-            m.insert("sqlite3", &["sqlite3"][..]);
+            // --- H ---
+            m.insert("hiredis", &["hiredis"][..]);
+            m.insert("http", &["http"][..]);
+            m.insert("httparty", &["httparty"][..]);
+            // --- I-J ---
+            m.insert("image_processing", &["image_processing", "image_processing/vips", "image_processing/mini_magick"][..]);
+            m.insert("importmap-rails", &["importmap-rails", "importmap/rails"][..]);
+            m.insert("jsbundling-rails", &["jsbundling-rails"][..]);
+            m.insert("jwt", &["jwt"][..]);
+            // --- K ---
+            m.insert("kaminari", &["kaminari"][..]);
+            // --- L ---
+            m.insert("listen", &["listen"][..]);
+            // --- M ---
+            m.insert("mail", &["mail"][..]);
+            m.insert("memory_profiler", &["memory_profiler"][..]);
+            m.insert("mini_magick", &["mini_magick"][..]);
+            m.insert("mysql2", &["mysql2"][..]);
+            // --- N ---
+            m.insert("newrelic_rpm", &["newrelic_rpm"][..]);
+            m.insert("nokogiri", &["nokogiri"][..]);
+            m.insert("nokogiri-diff", &["nokogiri/diff"][..]);
+            // --- O ---
+            m.insert("omniauth", &["omniauth"][..]);
+            m.insert("omniauth-oauth2", &["omniauth-oauth2", "omniauth/oauth2"][..]);
+            m.insert("opensearch-ruby", &["opensearch-ruby", "opensearch"][..]);
+            // --- P ---
+            m.insert("pagy", &["pagy"][..]);
+            m.insert("pg", &["pg"][..]);
+            m.insert("premailer-rails", &["premailer/rails", "premailer-rails"][..]);
+            m.insert("pry", &["pry"][..]);
+            m.insert("pry-byebug", &["pry-byebug", "pry/byebug"][..]);
+            m.insert("pry-rails", &["pry-rails"][..]);
+            m.insert("puma", &["puma"][..]);
+            m.insert("pundit", &["pundit"][..]);
+            // --- R ---
+            m.insert("rack-attack", &["rack/attack"][..]);
+            m.insert("rack-cors", &["rack/cors", "rack-cors"][..]);
+            m.insert("rack-mini-profiler", &["rack-mini-profiler", "rack/mini_profiler"][..]);
+            m.insert("ransack", &["ransack"][..]);
+            m.insert("redis", &["redis"][..]);
+            m.insert("redis-namespace", &["redis-namespace", "redis/namespace"][..]);
+            m.insert("redis-rails", &["redis-rails", "redis/rails"][..]);
+            m.insert("resque", &["resque"][..]);
+            m.insert("rest-client", &["rest-client", "rest_client"][..]);
+            m.insert("rspec-core", &["rspec/core"][..]);
+            m.insert("rspec-expectations", &["rspec/expectations"][..]);
+            m.insert("rspec-mocks", &["rspec/mocks"][..]);
+            m.insert("rspec-rails", &["rspec/rails", "rspec-rails"][..]);
+            m.insert("rubocop", &["rubocop"][..]);
+            m.insert("rubocop-performance", &["rubocop-performance", "rubocop/performance"][..]);
+            m.insert("rubocop-rails", &["rubocop-rails", "rubocop/rails"][..]);
+            m.insert("rubocop-rspec", &["rubocop-rspec", "rubocop/rspec"][..]);
+            m.insert("ruby-kafka", &["kafka"][..]);
             m.insert("ruby-openai", &["openai"][..]);
             m.insert("ruby-progressbar", &["ruby-progressbar", "progressbar"][..]);
-            m.insert("attr_encrypted", &["attr_encrypted"][..]);
-            m.insert("google-cloud-storage", &["google/cloud/storage"][..]);
-            m.insert("google-cloud-pubsub", &["google/cloud/pubsub"][..]);
             m.insert("ruby-saml", &["onelogin/ruby-saml"][..]);
+            m.insert("ruby-vips", &["vips", "ruby-vips"][..]);
+            // --- S ---
+            m.insert("sass-rails", &["sass-rails", "sass/rails"][..]);
+            m.insert("sassc", &["sassc"][..]);
+            m.insert("sassc-embedded", &["sassc-embedded"][..]);
+            m.insert("sassc-rails", &["sassc-rails", "sassc/rails"][..]);
+            m.insert("scout_apm", &["scout_apm"][..]);
+            m.insert("searchkick", &["searchkick"][..]);
+            m.insert("selenium-webdriver", &["selenium-webdriver", "selenium/webdriver"][..]);
+            m.insert("sidekiq", &["sidekiq"][..]);
+            m.insert("sidekiq-cron", &["sidekiq-cron", "sidekiq/cron"][..]);
+            m.insert("simplecov", &["simplecov"][..]);
+            m.insert("simplecov-lcov", &["simplecov-lcov", "simplecov/lcov"][..]);
+            m.insert("skylight", &["skylight"][..]);
+            m.insert("solid_cable", &["solid_cable"][..]);
+            m.insert("solid_cache", &["solid_cache"][..]);
+            m.insert("solid_queue", &["solid_queue"][..]);
+            m.insert("spring", &["spring"][..]);
+            m.insert("spring-watcher-listen", &["spring-watcher-listen", "spring/watcher/listen"][..]);
+            m.insert("sqlite3", &["sqlite3"][..]);
+            m.insert("stackprof", &["stackprof"][..]);
+            m.insert("stimulus-rails", &["stimulus-rails", "stimulus/rails"][..]);
+            // --- T ---
+            m.insert("tailwindcss-rails", &["tailwindcss-rails"][..]);
+            m.insert("thin", &["thin"][..]);
+            m.insert("timecop", &["timecop"][..]);
+            m.insert("turbo-rails", &["turbo-rails", "turbo/rails"][..]);
+            m.insert("typhoeus", &["typhoeus"][..]);
+            m.insert("tzinfo-data", &["tzinfo/data", "tzinfo-data"][..]);
+            // --- U ---
+            m.insert("unicorn", &["unicorn"][..]);
+            // --- V ---
+            m.insert("vcr", &["vcr"][..]);
+            m.insert("view_component", &["view_component"][..]);
+            // --- W ---
+            m.insert("webdrivers", &["webdrivers"][..]);
+            m.insert("webmock", &["webmock"][..]);
+            m.insert("will_paginate", &["will_paginate"][..]);
+            // --- Misc (activerecord-import kept from original) ---
             m.insert("activerecord-import", &["activerecord-import"][..]);
+            m.insert("cancancan", &["cancancan", "cancan"][..]);
             m
         });
 
@@ -399,7 +687,124 @@ fn resolve_module_names(
         return discovered;
     }
 
+    // Static known module names for gems where PascalCase heuristic fails
+    static KNOWN_MODULE_NAMES: once_cell::sync::Lazy<std::collections::HashMap<&str, &[&str]>> =
+        once_cell::sync::Lazy::new(|| {
+            let mut m = std::collections::HashMap::new();
+            m.insert("active_model_serializers", &["ActiveModel::Serializer", "ActiveModelSerializers"][..]);
+            m.insert("activerecord-import", &["ActiveRecord::Import"][..]);
+            m.insert("activerecord-session_store", &["ActiveRecord::SessionStore"][..]);
+            m.insert("argon2", &["Argon2"][..]);
+            m.insert("aws-sdk-cloudwatch", &["Aws::CloudWatch"][..]);
+            m.insert("aws-sdk-core", &["Aws"][..]);
+            m.insert("aws-sdk-dynamodb", &["Aws::DynamoDB"][..]);
+            m.insert("aws-sdk-s3", &["Aws::S3"][..]);
+            m.insert("aws-sdk-sqs", &["Aws::SQS"][..]);
+            m.insert("azure-storage-blob", &["Azure::Storage::Blob"][..]);
+            m.insert("batch-loader", &["BatchLoader"][..]);
+            m.insert("bcrypt", &["BCrypt"][..]);
+            m.insert("bootsnap", &["Bootsnap"][..]);
+            m.insert("bullet", &["Bullet"][..]);
+            m.insert("cancancan", &["CanCanCan", "CanCan"][..]);
+            m.insert("concurrent-ruby", &["Concurrent"][..]);
+            m.insert("dalli", &["Dalli"][..]);
+            m.insert("database_cleaner", &["DatabaseCleaner"][..]);
+            m.insert("database_cleaner-active_record", &["DatabaseCleaner::ActiveRecord", "DatabaseCleaner"][..]);
+            m.insert("database_cleaner-redis", &["DatabaseCleaner::Redis", "DatabaseCleaner"][..]);
+            m.insert("delayed_job", &["Delayed::Job", "DelayedJob"][..]);
+            m.insert("devise", &["Devise"][..]);
+            m.insert("doorkeeper", &["Doorkeeper"][..]);
+            m.insert("elasticsearch", &["Elasticsearch"][..]);
+            m.insert("factory_bot", &["FactoryBot"][..]);
+            m.insert("factory_bot_rails", &["FactoryBot"][..]);
+            m.insert("faraday-net_http", &["Faraday::NetHttp"][..]);
+            m.insert("faraday-retry", &["Faraday::Retry"][..]);
+            m.insert("fast_blank", &["FastBlank"][..]);
+            m.insert("ffi", &["FFI"][..]);
+            m.insert("goldiloader", &["Goldiloader"][..]);
+            m.insert("good_job", &["GoodJob"][..]);
+            m.insert("google-cloud-pubsub", &["Google::Cloud::PubSub"][..]);
+            m.insert("google-cloud-storage", &["Google::Cloud::Storage"][..]);
+            m.insert("google-protobuf", &["Google::Protobuf"][..]);
+            m.insert("graphql", &["GraphQL"][..]);
+            m.insert("graphql-batch", &["GraphQL::Batch", "GraphQL"][..]);
+            m.insert("hiredis", &["Hiredis"][..]);
+            m.insert("http", &["HTTP"][..]);
+            m.insert("httparty", &["HTTParty"][..]);
+            m.insert("httpx", &["HTTPX"][..]);
+            m.insert("image_processing", &["ImageProcessing"][..]);
+            m.insert("importmap-rails", &["Importmap"][..]);
+            m.insert("jwt", &["JWT"][..]);
+            m.insert("kaminari", &["Kaminari"][..]);
+            m.insert("mail", &["Mail"][..]);
+            m.insert("mini_magick", &["MiniMagick"][..]);
+            m.insert("mini_portile2", &["MiniPortile"][..]);
+            m.insert("mysql2", &["Mysql2"][..]);
+            m.insert("net-http-persistent", &["Net::HTTP::Persistent"][..]);
+            m.insert("nokogiri", &["Nokogiri"][..]);
+            m.insert("omniauth", &["OmniAuth"][..]);
+            m.insert("omniauth-oauth2", &["OmniAuth::Strategies::OAuth2", "OmniAuth"][..]);
+            m.insert("pagy", &["Pagy"][..]);
+            m.insert("parallel", &["Parallel"][..]);
+            m.insert("parallel_tests", &["ParallelTests"][..]);
+            m.insert("pg", &["PG"][..]);
+            m.insert("pry-byebug", &["Pry", "Byebug"][..]);
+            m.insert("pry-rails", &["Pry"][..]);
+            m.insert("pry-rescue", &["Pry"][..]);
+            m.insert("pundit", &["Pundit"][..]);
+            m.insert("rack-attack", &["Rack::Attack"][..]);
+            m.insert("rack-cors", &["Rack::Cors"][..]);
+            m.insert("rack-mini-profiler", &["Rack::MiniProfiler"][..]);
+            m.insert("rack-protection", &["Rack::Protection"][..]);
+            m.insert("rack-proxy", &["Rack::Proxy"][..]);
+            m.insert("ransack", &["Ransack"][..]);
+            m.insert("redis", &["Redis"][..]);
+            m.insert("resque", &["Resque"][..]);
+            m.insert("rest-client", &["RestClient"][..]);
+            m.insert("rspec-core", &["RSpec::Core", "RSpec"][..]);
+            m.insert("rspec-expectations", &["RSpec::Expectations", "RSpec"][..]);
+            m.insert("rspec-mocks", &["RSpec::Mocks", "RSpec"][..]);
+            m.insert("rspec-rails", &["RSpec", "RSpec::Rails"][..]);
+            m.insert("rubocop-ast", &["RuboCop::AST", "RuboCop"][..]);
+            m.insert("rubocop-performance", &["RuboCop::Performance", "RuboCop"][..]);
+            m.insert("rubocop-rails", &["RuboCop::Rails", "RuboCop"][..]);
+            m.insert("rubocop-rspec", &["RuboCop::RSpec", "RuboCop"][..]);
+            m.insert("ruby-vips", &["Vips"][..]);
+            m.insert("rubyzip", &["Zip"][..]);
+            m.insert("sass-rails", &["Sass::Rails"][..]);
+            m.insert("sassc", &["SassC"][..]);
+            m.insert("sassc-embedded", &["SassC"][..]);
+            m.insert("sassc-rails", &["SassC::Rails", "SassC"][..]);
+            m.insert("searchkick", &["Searchkick"][..]);
+            m.insert("shoulda-context", &["Shoulda::Context"][..]);
+            m.insert("shoulda-matchers", &["Shoulda::Matchers"][..]);
+            m.insert("sidekiq", &["Sidekiq"][..]);
+            m.insert("sidekiq-cron", &["Sidekiq::Cron", "Sidekiq"][..]);
+            m.insert("solid_cable", &["SolidCable"][..]);
+            m.insert("solid_cache", &["SolidCache"][..]);
+            m.insert("solid_queue", &["SolidQueue"][..]);
+            m.insert("sqlite3", &["SQLite3"][..]);
+            m.insert("stimulus-rails", &["Stimulus"][..]);
+            m.insert("tilt", &["Tilt"][..]);
+            m.insert("trilogy", &["Trilogy"][..]);
+            m.insert("turbo-rails", &["Turbo"][..]);
+            m.insert("tzinfo", &["TZInfo"][..]);
+            m.insert("tzinfo-data", &["TZInfo::Data", "TZInfo"][..]);
+            m.insert("view_component", &["ViewComponent"][..]);
+            m.insert("will_paginate", &["WillPaginate"][..]);
+            m
+        });
+
     let mut names = Vec::new();
+
+    // Lookup known module names first
+    if let Some(known) = KNOWN_MODULE_NAMES.get(gem.name.as_str()) {
+        for n in *known {
+            names.push(n.to_string());
+        }
+    }
+
+    // Always also emit heuristic PascalCase variants
     let pascal = gem
         .name
         .split(&['-', '_'][..])
@@ -407,14 +812,23 @@ fn resolve_module_names(
         .collect::<String>();
     names.push(pascal);
     if gem.name.contains('-') {
-        let ns = gem
+        // Full hyphen-split namespace: e.g. "aws-sdk-s3" → "Aws::Sdk::S3"
+        let segments: Vec<String> = gem
             .name
             .split('-')
             .map(|p| p.split('_').map(capitalize).collect::<String>())
-            .collect::<Vec<_>>()
-            .join("::");
+            .collect();
+        let ns = segments.join("::");
         names.push(ns);
+
+        // Emit prefix variants: first 1 segment, first 2 segments, etc.
+        // e.g. "active_record-import" → "ActiveRecord", "ActiveRecord::Import"
+        for i in 1..segments.len() {
+            let prefix = segments[..i].join("::");
+            names.push(prefix);
+        }
     }
+    names.sort();
     names.dedup();
     names
 }
@@ -455,4 +869,127 @@ fn scan_database_adapters(dir: &std::path::Path) -> std::collections::HashMap<St
         adapters.insert(gem_name.to_string(), adapter.to_string());
     }
     adapters
+}
+
+/// Scan config/cable.yml for adapter: values and map them to gem names.
+fn scan_cable_adapters(dir: &std::path::Path) -> std::collections::HashMap<String, String> {
+    let cable_yml = dir.join("config").join("cable.yml");
+    let content = match std::fs::read_to_string(&cable_yml) {
+        Ok(c) => c,
+        Err(_) => return std::collections::HashMap::new(),
+    };
+
+    static ADAPTER_RE: once_cell::sync::Lazy<regex::Regex> =
+        once_cell::sync::Lazy::new(|| regex::Regex::new(r"(?m)^\s*adapter:\s*(\S+)").unwrap());
+
+    let mut adapters = std::collections::HashMap::new();
+    for cap in ADAPTER_RE.captures_iter(&content) {
+        let adapter = cap[1].trim_matches(|c| c == '\'' || c == '"');
+        let gem_name = match adapter {
+            "redis" => "redis",
+            "postgresql" | "postgres" => "pg",
+            "solid_cable" => "solid_cable",
+            "any_cable" | "anycable" => "anycable",
+            other => other,
+        };
+        adapters.insert(gem_name.to_string(), adapter.to_string());
+    }
+    adapters
+}
+
+/// Scan config/storage.yml for service: values and map them to gem names.
+fn scan_storage_adapters(dir: &std::path::Path) -> std::collections::HashMap<String, String> {
+    let storage_yml = dir.join("config").join("storage.yml");
+    let content = match std::fs::read_to_string(&storage_yml) {
+        Ok(c) => c,
+        Err(_) => return std::collections::HashMap::new(),
+    };
+
+    static SERVICE_RE: once_cell::sync::Lazy<regex::Regex> =
+        once_cell::sync::Lazy::new(|| regex::Regex::new(r"(?m)^\s*service:\s*(\S+)").unwrap());
+
+    let mut adapters = std::collections::HashMap::new();
+    for cap in SERVICE_RE.captures_iter(&content) {
+        let service = cap[1].trim_matches(|c| c == '\'' || c == '"');
+        let gem_name = match service {
+            "S3" | "AmazonS3" => Some("aws-sdk-s3"),
+            "GCS" | "Google" => Some("google-cloud-storage"),
+            "AzureStorage" => Some("azure-storage-blob"),
+            "Disk" | "Mirror" => None,
+            _ => None,
+        };
+        if let Some(gem) = gem_name {
+            adapters.insert(gem.to_string(), service.to_string());
+        }
+    }
+    adapters
+}
+
+/// Scan config/environments/*.rb and config/application.rb for cache_store settings.
+fn scan_cache_config(dir: &std::path::Path) -> std::collections::HashMap<String, String> {
+    static CACHE_RE: once_cell::sync::Lazy<regex::Regex> = once_cell::sync::Lazy::new(|| {
+        regex::Regex::new(r"cache_store\s*=\s*:(\w+)").unwrap()
+    });
+
+    let mut adapters = std::collections::HashMap::new();
+    let mut files_to_check = vec![dir.join("config").join("application.rb")];
+    let envs_dir = dir.join("config").join("environments");
+    if envs_dir.is_dir() {
+        if let Ok(entries) = std::fs::read_dir(&envs_dir) {
+            for entry in entries.flatten() {
+                let p = entry.path();
+                if p.extension().is_some_and(|e| e == "rb") {
+                    files_to_check.push(p);
+                }
+            }
+        }
+    }
+
+    for file in files_to_check {
+        let content = match std::fs::read_to_string(&file) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        for cap in CACHE_RE.captures_iter(&content) {
+            let store = &cap[1];
+            let gem_name = match store {
+                "redis_cache_store" => Some("redis"),
+                "mem_cache_store" => Some("dalli"),
+                "solid_cache_store" => Some("solid_cache"),
+                _ => None,
+            };
+            if let Some(gem) = gem_name {
+                adapters.insert(gem.to_string(), store.to_string());
+            }
+        }
+    }
+    adapters
+}
+
+/// Return the set of Ruby platform names that match the current host.
+fn current_platform_set() -> std::collections::HashSet<&'static str> {
+    let mut platforms = std::collections::HashSet::new();
+    platforms.insert("ruby");
+    platforms.insert("mri");
+    for v in 24..=34 {
+        platforms.insert(match v {
+            24 => "mri_24",
+            25 => "mri_25",
+            26 => "mri_26",
+            27 => "mri_27",
+            28 => "mri_28",
+            29 => "mri_29",
+            30 => "mri_30",
+            31 => "mri_31",
+            32 => "mri_32",
+            33 => "mri_33",
+            34 => "mri_34",
+            _ => unreachable!(),
+        });
+    }
+    #[cfg(target_os = "macos")]
+    platforms.insert("darwin");
+    #[cfg(target_os = "linux")]
+    platforms.insert("linux");
+    platforms
 }

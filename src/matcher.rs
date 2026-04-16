@@ -1,96 +1,74 @@
 use std::collections::{HashMap, HashSet};
 
+use rayon::prelude::*;
+
 use crate::types::{Evidence, GemEntry, GemResult, GemStatus, ScanResults};
 
-pub fn match_gem_usage(
-    gems: &[GemEntry],
-    scan_results: &ScanResults,
-) -> HashMap<String, GemResult> {
-    let requires = &scan_results.requires;
-    let modules = &scan_results.modules;
-    let bundler_groups = &scan_results.bundler_groups;
-    let bundler_require_all = scan_results.bundler_require_all;
+/// Shared indexes built once from scan results and reused across all gem matching.
+struct MatchIndexes<'a> {
+    requires: &'a HashMap<String, HashSet<String>>,
+    prefix_map: HashMap<&'a str, Vec<(&'a str, &'a HashSet<String>)>>,
+    /// (lowercased_name, original_name, files)
+    modules_indexed: Vec<(String, String, &'a HashSet<String>)>,
+    bundler_groups: &'a HashSet<String>,
+    bundler_require_all: bool,
+}
 
-    // Pre-build prefix map for O(1) sub-require lookups
-    let mut prefix_map: HashMap<&str, Vec<(&str, &HashSet<String>)>> = HashMap::new();
-    for (req_name, files) in requires {
-        let top_segment = req_name.split('/').next().unwrap_or(req_name);
-        prefix_map
-            .entry(top_segment)
-            .or_default()
-            .push((req_name.as_str(), files));
-    }
+impl<'a> MatchIndexes<'a> {
+    fn build(scan_results: &'a ScanResults) -> Self {
+        let requires = &scan_results.requires;
 
-    // Pre-lowercase all source module names once (avoids repeated to_lowercase per gem)
-    let modules_lower: Vec<(String, &HashSet<String>)> = modules
-        .iter()
-        .map(|(name, files)| (name.to_lowercase(), files))
-        .collect();
-
-    // Keep original module names for evidence reporting
-    let modules_original: HashMap<String, &str> = modules
-        .keys()
-        .map(|name| (name.to_lowercase(), name.as_str()))
-        .collect();
-
-    let mut results = HashMap::new();
-
-    for gem_entry in gems {
-        let mut found_files: HashSet<String> = HashSet::new();
-        let mut evidence: Vec<Evidence> = Vec::new();
-
-        // Check each require path for this gem
-        for req_path in &gem_entry.require_paths {
-            if let Some(files) = requires.get(req_path) {
-                for f in files {
-                    evidence.push(Evidence::Require {
-                        path: req_path.clone(),
-                        file: f.clone(),
-                    });
-                }
-                found_files.extend(files.iter().cloned());
-            }
-
-            // Check sub-requires via prefix map
-            let top = req_path.split('/').next().unwrap_or(req_path);
-            if let Some(entries) = prefix_map.get(top) {
-                let prefix = format!("{}/", req_path);
-                for (req_name, files) in entries {
-                    if req_name.starts_with(&prefix) {
-                        for f in *files {
-                            evidence.push(Evidence::Require {
-                                path: req_name.to_string(),
-                                file: f.clone(),
-                            });
-                        }
-                        found_files.extend(files.iter().cloned());
-                    }
-                }
-            }
+        let mut prefix_map: HashMap<&str, Vec<(&str, &HashSet<String>)>> = HashMap::new();
+        for (req_name, files) in requires {
+            let top_segment = req_name.split('/').next().unwrap_or(req_name);
+            prefix_map
+                .entry(top_segment)
+                .or_default()
+                .push((req_name.as_str(), files));
         }
 
-        // Check module/class name references against pre-lowercased source modules
-        for mod_pattern in &gem_entry.module_names {
-            let mod_down = mod_pattern.to_lowercase();
-            // Skip very short module names that cause false positives (e.g., "Cli", "Api")
-            // UNLESS they match the gem name exactly (e.g. "aws", "jwt", "csv")
-            if mod_down.len() < 4 {
-                let gem_simple = gem_entry.name.replace(['-', '_'], "").to_lowercase();
-                if mod_down != gem_simple && mod_down != gem_entry.name.to_lowercase() {
-                    continue;
-                }
-            }
-            let prefix = format!("{}::", mod_down);
+        let modules_indexed: Vec<(String, String, &HashSet<String>)> = scan_results
+            .modules
+            .iter()
+            .map(|(name, files)| (name.to_lowercase(), name.clone(), files))
+            .collect();
 
-            for (name_down, files) in &modules_lower {
-                if *name_down == mod_down || name_down.starts_with(&prefix) {
-                    let original_name = match modules_original.get(name_down.as_str()) {
-                        Some(n) => *n,
-                        None => name_down.as_str(),
-                    };
+        MatchIndexes {
+            requires,
+            prefix_map,
+            modules_indexed,
+            bundler_groups: &scan_results.bundler_groups,
+            bundler_require_all: scan_results.bundler_require_all,
+        }
+    }
+}
+
+/// Build a single GemResult for one gem entry against the shared indexes.
+fn build_gem_result(gem_entry: &GemEntry, indexes: &MatchIndexes<'_>) -> GemResult {
+    let mut found_files: HashSet<String> = HashSet::new();
+    let mut evidence: Vec<Evidence> = Vec::new();
+
+    // Check each require path for this gem
+    for req_path in &gem_entry.require_paths {
+        if let Some(files) = indexes.requires.get(req_path) {
+            for f in files {
+                evidence.push(Evidence::Require {
+                    path: req_path.clone(),
+                    file: f.clone(),
+                });
+            }
+            found_files.extend(files.iter().cloned());
+        }
+
+        // Check sub-requires via prefix map
+        let top = req_path.split('/').next().unwrap_or(req_path);
+        if let Some(entries) = indexes.prefix_map.get(top) {
+            let prefix = format!("{}/", req_path);
+            for (req_name, files) in entries {
+                if req_name.starts_with(&prefix) {
                     for f in *files {
-                        evidence.push(Evidence::Module {
-                            name: original_name.to_string(),
+                        evidence.push(Evidence::Require {
+                            path: req_name.to_string(),
                             file: f.clone(),
                         });
                     }
@@ -98,43 +76,92 @@ pub fn match_gem_usage(
                 }
             }
         }
-
-        // Determine status
-        let status = if !found_files.is_empty() {
-            GemStatus::Used
-        } else if gem_entry.require_false {
-            GemStatus::RequireFalse
-        } else if bundler_require_all && gem_entry.groups.contains(&"default".to_string()) {
-            // Bundler.require(*Rails.groups) only auto-loads :default + current env group.
-            // Only mark :default gems as BundlerRequired; dev/test-only gems are Unused.
-            evidence.push(Evidence::BundlerRequire);
-            GemStatus::BundlerRequired
-        } else if gem_entry.groups.iter().any(|g| bundler_groups.contains(g)) {
-            evidence.push(Evidence::BundlerRequire);
-            GemStatus::BundlerRequired
-        } else {
-            GemStatus::Unused
-        };
-
-        let mut files: Vec<String> = found_files.into_iter().collect();
-        files.sort();
-
-        // Deduplicate evidence
-        evidence.sort_by(|a, b| format!("{:?}", a).cmp(&format!("{:?}", b)));
-        evidence.dedup_by(|a, b| format!("{:?}", a) == format!("{:?}", b));
-
-        results.insert(
-            gem_entry.name.clone(),
-            GemResult {
-                status,
-                files,
-                evidence,
-                gem: gem_entry.clone(),
-            },
-        );
     }
 
-    results
+    // Hoist per-gem computations out of the inner module loop
+    let gem_name_lower = gem_entry.name.to_lowercase();
+    let gem_simple = gem_entry.name.replace(['-', '_'], "").to_lowercase();
+
+    // Check module/class name references against pre-lowercased source modules
+    for mod_pattern in &gem_entry.module_names {
+        let mod_down = mod_pattern.to_lowercase();
+        // Skip very short module names that cause false positives (e.g., "Cli", "Api")
+        // UNLESS they match the gem name exactly (e.g. "aws", "jwt", "csv")
+        if mod_down.len() < 4 && mod_down != gem_simple && mod_down != gem_name_lower {
+            continue;
+        }
+        let prefix = format!("{}::", mod_down);
+
+        for (name_down, original_name, files) in &indexes.modules_indexed {
+            if *name_down == mod_down || name_down.starts_with(&prefix) {
+                for f in *files {
+                    evidence.push(Evidence::Module {
+                        name: original_name.clone(),
+                        file: f.clone(),
+                    });
+                }
+                found_files.extend(files.iter().cloned());
+            }
+        }
+    }
+
+    // Determine status
+    let is_bundler_required = indexes.bundler_require_all
+        && gem_entry.groups.contains(&"default".to_string())
+        || gem_entry
+            .groups
+            .iter()
+            .any(|g| indexes.bundler_groups.contains(g));
+
+    let status = if !found_files.is_empty() {
+        GemStatus::Used
+    } else if gem_entry.require_false {
+        GemStatus::RequireFalse
+    } else if is_bundler_required {
+        evidence.push(Evidence::BundlerRequire);
+        GemStatus::BundlerRequired
+    } else {
+        GemStatus::Unused
+    };
+
+    let mut files: Vec<String> = found_files.into_iter().collect();
+    files.sort();
+
+    evidence.sort();
+    evidence.dedup();
+
+    GemResult {
+        status,
+        files,
+        evidence,
+        gem: gem_entry.clone(),
+    }
+}
+
+/// Match a subset of gems (by index) against scan results. Builds shared indexes once
+/// and processes gems in parallel via rayon.
+pub fn match_gem_subset(
+    gems: &[GemEntry],
+    indices: &[usize],
+    scan_results: &ScanResults,
+) -> HashMap<String, GemResult> {
+    let indexes = MatchIndexes::build(scan_results);
+
+    indices
+        .par_iter()
+        .map(|&i| {
+            let gem_entry = &gems[i];
+            (gem_entry.name.clone(), build_gem_result(gem_entry, &indexes))
+        })
+        .collect()
+}
+
+pub fn match_gem_usage(
+    gems: &[GemEntry],
+    scan_results: &ScanResults,
+) -> HashMap<String, GemResult> {
+    let all_indices: Vec<usize> = (0..gems.len()).collect();
+    match_gem_subset(gems, &all_indices, scan_results)
 }
 
 #[cfg(test)]
@@ -145,6 +172,7 @@ mod tests {
         GemEntry {
             name: name.to_string(),
             groups: vec!["default".to_string()],
+            platforms: Vec::new(),
             require_paths: require_paths.iter().map(|s| s.to_string()).collect(),
             module_names: module_names.iter().map(|s| s.to_string()).collect(),
             require_false: false,

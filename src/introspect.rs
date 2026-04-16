@@ -561,35 +561,67 @@ fn parse_gem_metadata_yaml(yaml: &str) -> Option<GemMetadata> {
     Some(meta)
 }
 
-/// Build a gem metadata index from vendor/cache/*.gem tarballs.
-/// Returns gem_name → GemMetadata with require_paths and executables.
-pub fn build_vendor_cache_index(project_dir: &Path) -> HashMap<String, GemMetadata> {
+/// Lightweight directory scan of `vendor/cache/*.gem`.
+/// Returns gem_name → PathBuf mapping, keeping the latest version per gem name.
+/// Does NOT open any tarballs — only inspects filenames.
+pub fn build_vendor_cache_path_index(project_dir: &Path) -> HashMap<String, PathBuf> {
     let cache_dir = project_dir.join("vendor").join("cache");
     if !cache_dir.is_dir() {
         return HashMap::new();
     }
-    let gem_files: Vec<PathBuf> = std::fs::read_dir(&cache_dir)
-        .into_iter()
-        .flatten()
-        .flatten()
-        .filter(|e| e.path().extension().is_some_and(|ext| ext == "gem"))
-        .map(|e| e.path())
-        .collect();
 
-    // Extract in parallel
+    let mut best: HashMap<String, (String, PathBuf)> = HashMap::new();
+    let entries = match std::fs::read_dir(&cache_dir) {
+        Ok(rd) => rd,
+        Err(_) => return HashMap::new(),
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().is_none_or(|ext| ext != "gem") {
+            continue;
+        }
+        let filename = match path.file_stem() {
+            Some(s) => s.to_string_lossy().to_string(),
+            None => continue,
+        };
+        let gem_name = match extract_gem_name_from_filename(&filename) {
+            Some(n) => n,
+            None => continue,
+        };
+        let version = extract_gem_version(&filename).unwrap_or_default();
+        match best.entry(gem_name) {
+            std::collections::hash_map::Entry::Vacant(e) => {
+                e.insert((version, path));
+            }
+            std::collections::hash_map::Entry::Occupied(mut e) => {
+                if compare_gem_versions(&version, &e.get().0) == std::cmp::Ordering::Greater {
+                    e.insert((version, path));
+                }
+            }
+        }
+    }
+    best.into_iter().map(|(name, (_, path))| (name, path)).collect()
+}
+
+/// Extract metadata (require_paths, executables) from a single `.gem` tarball.
+/// This is the expensive operation — opens the tar, decompresses metadata.gz, parses YAML.
+pub fn extract_vendor_gem_metadata(gem_path: &Path) -> Option<GemMetadata> {
+    extract_gem_metadata(gem_path)
+}
+
+/// Build a gem metadata index from vendor/cache/*.gem tarballs.
+/// Returns gem_name → GemMetadata with require_paths and executables.
+///
+/// Prefer `build_vendor_cache_path_index` + on-demand `extract_vendor_gem_metadata`
+/// for lazy evaluation — this eagerly extracts every gem.
+#[allow(dead_code)]
+pub fn build_vendor_cache_index(project_dir: &Path) -> HashMap<String, GemMetadata> {
+    let paths = build_vendor_cache_path_index(project_dir);
     use rayon::prelude::*;
-    let results: Vec<(String, GemMetadata)> = gem_files
-        .par_iter()
-        .filter_map(|path| {
-            let filename = path.file_stem()?.to_string_lossy().to_string();
-            // Parse gem_name from "gem_name-version" filename
-            let gem_name = extract_gem_name_from_filename(&filename)?;
-            let meta = extract_gem_metadata(path)?;
-            Some((gem_name, meta))
-        })
-        .collect();
-
-    results.into_iter().collect()
+    paths
+        .into_par_iter()
+        .filter_map(|(name, path)| extract_vendor_gem_metadata(&path).map(|m| (name, m)))
+        .collect()
 }
 
 /// Extract gem name from a "name-version" filename (e.g., "activesupport-8.1.1" → "activesupport").
@@ -1325,5 +1357,46 @@ mod tests {
             extract_gem_name_from_filename("rails-7.2.0.beta1"),
             Some("rails".to_string())
         );
+    }
+
+    // ── build_vendor_cache_path_index ──
+
+    #[test]
+    fn path_index_returns_correct_mapping() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache_dir = dir.path().join("vendor").join("cache");
+        std::fs::create_dir_all(&cache_dir).unwrap();
+
+        // Create empty .gem files — path index should not care about contents
+        std::fs::write(cache_dir.join("rails-7.1.3.gem"), b"").unwrap();
+        std::fs::write(cache_dir.join("nokogiri-1.16.0-x86_64-linux.gem"), b"").unwrap();
+        std::fs::write(cache_dir.join("aws-sdk-s3-1.143.0.gem"), b"").unwrap();
+        // Non-gem file should be ignored
+        std::fs::write(cache_dir.join("README.txt"), b"").unwrap();
+
+        let index = build_vendor_cache_path_index(dir.path());
+        assert_eq!(index.len(), 3);
+        assert_eq!(index["rails"], cache_dir.join("rails-7.1.3.gem"));
+        assert_eq!(
+            index["nokogiri"],
+            cache_dir.join("nokogiri-1.16.0-x86_64-linux.gem")
+        );
+        assert_eq!(index["aws-sdk-s3"], cache_dir.join("aws-sdk-s3-1.143.0.gem"));
+        assert!(!index.contains_key("README"));
+    }
+
+    #[test]
+    fn path_index_keeps_latest_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache_dir = dir.path().join("vendor").join("cache");
+        std::fs::create_dir_all(&cache_dir).unwrap();
+
+        std::fs::write(cache_dir.join("rails-6.1.0.gem"), b"").unwrap();
+        std::fs::write(cache_dir.join("rails-7.1.3.gem"), b"").unwrap();
+        std::fs::write(cache_dir.join("rails-7.0.8.gem"), b"").unwrap();
+
+        let index = build_vendor_cache_path_index(dir.path());
+        assert_eq!(index.len(), 1);
+        assert_eq!(index["rails"], cache_dir.join("rails-7.1.3.gem"));
     }
 }

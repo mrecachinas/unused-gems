@@ -38,6 +38,7 @@ pub fn parse_gemfile(dir: &Path) -> Vec<GemEntry> {
         let mut visitor = GemfileVisitor {
             gems: Vec::new(),
             current_groups: Vec::new(),
+            current_platforms: Vec::new(),
             source: &source,
             eval_gemfiles: Vec::new(),
             gemspec_paths: Vec::new(),
@@ -74,12 +75,14 @@ pub fn parse_gemfile(dir: &Path) -> Vec<GemEntry> {
         }
     }
 
+    gems = merge_duplicate_gems(gems);
     gems
 }
 
 struct GemfileVisitor<'s> {
     gems: Vec<GemEntry>,
     current_groups: Vec<String>,
+    current_platforms: Vec<String>,
     source: &'s [u8],
     eval_gemfiles: Vec<String>,
     gemspec_paths: Vec<String>,
@@ -106,6 +109,7 @@ impl<'s> GemfileVisitor<'s> {
         let mut require_false = false;
         let mut require_paths: Vec<String> = Vec::new();
         let mut groups: Vec<String> = self.current_groups.clone();
+        let mut platforms: Vec<String> = self.current_platforms.clone();
 
         // Check remaining args for keyword hash
         for arg in &arg_list[1..] {
@@ -141,6 +145,18 @@ impl<'s> GemfileVisitor<'s> {
                                     }
                                 }
                             }
+                            Some("platform") | Some("platforms") => {
+                                if let Some(sym) = extract_symbol_value(&assoc.value(), self.source)
+                                {
+                                    platforms.push(sym);
+                                } else if let Some(arr) = assoc.value().as_array_node() {
+                                    for el in arr.elements().iter() {
+                                        if let Some(s) = extract_symbol_value(&el, self.source) {
+                                            platforms.push(s);
+                                        }
+                                    }
+                                }
+                            }
                             _ => {}
                         }
                     }
@@ -155,6 +171,7 @@ impl<'s> GemfileVisitor<'s> {
         self.gems.push(GemEntry {
             name,
             groups,
+            platforms,
             require_paths: if require_false {
                 Vec::new()
             } else {
@@ -176,6 +193,18 @@ impl<'s> GemfileVisitor<'s> {
         }
         groups
     }
+
+    fn extract_platform_names(&self, node: &ruby_prism::CallNode<'_>) -> Vec<String> {
+        let mut platforms = Vec::new();
+        if let Some(args) = node.arguments() {
+            for arg in args.arguments().iter() {
+                if let Some(sym) = extract_symbol_value(&arg, self.source) {
+                    platforms.push(sym);
+                }
+            }
+        }
+        platforms
+    }
 }
 
 impl<'s> Visit<'_> for GemfileVisitor<'s> {
@@ -192,11 +221,29 @@ impl<'s> Visit<'_> for GemfileVisitor<'s> {
             ruby_prism::visit_call_node(self, node);
             self.current_groups.truncate(prev_len);
             return;
+        } else if (name_bytes == b"platforms" || name_bytes == b"platform") && node.receiver().is_none() {
+            let platforms = self.extract_platform_names(node);
+            let prev_len = self.current_platforms.len();
+            self.current_platforms.extend(platforms);
+            ruby_prism::visit_call_node(self, node);
+            self.current_platforms.truncate(prev_len);
+            return;
         } else if name_bytes == b"eval_gemfile" && node.receiver().is_none() {
             if let Some(args) = node.arguments() {
                 if let Some(first) = args.arguments().iter().next() {
                     if let Some(path) = extract_string_value(&first, self.source) {
                         self.eval_gemfiles.push(path);
+                    } else if let Some(call) = first.as_call_node() {
+                        // Support eval_gemfile File.expand_path("../shared/Gemfile", __FILE__)
+                        if call.name().as_slice() == b"expand_path" {
+                            if let Some(inner_args) = call.arguments() {
+                                if let Some(inner_first) = inner_args.arguments().iter().next() {
+                                    if let Some(path) = extract_string_value(&inner_first, self.source) {
+                                        self.eval_gemfiles.push(path);
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -229,6 +276,48 @@ impl<'s> Visit<'_> for GemfileVisitor<'s> {
 
         ruby_prism::visit_call_node(self, node);
     }
+}
+
+/// Merge duplicate gem entries by name, combining groups, platforms, require_paths,
+/// and require_false. Preserves the position of the first occurrence.
+fn merge_duplicate_gems(gems: Vec<GemEntry>) -> Vec<GemEntry> {
+    let mut seen: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut result: Vec<GemEntry> = Vec::new();
+
+    for gem in gems {
+        if let Some(&idx) = seen.get(&gem.name) {
+            let existing = &mut result[idx];
+            // groups: set union preserving order
+            for g in &gem.groups {
+                if !existing.groups.contains(g) {
+                    existing.groups.push(g.clone());
+                }
+            }
+            // platforms: empty on either side means "all platforms" → result should be empty
+            if existing.platforms.is_empty() || gem.platforms.is_empty() {
+                existing.platforms.clear();
+            } else {
+                for p in &gem.platforms {
+                    if !existing.platforms.contains(p) {
+                        existing.platforms.push(p.clone());
+                    }
+                }
+            }
+            // require_paths: union preserving order
+            for rp in &gem.require_paths {
+                if !existing.require_paths.contains(rp) {
+                    existing.require_paths.push(rp.clone());
+                }
+            }
+            // require_false: logical OR
+            existing.require_false = existing.require_false || gem.require_false;
+        } else {
+            seen.insert(gem.name.clone(), result.len());
+            result.push(gem);
+        }
+    }
+
+    result
 }
 
 /// Parse a .gemspec file for dependencies.
@@ -289,6 +378,7 @@ impl<'s> Visit<'_> for GemspecVisitor<'s> {
                     self.gems.push(GemEntry {
                         name: dep_name,
                         groups,
+                        platforms: Vec::new(),
                         require_paths: Vec::new(),
                         module_names: Vec::new(),
                         require_false: false,
@@ -609,5 +699,85 @@ end
         let gems = parse_gemfile(dir.path());
         assert!(gems.iter().any(|g| g.name == "devise"));
         assert!(gems.iter().any(|g| g.name == "factory_bot"));
+    }
+
+    #[test]
+    fn parses_platforms_key_single() {
+        let gems = parse_gems("gem 'x', platforms: :mingw\n");
+        let g = find_gem(&gems, "x");
+        assert_eq!(g.platforms, vec!["mingw"]);
+    }
+
+    #[test]
+    fn parses_platforms_key_array() {
+        let gems = parse_gems("gem 'x', platforms: [:mingw, :x64_mingw]\n");
+        let g = find_gem(&gems, "x");
+        assert_eq!(g.platforms, vec!["mingw", "x64_mingw"]);
+    }
+
+    #[test]
+    fn parses_platform_singular_key() {
+        let gems = parse_gems("gem 'x', platform: :jruby\n");
+        let g = find_gem(&gems, "x");
+        assert_eq!(g.platforms, vec!["jruby"]);
+    }
+
+    #[test]
+    fn parses_platforms_block() {
+        let gems = parse_gems("platforms :mingw do\n  gem 'x'\nend\n");
+        let g = find_gem(&gems, "x");
+        assert_eq!(g.platforms, vec!["mingw"]);
+    }
+
+    #[test]
+    fn merges_nested_platforms_and_groups() {
+        let gems = parse_gems("platforms :mingw do\n  group :development do\n    gem 'x'\n  end\nend\n");
+        let g = find_gem(&gems, "x");
+        assert_eq!(g.platforms, vec!["mingw"]);
+        assert!(g.groups.contains(&"development".to_string()));
+    }
+
+    #[test]
+    fn duplicate_gems_merge_groups() {
+        let gems = parse_gems("gem 'x', group: :dev\ngem 'x', group: :test\n");
+        assert_eq!(gems.iter().filter(|g| g.name == "x").count(), 1);
+        let g = find_gem(&gems, "x");
+        assert!(g.groups.contains(&"dev".to_string()));
+        assert!(g.groups.contains(&"test".to_string()));
+    }
+
+    #[test]
+    fn duplicate_gems_merge_platforms() {
+        let gems = parse_gems("gem 'x', platforms: :mingw\ngem 'x'\n");
+        assert_eq!(gems.iter().filter(|g| g.name == "x").count(), 1);
+        let g = find_gem(&gems, "x");
+        // No platforms on second line means "all platforms" → merged result is empty (all)
+        assert!(g.platforms.is_empty());
+    }
+
+    #[test]
+    fn duplicate_gems_require_false_union() {
+        let gems = parse_gems("gem 'x', require: false\ngem 'x', require: 'x/init'\n");
+        assert_eq!(gems.iter().filter(|g| g.name == "x").count(), 1);
+        let g = find_gem(&gems, "x");
+        assert!(g.require_false);
+        assert!(g.require_paths.contains(&"x/init".to_string()));
+    }
+
+    #[test]
+    fn eval_gemfile_file_expand_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let shared = dir.path().join("shared");
+        std::fs::create_dir_all(&shared).unwrap();
+        std::fs::write(
+            dir.path().join("Gemfile"),
+            "eval_gemfile File.expand_path(\"shared/Gemfile\", __FILE__)\ngem 'rails'\n",
+        )
+        .unwrap();
+        std::fs::write(shared.join("Gemfile"), "gem 'puma'\n").unwrap();
+        let gems = parse_gemfile(dir.path());
+        let names: Vec<&str> = gems.iter().map(|g| g.name.as_str()).collect();
+        assert!(names.contains(&"rails"));
+        assert!(names.contains(&"puma"));
     }
 }
