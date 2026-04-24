@@ -156,7 +156,7 @@ fn main() {
     let cache_for_scan = Arc::clone(&file_cache);
     let ignore_file_ref = cli.ignore_file.as_deref();
     let (
-        ((gem_index, vendor_path_index), (scan_results, cache_updates)),
+        ((gem_index, vendor_path_index), (mut scan_results, cache_updates)),
         (lock_deps, (db_adapters, (cable_adapters, (storage_adapters, (cache_config_adapters, ignore_config))))),
     ) = timed!(
         "concurrent_init",
@@ -222,8 +222,14 @@ fn main() {
         file_cache.put(rel_path, mtime, size, &reqs, mods, &bgroups, breq_all);
     }
 
+    // Synthesize active bundler groups when `Bundler.require(*Rails.groups)` (or equivalent)
+    // is detected. See `synthesize_bundler_groups` for rationale.
+    if scan_results.bundler_require_all {
+        synthesize_bundler_groups(&gems, &mut scan_results.bundler_groups);
+    }
+
     // 2b+3. Script scanning || resolve require paths (concurrent)
-    let vendor_memo: Mutex<HashMap<PathBuf, Option<introspect::GemMetadata>>> =
+    let vendor_memo: Mutex<HashMap<PathBuf, Option<Arc<introspect::GemMetadata>>>> =
         Mutex::new(HashMap::new());
     let (script_refs, _) = timed!(
         "scripts+resolve",
@@ -249,10 +255,23 @@ fn main() {
                         // Lazy vendor fallback: extract metadata on demand
                         if declared.len() <= 1 {
                             if let Some(path) = vendor_path_index.get(&gem.name) {
-                                let mut memo = vendor_memo.lock().unwrap();
-                                let meta = memo.entry(path.clone()).or_insert_with(|| {
-                                    introspect::extract_vendor_gem_metadata(path)
-                                });
+                                // Compute-outside-lock: check cache first; if miss, decompress
+                                // tarball outside the lock, then insert. Avoids serializing
+                                // every vendor extraction across all rayon workers.
+                                let cached = vendor_memo.lock().unwrap().get(path).cloned();
+                                let meta = match cached {
+                                    Some(m) => m,
+                                    None => {
+                                        let computed = introspect::extract_vendor_gem_metadata(path)
+                                            .map(Arc::new);
+                                        vendor_memo
+                                            .lock()
+                                            .unwrap()
+                                            .entry(path.clone())
+                                            .or_insert(computed)
+                                            .clone()
+                                    }
+                                };
                                 if let Some(ref meta) = meta {
                                     for rp in &meta.require_paths {
                                         if rp != "lib" && !declared.contains(rp) {
@@ -479,9 +498,14 @@ fn merge_script_refs(
                     .evidence
                     .push(types::Evidence::Script { file: f.clone() });
             }
-            result.files.extend(files.iter().cloned());
-            result.files.sort();
-            result.files.dedup();
+            // Dedup via HashSet then sort once — avoids quadratic per-iteration sort/dedup.
+            let mut set: HashSet<String> = std::mem::take(&mut result.files).into_iter().collect();
+            for f in files {
+                set.insert(f.clone());
+            }
+            let mut merged: Vec<String> = set.into_iter().collect();
+            merged.sort();
+            result.files = merged;
             if !result.files.is_empty() {
                 result.status = GemStatus::Used;
             }
@@ -669,23 +693,22 @@ fn resolve_require_paths(
         paths.push(gem.name.replace('-', "/"));
     }
     paths.push(gem.name.clone());
-    let first_segment = gem.name.split('-').next().unwrap_or(&gem.name);
-    if first_segment != gem.name {
-        paths.push(first_segment.to_string());
-    }
+    // NOTE: we deliberately do NOT add the bare first segment as a require path
+    // (e.g. "aws" for "aws-sdk-s3"). It almost never corresponds to a real require
+    // path and over-attributes usage to unrelated gems in the same family.
     paths.dedup();
     paths
 }
 
-/// Resolve module names for a gem: check installed gem first, then generate candidates.
+/// Resolve module names for a gem: union of discovered names (from installed gem)
+/// AND curated KNOWN_MODULE_NAMES AND PascalCase heuristics. Discovery alone can
+/// miss canonical module names (e.g. discover picks up a generic helper module
+/// instead of the gem's primary constant), so we always merge all sources.
 fn resolve_module_names(
     gem: &types::GemEntry,
     gem_index: &std::collections::HashMap<String, std::path::PathBuf>,
 ) -> Vec<String> {
     let discovered = introspect::discover_gem_module_names(&gem.name, gem_index);
-    if !discovered.is_empty() {
-        return discovered;
-    }
 
     // Static known module names for gems where PascalCase heuristic fails
     static KNOWN_MODULE_NAMES: once_cell::sync::Lazy<std::collections::HashMap<&str, &[&str]>> =
@@ -797,7 +820,12 @@ fn resolve_module_names(
 
     let mut names = Vec::new();
 
-    // Lookup known module names first
+    // Always include discovered names from the installed gem (if any).
+    for n in &discovered {
+        names.push(n.clone());
+    }
+
+    // Lookup known module names — merge with discovered (do not replace).
     if let Some(known) = KNOWN_MODULE_NAMES.get(gem.name.as_str()) {
         for n in *known {
             names.push(n.to_string());
@@ -821,9 +849,12 @@ fn resolve_module_names(
         let ns = segments.join("::");
         names.push(ns);
 
-        // Emit prefix variants: first 1 segment, first 2 segments, etc.
-        // e.g. "active_record-import" → "ActiveRecord", "ActiveRecord::Import"
-        for i in 1..segments.len() {
+        // Emit prefix variants starting from 2 segments (e.g. "Aws::Sdk").
+        // We deliberately skip the bare 1-segment prefix (e.g. "Aws" alone) because
+        // it over-attributes: code referencing `Aws::S3::Client` should NOT mark
+        // unrelated `aws-sdk-cloudwatch` as Used. The curated KNOWN_MODULE_NAMES
+        // table provides the precise mappings (e.g. aws-sdk-core → "Aws").
+        for i in 2..segments.len() {
             let prefix = segments[..i].join("::");
             names.push(prefix);
         }
@@ -841,12 +872,28 @@ fn capitalize(s: &str) -> String {
     }
 }
 
-/// Scan config/database.yml for adapter: values and map them to gem names.
+/// Read a YAML config file, falling back to its `.yml.erb` variant if the plain
+/// `.yml` is absent. Many Rails apps template their config files with ERB; the
+/// scanners below only match static `key: value` lines, which work fine on raw
+/// `.yml.erb` source.
+fn read_yaml_or_erb(yml_path: &std::path::Path) -> Option<String> {
+    if let Ok(c) = std::fs::read_to_string(yml_path) {
+        return Some(c);
+    }
+    let erb_path = {
+        let mut s = yml_path.as_os_str().to_owned();
+        s.push(".erb");
+        std::path::PathBuf::from(s)
+    };
+    std::fs::read_to_string(&erb_path).ok()
+}
+
+/// Scan config/database.yml (or .yml.erb) for adapter: values and map them to gem names.
 fn scan_database_adapters(dir: &std::path::Path) -> std::collections::HashMap<String, String> {
     let db_yml = dir.join("config").join("database.yml");
-    let content = match std::fs::read_to_string(&db_yml) {
-        Ok(c) => c,
-        Err(_) => return std::collections::HashMap::new(),
+    let content = match read_yaml_or_erb(&db_yml) {
+        Some(c) => c,
+        None => return std::collections::HashMap::new(),
     };
 
     static ADAPTER_RE: once_cell::sync::Lazy<regex::Regex> =
@@ -871,12 +918,12 @@ fn scan_database_adapters(dir: &std::path::Path) -> std::collections::HashMap<St
     adapters
 }
 
-/// Scan config/cable.yml for adapter: values and map them to gem names.
+/// Scan config/cable.yml (or .yml.erb) for adapter: values and map them to gem names.
 fn scan_cable_adapters(dir: &std::path::Path) -> std::collections::HashMap<String, String> {
     let cable_yml = dir.join("config").join("cable.yml");
-    let content = match std::fs::read_to_string(&cable_yml) {
-        Ok(c) => c,
-        Err(_) => return std::collections::HashMap::new(),
+    let content = match read_yaml_or_erb(&cable_yml) {
+        Some(c) => c,
+        None => return std::collections::HashMap::new(),
     };
 
     static ADAPTER_RE: once_cell::sync::Lazy<regex::Regex> =
@@ -897,12 +944,12 @@ fn scan_cable_adapters(dir: &std::path::Path) -> std::collections::HashMap<Strin
     adapters
 }
 
-/// Scan config/storage.yml for service: values and map them to gem names.
+/// Scan config/storage.yml (or .yml.erb) for service: values and map them to gem names.
 fn scan_storage_adapters(dir: &std::path::Path) -> std::collections::HashMap<String, String> {
     let storage_yml = dir.join("config").join("storage.yml");
-    let content = match std::fs::read_to_string(&storage_yml) {
-        Ok(c) => c,
-        Err(_) => return std::collections::HashMap::new(),
+    let content = match read_yaml_or_erb(&storage_yml) {
+        Some(c) => c,
+        None => return std::collections::HashMap::new(),
     };
 
     static SERVICE_RE: once_cell::sync::Lazy<regex::Regex> =
@@ -966,30 +1013,205 @@ fn scan_cache_config(dir: &std::path::Path) -> std::collections::HashMap<String,
     adapters
 }
 
-/// Return the set of Ruby platform names that match the current host.
-fn current_platform_set() -> std::collections::HashSet<&'static str> {
-    let mut platforms = std::collections::HashSet::new();
-    platforms.insert("ruby");
-    platforms.insert("mri");
-    for v in 24..=34 {
-        platforms.insert(match v {
-            24 => "mri_24",
-            25 => "mri_25",
-            26 => "mri_26",
-            27 => "mri_27",
-            28 => "mri_28",
-            29 => "mri_29",
-            30 => "mri_30",
-            31 => "mri_31",
-            32 => "mri_32",
-            33 => "mri_33",
-            34 => "mri_34",
-            _ => unreachable!(),
-        });
+/// Set of Ruby platform names that match the current host. Built once at first
+/// use and reused — the contents are static for the lifetime of the process.
+static CURRENT_PLATFORM_SET: once_cell::sync::Lazy<std::collections::HashSet<&'static str>> =
+    once_cell::sync::Lazy::new(|| {
+        let mut platforms = std::collections::HashSet::new();
+        platforms.insert("ruby");
+        platforms.insert("mri");
+        for v in &[
+            "mri_24", "mri_25", "mri_26", "mri_27", "mri_28", "mri_29", "mri_30", "mri_31",
+            "mri_32", "mri_33", "mri_34",
+        ] {
+            platforms.insert(*v);
+        }
+        #[cfg(target_os = "macos")]
+        platforms.insert("darwin");
+        #[cfg(target_os = "linux")]
+        platforms.insert("linux");
+        platforms
+    });
+
+fn current_platform_set() -> &'static std::collections::HashSet<&'static str> {
+    &CURRENT_PLATFORM_SET
+}
+
+/// Populate `target` with every distinct group declared across `gems`, plus
+/// "default". This represents the safe upper bound for `Bundler.require(*Rails.groups)`,
+/// where Bundler auto-requires every gem in every group active for the current env.
+fn synthesize_bundler_groups(gems: &[types::GemEntry], target: &mut HashSet<String>) {
+    for gem in gems {
+        for g in &gem.groups {
+            target.insert(g.clone());
+        }
     }
-    #[cfg(target_os = "macos")]
-    platforms.insert("darwin");
-    #[cfg(target_os = "linux")]
-    platforms.insert("linux");
-    platforms
+    target.insert("default".to_string());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    fn gem(name: &str, groups: &[&str]) -> types::GemEntry {
+        types::GemEntry {
+            name: name.to_string(),
+            groups: groups.iter().map(|s| s.to_string()).collect(),
+            platforms: vec![],
+            require_paths: vec![],
+            module_names: vec![],
+            require_false: false,
+        }
+    }
+
+    #[test]
+    fn synthesize_bundler_groups_adds_all_declared_groups() {
+        let gems = vec![
+            gem("rails", &[]),
+            gem("rspec-rails", &["test"]),
+            gem("pry", &["development", "test"]),
+            gem("newrelic", &["production", "staging"]),
+        ];
+        let mut groups = HashSet::new();
+        synthesize_bundler_groups(&gems, &mut groups);
+        assert!(groups.contains("default"));
+        assert!(groups.contains("development"));
+        assert!(groups.contains("test"));
+        assert!(groups.contains("production"));
+        assert!(groups.contains("staging"));
+    }
+
+    #[test]
+    fn synthesize_bundler_groups_always_includes_default() {
+        let gems = vec![gem("rails", &[])];
+        let mut groups = HashSet::new();
+        synthesize_bundler_groups(&gems, &mut groups);
+        assert!(groups.contains("default"));
+        assert_eq!(groups.len(), 1);
+    }
+
+    #[test]
+    fn synthesize_bundler_groups_dedups() {
+        let gems = vec![
+            gem("a", &["test"]),
+            gem("b", &["test"]),
+            gem("c", &["test", "development"]),
+        ];
+        let mut groups = HashSet::new();
+        synthesize_bundler_groups(&gems, &mut groups);
+        assert_eq!(groups.len(), 3); // test + development + default
+    }
+
+    #[test]
+    fn resolve_require_paths_drops_bare_first_segment_for_hyphenated() {
+        // aws-sdk-s3: must NOT include bare "aws" as a require path
+        let g = gem("some-unknown-vendor-pkg", &[]);
+        let idx = std::collections::HashMap::new();
+        let paths = resolve_require_paths(&g, &idx);
+        assert!(
+            !paths.iter().any(|p| p == "some"),
+            "bare first segment 'some' should not be emitted; got {:?}",
+            paths
+        );
+        // Should still emit the full slashed form and the original name
+        assert!(paths.iter().any(|p| p == "some/unknown/vendor/pkg"));
+        assert!(paths.iter().any(|p| p == "some-unknown-vendor-pkg"));
+    }
+
+    #[test]
+    fn resolve_module_names_drops_bare_one_segment_prefix_for_hyphenated() {
+        // For an unknown gem like "some-unknown-vendor-pkg", we should NOT emit
+        // the bare 1-segment prefix "Some" alone; it over-attributes.
+        let g = gem("some-unknown-vendor-pkg", &[]);
+        let idx = std::collections::HashMap::new();
+        let names = resolve_module_names(&g, &idx);
+        assert!(
+            !names.iter().any(|n| n == "Some"),
+            "bare 1-segment prefix 'Some' should not be emitted; got {:?}",
+            names
+        );
+        // 2-segment prefix should still appear
+        assert!(names.iter().any(|n| n == "Some::Unknown"));
+        // Full namespace and full pascal should still appear
+        assert!(names.iter().any(|n| n == "Some::Unknown::Vendor::Pkg"));
+    }
+
+    #[test]
+    fn resolve_module_names_unions_known_with_pascal_heuristic() {
+        // A gem present in KNOWN_MODULE_NAMES (e.g. "graphql" → "GraphQL") should
+        // emit BOTH the curated name AND the heuristic PascalCase form.
+        let g = gem("graphql", &[]);
+        let idx = std::collections::HashMap::new();
+        let names = resolve_module_names(&g, &idx);
+        assert!(names.iter().any(|n| n == "GraphQL"));
+        assert!(names.iter().any(|n| n == "Graphql"));
+    }
+
+    #[test]
+    fn scan_database_adapters_reads_yml_erb_when_yml_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = tmp.path().join("config");
+        std::fs::create_dir_all(&cfg).unwrap();
+        let mut f = std::fs::File::create(cfg.join("database.yml.erb")).unwrap();
+        writeln!(f, "default: &default").unwrap();
+        writeln!(f, "  adapter: postgresql").unwrap();
+        writeln!(f, "  host: <%= ENV['DB_HOST'] %>").unwrap();
+        drop(f);
+
+        let adapters = scan_database_adapters(tmp.path());
+        assert_eq!(adapters.get("pg").map(|s| s.as_str()), Some("postgresql"));
+    }
+
+    #[test]
+    fn scan_cable_adapters_reads_yml_erb() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = tmp.path().join("config");
+        std::fs::create_dir_all(&cfg).unwrap();
+        std::fs::write(
+            cfg.join("cable.yml.erb"),
+            "production:\n  adapter: redis\n  url: <%= ENV['REDIS_URL'] %>\n",
+        )
+        .unwrap();
+
+        let adapters = scan_cable_adapters(tmp.path());
+        assert_eq!(adapters.get("redis").map(|s| s.as_str()), Some("redis"));
+    }
+
+    #[test]
+    fn scan_storage_adapters_reads_yml_erb() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = tmp.path().join("config");
+        std::fs::create_dir_all(&cfg).unwrap();
+        std::fs::write(
+            cfg.join("storage.yml.erb"),
+            "amazon:\n  service: S3\n  bucket: <%= ENV['BUCKET'] %>\n",
+        )
+        .unwrap();
+
+        let adapters = scan_storage_adapters(tmp.path());
+        assert_eq!(adapters.get("aws-sdk-s3").map(|s| s.as_str()), Some("S3"));
+    }
+
+    #[test]
+    fn scan_database_adapters_prefers_yml_over_yml_erb() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = tmp.path().join("config");
+        std::fs::create_dir_all(&cfg).unwrap();
+        std::fs::write(cfg.join("database.yml"), "default:\n  adapter: mysql2\n").unwrap();
+        std::fs::write(cfg.join("database.yml.erb"), "default:\n  adapter: postgresql\n").unwrap();
+
+        let adapters = scan_database_adapters(tmp.path());
+        // .yml takes precedence
+        assert_eq!(adapters.get("mysql2").map(|s| s.as_str()), Some("mysql2"));
+        assert!(!adapters.contains_key("pg"));
+    }
+
+    #[test]
+    fn current_platform_set_includes_ruby_and_mri() {
+        let p = current_platform_set();
+        assert!(p.contains("ruby"));
+        assert!(p.contains("mri"));
+        assert!(p.contains("mri_31"));
+    }
 }

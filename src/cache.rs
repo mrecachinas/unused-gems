@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Mutex;
 use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
@@ -31,8 +32,10 @@ struct CacheFileRef<'a> {
 }
 
 pub struct FileCache {
-    entries: HashMap<String, CacheEntry>,
-    dirty: bool,
+    /// Wrapped in Mutex so we can `take()` (consume) entries on cache hit
+    /// without cloning. Lock is held only briefly per file.
+    entries: Mutex<HashMap<String, CacheEntry>>,
+    dirty: std::sync::atomic::AtomicBool,
     cache_path: std::path::PathBuf,
 }
 
@@ -53,32 +56,69 @@ impl FileCache {
             HashMap::new()
         };
         FileCache {
-            entries,
-            dirty: false,
+            entries: Mutex::new(entries),
+            dirty: std::sync::atomic::AtomicBool::new(false),
             cache_path,
         }
     }
 
     pub fn disabled() -> Self {
         FileCache {
-            entries: HashMap::new(),
-            dirty: false,
+            entries: Mutex::new(HashMap::new()),
+            dirty: std::sync::atomic::AtomicBool::new(false),
             cache_path: std::path::PathBuf::new(),
         }
     }
 
-    /// Check cache for a file. Returns a borrowed CacheEntry on hit.
-    pub fn get(&self, rel_path: &str, mtime: SystemTime, size: u64) -> Option<&CacheEntry> {
-        let entry = self.entries.get(rel_path)?;
+    /// Check cache for a file. Returns a borrowed CacheEntry clone on hit.
+    /// Kept for tests / external readers; scanner uses `take()` to avoid clones.
+    #[allow(dead_code)]
+    pub fn get(&self, rel_path: &str, mtime: SystemTime, size: u64) -> Option<CacheEntry> {
+        let entries = self.entries.lock().unwrap();
+        let entry = entries.get(rel_path)?;
         let duration = mtime.duration_since(SystemTime::UNIX_EPOCH).ok()?;
         let mtime_secs = duration.as_secs();
         let mtime_nanos = duration.subsec_nanos();
         if entry.mtime_secs == mtime_secs && entry.mtime_nanos == mtime_nanos && entry.size == size
         {
-            Some(entry)
+            Some(CacheEntry {
+                mtime_secs: entry.mtime_secs,
+                mtime_nanos: entry.mtime_nanos,
+                size: entry.size,
+                requires: entry.requires.clone(),
+                modules: entry.modules.clone(),
+                bundler_groups: entry.bundler_groups.clone(),
+                bundler_require_all: entry.bundler_require_all,
+            })
         } else {
             None
         }
+    }
+
+    /// Consume the cache entry on hit (removes from internal map, returns owned CacheEntry).
+    /// This avoids cloning the inner Vec<String>s on the hot path.
+    /// If validation fails, the entry is left in place.
+    pub fn take(&self, rel_path: &str, mtime: SystemTime, size: u64) -> Option<CacheEntry> {
+        let mut entries = self.entries.lock().unwrap();
+        // Validate before removing
+        let entry = entries.get(rel_path)?;
+        let duration = mtime.duration_since(SystemTime::UNIX_EPOCH).ok()?;
+        let mtime_secs = duration.as_secs();
+        let mtime_nanos = duration.subsec_nanos();
+        if entry.mtime_secs != mtime_secs
+            || entry.mtime_nanos != mtime_nanos
+            || entry.size != size
+        {
+            return None;
+        }
+        entries.remove(rel_path)
+    }
+
+    /// Re-insert a previously `take()`n entry back into the cache without marking
+    /// it dirty. Used by the scanner cache-hit path to preserve durability while
+    /// avoiding spurious cache_buf round-trips.
+    pub(crate) fn reinsert(&self, rel_path: String, entry: CacheEntry) {
+        self.entries.lock().unwrap().insert(rel_path, entry);
     }
 
     /// Insert/update a cache entry.
@@ -98,7 +138,7 @@ impl FileCache {
             .unwrap_or_default();
         let mtime_secs = duration.as_secs();
         let mtime_nanos = duration.subsec_nanos();
-        self.entries.insert(
+        self.entries.lock().unwrap().insert(
             rel_path,
             CacheEntry {
                 mtime_secs,
@@ -110,17 +150,20 @@ impl FileCache {
                 bundler_require_all,
             },
         );
-        self.dirty = true;
+        self.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Write cache to disk if modified.
     pub fn save(&self) {
-        if !self.dirty || self.cache_path.as_os_str().is_empty() {
+        if !self.dirty.load(std::sync::atomic::Ordering::Relaxed)
+            || self.cache_path.as_os_str().is_empty()
+        {
             return;
         }
+        let entries = self.entries.lock().unwrap();
         let cf = CacheFileRef {
             version: CACHE_VERSION,
-            entries: &self.entries,
+            entries: &entries,
         };
         if let Ok(data) = bincode::serialize(&cf) {
             let _ = std::fs::write(&self.cache_path, data);

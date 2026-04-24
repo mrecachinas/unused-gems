@@ -4,22 +4,28 @@ use std::sync::{Arc, Mutex};
 
 use memchr::memmem;
 use once_cell::sync::Lazy;
+use regex::bytes::Regex as BytesRegex;
 use regex::Regex;
 
 use crate::types::{FileResult, ScanResults};
 
-// YAML-specific regexes (rarely hit, not worth hand-rolling)
-static RUBOCOP_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?m)^\s*-\s*(rubocop[\w-]*)").unwrap());
-static YAML_REQUIRE_BLOCK_RE: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"(?:require|plugins):\s*\n((?:\s*-\s*.+\n)*)").unwrap());
-static YAML_ITEM_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?m)^\s*-\s*(.+)").unwrap());
-static INHERIT_GEM_RE: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"inherit_gem:\s*\n((?:\s+\S+:\s*\n(?:\s+-.+\n)*)*)").unwrap());
-static INHERIT_GEM_KEY_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?m)^\s+([\w-]+):").unwrap());
+// YAML-specific regexes (rarely hit, not worth hand-rolling).
+// Use bytes-mode regex to avoid String::from_utf8_lossy allocations.
+static RUBOCOP_RE: Lazy<BytesRegex> =
+    Lazy::new(|| BytesRegex::new(r"(?m)^\s*-\s*(rubocop[\w-]*)").unwrap());
+static YAML_REQUIRE_BLOCK_RE: Lazy<BytesRegex> =
+    Lazy::new(|| BytesRegex::new(r"(?:require|plugins):\s*\n((?:\s*-\s*.+\n)*)").unwrap());
+static YAML_ITEM_RE: Lazy<BytesRegex> =
+    Lazy::new(|| BytesRegex::new(r"(?m)^\s*-\s*(.+)").unwrap());
+static INHERIT_GEM_RE: Lazy<BytesRegex> =
+    Lazy::new(|| BytesRegex::new(r"inherit_gem:\s*\n((?:\s+\S+:\s*\n(?:\s+-.+\n)*)*)").unwrap());
+static INHERIT_GEM_KEY_RE: Lazy<BytesRegex> =
+    Lazy::new(|| BytesRegex::new(r"(?m)^\s+([\w-]+):").unwrap());
 
 // Precompiled byte finders (avoid re-building per call)
 static NEWLINE_BEGIN_FINDER: Lazy<memmem::Finder<'static>> =
     Lazy::new(|| memmem::Finder::new(b"\n=begin"));
+static BEGIN_FINDER: Lazy<memmem::Finder<'static>> = Lazy::new(|| memmem::Finder::new(b"=begin"));
 static HEREDOC_FINDER: Lazy<memmem::Finder<'static>> =
     Lazy::new(|| memmem::Finder::new(b"<<"));
 static REQUIRE_FINDER: Lazy<memmem::Finder<'static>> =
@@ -30,6 +36,19 @@ static GEM_DOT_FINDER: Lazy<memmem::Finder<'static>> =
     Lazy::new(|| memmem::Finder::new(b"Gem."));
 static BUNDLER_REQUIRE_FINDER: Lazy<memmem::Finder<'static>> =
     Lazy::new(|| memmem::Finder::new(b"Bundler.require"));
+
+/// What style of single-line comment marker the file uses.
+/// Drives `build_skip_mask` so that Slim/Haml comment lines are skipped
+/// even though they don't start with `#`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum LineCommentKind {
+    /// `#` — Ruby, YAML, ERB, shell, generic. Also tracks inline `#` comments.
+    Hash,
+    /// `/` — Slim line comments.
+    Slash,
+    /// `-#` — Haml line comments.
+    DashHash,
+}
 
 #[cfg(test)]
 const SCANNABLE_EXTENSIONS: &[&str] = &[
@@ -89,6 +108,7 @@ fn skip_whitespace(bytes: &[u8], mut i: usize) -> usize {
 /// OR if `pos` appears after an inline `#` comment on the same line.
 /// Uses SIMD-accelerated memrchr to find line start.
 #[inline]
+#[allow(dead_code)]
 fn is_line_comment(bytes: &[u8], pos: usize) -> bool {
     // SIMD-accelerated backward scan for newline
     let line_start = if pos == 0 {
@@ -113,6 +133,7 @@ fn is_line_comment(bytes: &[u8], pos: usize) -> bool {
 
 /// Check if there is an unquoted `#` between `from` and `pos` on the same line.
 /// Uses a simple state machine to track single/double quoted strings.
+#[allow(dead_code)]
 #[inline]
 fn has_inline_comment_before(bytes: &[u8], from: usize, pos: usize) -> bool {
     let mut i = from;
@@ -145,7 +166,7 @@ fn has_inline_comment_before(bytes: &[u8], from: usize, pos: usize) -> bool {
 /// Returns sorted Vec of (start, end) byte offsets.
 fn build_block_comment_ranges(bytes: &[u8]) -> Vec<(usize, usize)> {
     // Short-circuit: if neither =begin nor << appear, no block ranges possible
-    if memmem::find(bytes, b"=begin").is_none() && memmem::find(bytes, b"<<").is_none() {
+    if BEGIN_FINDER.find(bytes).is_none() && memmem::find(bytes, b"<<").is_none() {
         return Vec::new();
     }
 
@@ -199,6 +220,23 @@ fn build_block_comment_ranges(bytes: &[u8]) -> Vec<(usize, usize)> {
     pos = 0;
     while let Some(idx) = HEREDOC_FINDER.find(&bytes[pos..]) {
         let abs = pos + idx;
+        // Fix #6: For `<<IDENT` to start a heredoc, the byte preceding `<<`
+        // must NOT be an identifier/word char. This prevents `arr<<MY_CONST`
+        // (shovel operator) from being treated as a heredoc start.
+        if abs > 0 {
+            let prev = bytes[abs - 1];
+            // Allowed leading contexts: whitespace, =, (, comma, [, {, ;, BOF.
+            // Anything else (word char, digit, ', ", ), ], etc.) means it's a
+            // shovel operator or expression continuation, not a heredoc.
+            let ok = matches!(
+                prev,
+                b' ' | b'\t' | b'\n' | b'\r' | b'=' | b'(' | b',' | b'[' | b'{' | b';'
+            );
+            if !ok {
+                pos = abs + 2;
+                continue;
+            }
+        }
         let mut i = abs + 2;
         // Optional ~ or -
         if i < bytes.len() && (bytes[i] == b'~' || bytes[i] == b'-') {
@@ -288,14 +326,135 @@ fn build_block_comment_ranges(bytes: &[u8]) -> Vec<(usize, usize)> {
 
 /// Check if position `pos` falls within a block comment range.
 #[inline]
+#[allow(dead_code)]
 fn is_in_block_comment(pos: usize, ranges: &[(usize, usize)]) -> bool {
     ranges.iter().any(|&(start, end)| pos >= start && pos < end)
 }
 
 /// Combined check: is this position in a # comment line OR a =begin/=end block?
 #[inline]
+#[allow(dead_code)]
 fn is_commented(bytes: &[u8], pos: usize, block_ranges: &[(usize, usize)]) -> bool {
     is_line_comment(bytes, pos) || is_in_block_comment(pos, block_ranges)
+}
+
+/// Build a unified per-byte "skip mask" in a single linear pass.
+///
+/// `mask[i] == true` means position `i` should be ignored by all token-level
+/// scanners. The mask covers:
+///   - `#` line comments (whole line, leading-whitespace aware)
+///   - inline `#` comments after non-string code (Hash kind only)
+///   - `=begin` / `=end` block comments (Ruby only)
+///   - heredoc bodies (Ruby only)
+///   - interiors of single- and double-quoted string literals (so a `require`
+///     keyword that lives inside a string is not detected as a real require).
+///
+/// `line_kind` controls which marker starts a line comment:
+///   - `Hash`     → `#`  (also enables inline `#` comment detection)
+///   - `Slash`    → `/`  (Slim)
+///   - `DashHash` → `-#` (Haml)
+///
+/// String literal interiors are masked regardless of `line_kind` so that fix
+/// #3 (`raise "Please require 'oauth2'"` not detected as a require) holds for
+/// both Ruby and the templating dialects.
+fn build_skip_mask(bytes: &[u8], is_ruby: bool, line_kind: LineCommentKind) -> Vec<bool> {
+    let mut mask = vec![false; bytes.len()];
+
+    // Pass 1: heredoc + =begin/=end ranges (Ruby only).
+    if is_ruby {
+        let ranges = build_block_comment_ranges(bytes);
+        for (s, e) in ranges {
+            let e = e.min(bytes.len());
+            for b in mask.iter_mut().take(e).skip(s) {
+                *b = true;
+            }
+        }
+    }
+
+    // Pass 2: line-by-line walk for line comments, inline comments, strings.
+    let len = bytes.len();
+    let mut i = 0;
+    while i < len {
+        let line_start = i;
+        // Find end of line.
+        let mut eol = i;
+        while eol < len && bytes[eol] != b'\n' {
+            eol += 1;
+        }
+
+        // Find first non-whitespace position on the line.
+        let mut ws = line_start;
+        while ws < eol && (bytes[ws] == b' ' || bytes[ws] == b'\t') {
+            ws += 1;
+        }
+
+        // Whole-line comment detection based on line_kind.
+        let line_is_comment = match line_kind {
+            LineCommentKind::Hash => ws < eol && bytes[ws] == b'#',
+            LineCommentKind::Slash => ws < eol && bytes[ws] == b'/',
+            LineCommentKind::DashHash => {
+                ws + 1 < eol && bytes[ws] == b'-' && bytes[ws + 1] == b'#'
+            }
+        };
+
+        if line_is_comment {
+            for b in mask.iter_mut().take(eol).skip(ws) {
+                *b = true;
+            }
+        } else {
+            // Walk for string state and (for Hash kind) inline `#` comments.
+            // Skip positions already masked by heredoc/=begin pass.
+            let mut j = line_start;
+            while j < eol {
+                if mask[j] {
+                    j += 1;
+                    continue;
+                }
+                let b = bytes[j];
+                if b == b'\'' || b == b'"' {
+                    let quote = b;
+                    let str_content_start = j + 1;
+                    let mut k = str_content_start;
+                    while k < eol {
+                        if bytes[k] == b'\\' && k + 1 < eol {
+                            k += 2;
+                            continue;
+                        }
+                        if bytes[k] == quote {
+                            break;
+                        }
+                        k += 1;
+                    }
+                    // Mask string interior (NOT the surrounding quotes — extract_quoted
+                    // and similar consumers expect the quote chars to remain visible).
+                    let str_end = k.min(eol);
+                    for b in mask.iter_mut().take(str_end).skip(str_content_start) {
+                        *b = true;
+                    }
+                    j = if k < eol { k + 1 } else { eol };
+                    continue;
+                }
+                // Inline `#` only counts as a comment for Hash kind.
+                if matches!(line_kind, LineCommentKind::Hash) && b == b'#' {
+                    for b in mask.iter_mut().take(eol).skip(j) {
+                        *b = true;
+                    }
+                    break;
+                }
+                j += 1;
+            }
+        }
+
+        i = if eol < len { eol + 1 } else { eol };
+    }
+
+    mask
+}
+
+/// O(1) replacement for `is_commented` using a precomputed mask.
+#[inline]
+fn is_skipped(mask: &[bool], pos: usize) -> bool {
+    mask.get(pos).copied().unwrap_or(false)
 }
 
 /// Extract a quoted string starting at position `i` (which should point at the quote char).
@@ -580,24 +739,19 @@ fn scan_bundler_require(
     }
 }
 
-/// Filtered wrappers that skip matches on commented lines (Ruby files).
-/// For non-Ruby files, these just call the original scanners directly.
+/// Filtered wrappers that skip matches in commented/string/heredoc regions
+/// using a precomputed `mask`. For non-Ruby files the caller still passes a
+/// mask built with appropriate `LineCommentKind` so YAML `#` comments etc.
+/// continue to be filtered.
 fn scan_requires_filtered(
     bytes: &[u8],
-    is_ruby: bool,
-    block_ranges: &[(usize, usize)],
+    mask: &[bool],
     results: &mut Vec<String>,
 ) {
-    // For non-Ruby files, still filter # line comments (YAML, shell, etc. use # comments)
     let mut pos = 0;
     while let Some(idx) = REQUIRE_FINDER.find(&bytes[pos..]) {
         let abs = pos + idx;
-        if is_ruby {
-            if is_commented(bytes, abs, block_ranges) {
-                pos = abs + 1;
-                continue;
-            }
-        } else if is_line_comment(bytes, abs) {
+        if is_skipped(mask, abs) {
             pos = abs + 1;
             continue;
         }
@@ -629,19 +783,13 @@ fn scan_requires_filtered(
 
 fn scan_autoloads_filtered(
     bytes: &[u8],
-    is_ruby: bool,
-    block_ranges: &[(usize, usize)],
+    mask: &[bool],
     results: &mut Vec<String>,
 ) {
     let mut pos = 0;
     while let Some(idx) = AUTOLOAD_FINDER.find(&bytes[pos..]) {
         let abs = pos + idx;
-        if is_ruby {
-            if is_commented(bytes, abs, block_ranges) {
-                pos = abs + 1;
-                continue;
-            }
-        } else if is_line_comment(bytes, abs) {
+        if is_skipped(mask, abs) {
             pos = abs + 1;
             continue;
         }
@@ -690,19 +838,13 @@ fn scan_autoloads_filtered(
 
 fn scan_gem_bin_filtered(
     bytes: &[u8],
-    is_ruby: bool,
-    block_ranges: &[(usize, usize)],
+    mask: &[bool],
     results: &mut Vec<String>,
 ) {
     let mut pos = 0;
     while let Some(idx) = GEM_DOT_FINDER.find(&bytes[pos..]) {
         let abs = pos + idx;
-        if is_ruby {
-            if is_commented(bytes, abs, block_ranges) {
-                pos = abs + 1;
-                continue;
-            }
-        } else if is_line_comment(bytes, abs) {
+        if is_skipped(mask, abs) {
             pos = abs + 1;
             continue;
         }
@@ -733,10 +875,9 @@ fn scan_gem_bin_filtered(
 
 fn scan_modules_filtered_into(
     bytes: &[u8],
-    is_ruby: bool,
-    block_ranges: &[(usize, usize)],
-    modules: &mut HashMap<String, HashSet<String>>,
-    rel_path: &str,
+    mask: &[bool],
+    modules: &mut HashMap<String, HashSet<Arc<str>>>,
+    rel_path: &Arc<str>,
 ) {
     let mut i = 0;
     let len = bytes.len();
@@ -749,17 +890,9 @@ fn scan_modules_filtered_into(
             break;
         }
         if i == 0 || !is_word_char(bytes[i - 1]) {
-            if is_ruby {
-                if is_commented(bytes, i, block_ranges) {
-                    while i < bytes.len() && bytes[i] != b'\n' {
-                        i += 1;
-                    }
-                    continue;
-                }
-            } else if is_line_comment(bytes, i) {
-                while i < bytes.len() && bytes[i] != b'\n' {
-                    i += 1;
-                }
+            if is_skipped(mask, i) {
+                // Skip rest of masked region (just advance by 1 — mask is per-byte)
+                i += 1;
                 continue;
             }
             let start = i;
@@ -805,13 +938,13 @@ fn scan_modules_filtered_into(
             }
             if match_end > start {
                 let slice = &bytes[start..match_end];
-                // Only allocate if this is a new module name (HashMap deduplicates)
-                if let Some(files) = modules.get_mut(std::str::from_utf8(slice).unwrap_or("")) {
-                    files.insert(rel_path.to_string());
-                } else if let Ok(name) = std::str::from_utf8(slice) {
-                    let mut files = HashSet::new();
-                    files.insert(rel_path.to_string());
-                    modules.insert(name.to_string(), files);
+                if let Ok(name) = std::str::from_utf8(slice) {
+                    // Use entry().or_default() to avoid double lookup;
+                    // rel_path is an Arc<str> so the clone is a refcount bump.
+                    modules
+                        .entry(name.to_string())
+                        .or_default()
+                        .insert(Arc::clone(rel_path));
                 }
             }
             if i <= match_end {
@@ -826,8 +959,7 @@ fn scan_modules_filtered_into(
 
 fn scan_bundler_require_filtered(
     bytes: &[u8],
-    is_ruby: bool,
-    block_ranges: &[(usize, usize)],
+    mask: &[bool],
     bundler_groups: &mut Vec<String>,
     bundler_require_all: &mut bool,
 ) {
@@ -835,12 +967,7 @@ fn scan_bundler_require_filtered(
     let mut pos = 0;
     while let Some(idx) = BUNDLER_REQUIRE_FINDER.find(&bytes[pos..]) {
         let abs = pos + idx;
-        if is_ruby {
-            if is_commented(bytes, abs, block_ranges) {
-                pos = abs + 1;
-                continue;
-            }
-        } else if is_line_comment(bytes, abs) {
+        if is_skipped(mask, abs) {
             pos = abs + 1;
             continue;
         }
@@ -853,10 +980,30 @@ fn scan_bundler_require_filtered(
         while end < bytes.len() && bytes[end] != b'\n' {
             end += 1;
         }
-        let rest = std::str::from_utf8(&bytes[after..end]).unwrap_or("").trim();
+        let raw = std::str::from_utf8(&bytes[after..end]).unwrap_or("").trim();
+        // Fix #2: strip an inline `#` comment from the captured tail before
+        // applying GROUP_SYM_RE so that
+        //   Bundler.require(:default) # :test removed
+        // does not capture `:test` from the comment. We must respect string
+        // literals so a `#` inside `"..."` / `'...'` doesn't terminate.
+        let rest_owned = strip_inline_comment(raw);
+        let rest = rest_owned.trim();
         let rest_inner = rest.strip_prefix('(').map(|s| s.trim()).unwrap_or(rest);
-        if rest.is_empty()
-            || rest.starts_with('#')
+
+        // Fix #1: `Bundler.require`, `Bundler.require()`, `Bundler.require( )`
+        // and `Bundler.require(\n)` all mean "auto-require the :default group".
+        // Detect the "no args" form before falling through to group extraction.
+        let is_empty_call = rest.is_empty()
+            || rest == "("
+            || rest == "()"
+            || rest == "( )"
+            || {
+                let r = rest_inner.trim_start();
+                let r = r.strip_prefix(')').map(|s| s.trim()).unwrap_or(r);
+                rest.starts_with('(') && r.is_empty()
+            };
+
+        if is_empty_call
             || rest.contains("Rails.groups")
             || rest.contains("Rails.env")
             || rest_inner.starts_with('*')
@@ -871,27 +1018,53 @@ fn scan_bundler_require_filtered(
     }
 }
 
+/// Strip an inline `#` comment from `s`, respecting single- and double-quoted
+/// string literals so a `#` inside a string is preserved.
+fn strip_inline_comment(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'\'' || b == b'"' {
+            let q = b;
+            i += 1;
+            while i < bytes.len() {
+                if bytes[i] == b'\\' && i + 1 < bytes.len() {
+                    i += 2;
+                    continue;
+                }
+                if bytes[i] == q {
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            continue;
+        }
+        if b == b'#' {
+            return std::str::from_utf8(&bytes[..i])
+                .unwrap_or("")
+                .to_string();
+        }
+        i += 1;
+    }
+    s.to_string()
+}
+
 /// Scan for middleware string-literal references (e.g. `config.middleware.use "Bullet::Rack"`)
 /// and insert each quoted module name into `modules`.
 fn scan_middleware_refs(
     bytes: &[u8],
-    is_ruby: bool,
-    block_ranges: &[(usize, usize)],
-    modules: &mut HashMap<String, HashSet<String>>,
-    rel_path: &str,
+    mask: &[bool],
+    modules: &mut HashMap<String, HashSet<Arc<str>>>,
+    rel_path: &Arc<str>,
 ) {
     static MIDDLEWARE_FINDER: Lazy<memmem::Finder<'static>> =
         Lazy::new(|| memmem::Finder::new(b".middleware."));
     let mut pos = 0;
     while let Some(idx) = MIDDLEWARE_FINDER.find(&bytes[pos..]) {
         let abs = pos + idx;
-        // Skip commented lines
-        if is_ruby {
-            if is_commented(bytes, abs, block_ranges) {
-                pos = abs + 1;
-                continue;
-            }
-        } else if is_line_comment(bytes, abs) {
+        if is_skipped(mask, abs) {
             pos = abs + 1;
             continue;
         }
@@ -900,7 +1073,10 @@ fn scan_middleware_refs(
         while eol < bytes.len() && bytes[eol] != b'\n' {
             eol += 1;
         }
-        // Extract all quoted string literals from the rest of the line
+        // Extract all quoted string literals from the rest of the line.
+        // NOTE: we walk raw bytes here (not the mask) because string interiors
+        // are exactly what the middleware scanner cares about — masking them
+        // would defeat the purpose.
         let mut i = abs + 12; // skip ".middleware."
         while i < eol {
             if bytes[i] == b'"' || bytes[i] == b'\'' {
@@ -918,7 +1094,7 @@ fn scan_middleware_refs(
                             modules
                                 .entry(name.to_string())
                                 .or_default()
-                                .insert(rel_path.to_string());
+                                .insert(Arc::clone(rel_path));
                         }
                     }
                     i = end + 1;
@@ -945,7 +1121,7 @@ pub type CacheUpdate = (
 );
 
 type ScriptFileList = Vec<(String, Vec<u8>)>;
-type ModuleMap = Vec<HashMap<String, HashSet<String>>>;
+type ModuleMap = Vec<HashMap<String, HashSet<Arc<str>>>>;
 
 pub fn scan_source_tree(
     dir: &Path,
@@ -1005,8 +1181,10 @@ pub fn scan_source_tree(
             scripts: Arc<Mutex<ScriptFileList>>,
             modules_shared: Arc<Mutex<ModuleMap>>,
             cache_puts: Arc<Mutex<Vec<CacheUpdate>>>,
-            // Thread-local module accumulator: maps module_name → set of rel_paths
-            local_modules: HashMap<String, HashSet<String>>,
+            // Thread-local module accumulator: maps module_name → set of rel_paths.
+            // rel_paths are interned as Arc<str> so each file allocates the path
+            // once and per-module insertions are cheap refcount bumps (fix #10).
+            local_modules: HashMap<String, HashSet<Arc<str>>>,
         }
         impl FlushBuf {
             fn flush_results(&mut self) {
@@ -1058,11 +1236,15 @@ pub fn scan_source_tree(
                     if is_scannable(&path_str, path) {
                         // Use metadata from DirEntry (avoids redundant stat syscall)
                         let metadata = entry.metadata().ok();
+                        // Fix #9: take() consumes the entry on a validated hit and we
+                        // immediately reinsert it back into the cache map (without marking
+                        // it dirty). This avoids cloning the entry's Vec<String> fields on
+                        // the hot path while preserving the "no spurious updates" contract.
                         let cache_hit = if use_cache {
                             if let Some(ref md) = metadata {
                                 let mtime =
                                     md.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-                                cache_shared.get(&rel_path_cow, mtime, md.len())
+                                cache_shared.take(&rel_path_cow, mtime, md.len())
                             } else {
                                 None
                             }
@@ -1070,24 +1252,29 @@ pub fn scan_source_tree(
                             None
                         };
 
-                        if let Some(entry) =
-                            cache_hit
-                        {
-                            // Cache hit: reconstruct FileResult + modules without reading file
-                            let rel = rel_path_cow.to_string();
-                            for m in &entry.modules {
+                        if let Some(entry) = cache_hit {
+                            // Cache hit: reconstruct FileResult + modules without reading file.
+                            let rel: Arc<str> = Arc::from(rel_path_cow.as_ref());
+                            // Clone modules so we can both (a) insert into local_modules and
+                            // (b) reinsert the original entry back into the cache map.
+                            let entry_modules = entry.modules.clone();
+                            for m in entry_modules {
                                 flush_buf
                                     .local_modules
-                                    .entry(m.clone())
+                                    .entry(m)
                                     .or_default()
-                                    .insert(rel.clone());
+                                    .insert(Arc::clone(&rel));
                             }
-                            flush_buf.buf.push(FileResult {
-                                rel_path: rel,
+                            // Build FileResult by cloning small Vec<String>s; reinsert
+                            // owned entry back into cache so durability is preserved.
+                            let file_result = FileResult {
+                                rel_path: rel.to_string(),
                                 requires: entry.requires.clone(),
                                 bundler_groups: entry.bundler_groups.clone(),
                                 bundler_require_all: entry.bundler_require_all,
-                            });
+                            };
+                            cache_shared.reinsert(rel.to_string(), entry);
+                            flush_buf.buf.push(file_result);
                         } else {
                             // Cache miss: scan file
 
@@ -1100,11 +1287,13 @@ pub fn scan_source_tree(
                                         let mtime = md
                                             .modified()
                                             .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+                                        let rel_for_filter: Arc<str> =
+                                            Arc::from(file_result.rel_path.as_str());
                                         let new_modules: Vec<String> = flush_buf
                                             .local_modules
                                             .iter()
                                             .filter(|(_, files)| {
-                                                files.contains(&file_result.rel_path)
+                                                files.contains(&rel_for_filter)
                                             })
                                             .map(|(name, _)| name.clone())
                                             .collect();
@@ -1173,10 +1362,14 @@ pub fn scan_source_tree(
         }
     }
 
-    // Merge per-thread module maps (each module name allocated once per thread, not per file)
+    // Merge per-thread module maps (each module name allocated once per thread, not per file).
+    // Convert interned Arc<str> rel_paths back to String for the public API.
     for thread_map in all_thread_modules {
         for (module_name, files) in thread_map {
-            modules.entry(module_name).or_default().extend(files);
+            modules
+                .entry(module_name)
+                .or_default()
+                .extend(files.into_iter().map(|p| p.to_string()));
         }
     }
 
@@ -1239,12 +1432,21 @@ fn is_scannable(_path: &str, full_path: &Path) -> bool {
                 )
             }
             7 => {
-                let ext_lower: Vec<u8> = ext_bytes.iter().map(|b| b | 0x20).collect();
-                ext_lower == b"gemspec" || ext_lower == b"builder"
+                // Fix #11: stack array instead of heap Vec for the lowercased
+                // 7-byte extension comparison.
+                let mut lower = [0u8; 7];
+                for (i, b) in ext_bytes.iter().enumerate() {
+                    lower[i] = b | 0x20;
+                }
+                &lower == b"gemspec" || &lower == b"builder"
             }
             8 => {
-                let ext_lower: Vec<u8> = ext_bytes.iter().map(|b| b | 0x20).collect();
-                ext_lower == b"jbuilder"
+                // Fix #11: stack array instead of heap Vec.
+                let mut lower = [0u8; 8];
+                for (i, b) in ext_bytes.iter().enumerate() {
+                    lower[i] = b | 0x20;
+                }
+                &lower == b"jbuilder"
             }
             _ => false,
         };
@@ -1287,7 +1489,7 @@ fn is_scannable(_path: &str, full_path: &Path) -> bool {
 fn scan_file(
     path: &str,
     dir: &str,
-    thread_modules: &mut HashMap<String, HashSet<String>>,
+    thread_modules: &mut HashMap<String, HashSet<Arc<str>>>,
 ) -> Option<FileResult> {
     // Plain read() is faster than mmap for single sequential reads (no VMA/TLB overhead)
     let bytes = std::fs::read(path).ok()?;
@@ -1301,108 +1503,82 @@ fn scan_file(
         .unwrap_or(Path::new(path))
         .display()
         .to_string();
+    // Fix #10: intern rel_path as Arc<str> so each per-module insertion is a
+    // cheap Arc::clone instead of a fresh String allocation.
+    let rel_path_arc: Arc<str> = Arc::from(rel_path.as_str());
 
     let full_path = Path::new(path);
-    let is_ruby = if let Some(ext) = full_path.extension() {
-        let ext_bytes = ext.as_encoded_bytes();
-        match ext_bytes.len() {
-            2 => {
-                let l = [ext_bytes[0] | 0x20, ext_bytes[1] | 0x20];
-                matches!(&l, b"rb" | b"ru")
-            }
-            4 => {
-                let l = [
-                    ext_bytes[0] | 0x20,
-                    ext_bytes[1] | 0x20,
-                    ext_bytes[2] | 0x20,
-                    ext_bytes[3] | 0x20,
-                ];
-                matches!(&l, b"rake" | b"haml" | b"slim" | b"rabl" | b"thor")
-            }
-            7 => {
-                let l: Vec<u8> = ext_bytes.iter().map(|b| b | 0x20).collect();
-                l == b"gemspec" || l == b"builder"
-            }
-            8 => {
-                let l: Vec<u8> = ext_bytes.iter().map(|b| b | 0x20).collect();
-                l == b"jbuilder"
-            }
-            _ => false,
-        }
+    let (is_ruby, is_yaml, is_slim, is_haml) = classify_file(full_path);
+
+    // Fix #4: Slim line comments use `/`, Haml line comments use `-#`.
+    // Other supported file types (Ruby, YAML, ERB, shell etc.) use `#`.
+    let line_kind = if is_slim {
+        LineCommentKind::Slash
+    } else if is_haml {
+        LineCommentKind::DashHash
     } else {
-        let name_bytes = full_path
-            .file_name()
-            .map(|n| n.as_encoded_bytes())
-            .unwrap_or(b"");
-        SCANNABLE_FILENAMES
-            .iter()
-            .any(|f| f.as_bytes() == name_bytes)
-    };
-    let is_yaml = if let Some(ext) = full_path.extension() {
-        let ext_bytes = ext.as_encoded_bytes();
-        match ext_bytes.len() {
-            3 => {
-                let l = [
-                    ext_bytes[0] | 0x20,
-                    ext_bytes[1] | 0x20,
-                    ext_bytes[2] | 0x20,
-                ];
-                l == *b"yml"
-            }
-            4 => {
-                let l = [
-                    ext_bytes[0] | 0x20,
-                    ext_bytes[1] | 0x20,
-                    ext_bytes[2] | 0x20,
-                    ext_bytes[3] | 0x20,
-                ];
-                l == *b"yaml"
-            }
-            _ => false,
-        }
-    } else {
-        false
+        LineCommentKind::Hash
     };
 
-    // Precompute block comment ranges for Ruby files (single pass)
-    let block_ranges = if is_ruby {
-        build_block_comment_ranges(bytes)
-    } else {
-        Vec::new()
-    };
+    // Fix #7: build a single unified skip mask covering line/inline/block
+    // comments, heredoc bodies, and string-literal interiors. All filtered
+    // scanners now do O(1) lookups against this mask, avoiding the previous
+    // quadratic per-call memrchr/range-scan cost on heredoc-heavy files.
+    let mask = build_skip_mask(bytes, is_ruby, line_kind);
 
     let mut requires = Vec::new();
     let mut bundler_groups = Vec::new();
     let mut bundler_require_all = false;
 
-    // Hand-rolled byte scanners with inline comment skipping
-    scan_requires_filtered(bytes, is_ruby, &block_ranges, &mut requires);
-    scan_autoloads_filtered(bytes, is_ruby, &block_ranges, &mut requires);
-    scan_gem_bin_filtered(bytes, is_ruby, &block_ranges, &mut requires);
-    // Modules go directly into thread-local map (avoids per-file Vec<String> allocation)
-    scan_modules_filtered_into(bytes, is_ruby, &block_ranges, thread_modules, &rel_path);
-    scan_middleware_refs(bytes, is_ruby, &block_ranges, thread_modules, &rel_path);
+    // Hand-rolled byte scanners with mask-based skipping
+    scan_requires_filtered(bytes, &mask, &mut requires);
+    scan_autoloads_filtered(bytes, &mask, &mut requires);
+    scan_gem_bin_filtered(bytes, &mask, &mut requires);
+    // Fix #5: do NOT run the generic uppercase-token module scanner on YAML
+    // files — YAML keys/values like `UserNotFound:` would otherwise be
+    // extracted as module references. The explicit YAML regex extractors
+    // below still pick up rubocop/plugins/inherit_gem/require: entries.
+    if !is_yaml {
+        scan_modules_filtered_into(bytes, &mask, thread_modules, &rel_path_arc);
+        scan_middleware_refs(bytes, &mask, thread_modules, &rel_path_arc);
+    }
 
-    // YAML config patterns (keep regex — rarely hit, complex multiline patterns)
+    // YAML config patterns (keep regex — rarely hit, complex multiline patterns).
+    // Fix #8: use regex::bytes::Regex to avoid the String::from_utf8_lossy
+    // allocation; patterns are byte-compatible.
     if is_yaml
         && (memmem::find(bytes, b"rubocop").is_some()
             || memmem::find(bytes, b"require:").is_some()
             || memmem::find(bytes, b"plugins:").is_some()
             || memmem::find(bytes, b"inherit_gem:").is_some())
     {
-        // Need &str for regex — borrow from bytes, no allocation if valid UTF-8
-        let content_str = String::from_utf8_lossy(bytes);
-        for cap in RUBOCOP_RE.captures_iter(&content_str) {
-            requires.push(cap[1].to_string());
-        }
-        for cap in YAML_REQUIRE_BLOCK_RE.captures_iter(&content_str) {
-            for item_cap in YAML_ITEM_RE.captures_iter(&cap[1]) {
-                requires.push(item_cap[1].trim().to_string());
+        for cap in RUBOCOP_RE.captures_iter(bytes) {
+            if let Some(m) = cap.get(1) {
+                if let Ok(s) = std::str::from_utf8(m.as_bytes()) {
+                    requires.push(s.to_string());
+                }
             }
         }
-        for cap in INHERIT_GEM_RE.captures_iter(&content_str) {
-            for key_cap in INHERIT_GEM_KEY_RE.captures_iter(&cap[1]) {
-                requires.push(key_cap[1].to_string());
+        for cap in YAML_REQUIRE_BLOCK_RE.captures_iter(bytes) {
+            if let Some(block) = cap.get(1) {
+                for item_cap in YAML_ITEM_RE.captures_iter(block.as_bytes()) {
+                    if let Some(item) = item_cap.get(1) {
+                        if let Ok(s) = std::str::from_utf8(item.as_bytes()) {
+                            requires.push(s.trim().to_string());
+                        }
+                    }
+                }
+            }
+        }
+        for cap in INHERIT_GEM_RE.captures_iter(bytes) {
+            if let Some(block) = cap.get(1) {
+                for key_cap in INHERIT_GEM_KEY_RE.captures_iter(block.as_bytes()) {
+                    if let Some(key) = key_cap.get(1) {
+                        if let Ok(s) = std::str::from_utf8(key.as_bytes()) {
+                            requires.push(s.to_string());
+                        }
+                    }
+                }
             }
         }
     }
@@ -1410,8 +1586,7 @@ fn scan_file(
     // Bundler.require detection
     scan_bundler_require_filtered(
         bytes,
-        is_ruby,
-        &block_ranges,
+        &mask,
         &mut bundler_groups,
         &mut bundler_require_all,
     );
@@ -1422,6 +1597,70 @@ fn scan_file(
         bundler_groups,
         bundler_require_all,
     })
+}
+
+/// Classify a path into (is_ruby, is_yaml, is_slim, is_haml). Single pass.
+fn classify_file(full_path: &Path) -> (bool, bool, bool, bool) {
+    if let Some(ext) = full_path.extension() {
+        let ext_bytes = ext.as_encoded_bytes();
+        match ext_bytes.len() {
+            2 => {
+                let l = [ext_bytes[0] | 0x20, ext_bytes[1] | 0x20];
+                let is_ruby = matches!(&l, b"rb" | b"ru");
+                return (is_ruby, false, false, false);
+            }
+            3 => {
+                let l = [
+                    ext_bytes[0] | 0x20,
+                    ext_bytes[1] | 0x20,
+                    ext_bytes[2] | 0x20,
+                ];
+                let is_yaml = &l == b"yml";
+                return (false, is_yaml, false, false);
+            }
+            4 => {
+                let l = [
+                    ext_bytes[0] | 0x20,
+                    ext_bytes[1] | 0x20,
+                    ext_bytes[2] | 0x20,
+                    ext_bytes[3] | 0x20,
+                ];
+                let is_yaml = &l == b"yaml";
+                let is_slim = &l == b"slim";
+                let is_haml = &l == b"haml";
+                let is_ruby = matches!(&l, b"rake" | b"rabl" | b"thor");
+                return (is_ruby, is_yaml, is_slim, is_haml);
+            }
+            7 => {
+                // gemspec | builder
+                let mut l = [0u8; 7];
+                for (i, b) in ext_bytes.iter().enumerate() {
+                    l[i] = b | 0x20;
+                }
+                let is_ruby = &l == b"gemspec" || &l == b"builder";
+                return (is_ruby, false, false, false);
+            }
+            8 => {
+                // jbuilder
+                let mut l = [0u8; 8];
+                for (i, b) in ext_bytes.iter().enumerate() {
+                    l[i] = b | 0x20;
+                }
+                let is_ruby = &l == b"jbuilder";
+                return (is_ruby, false, false, false);
+            }
+            _ => {}
+        }
+    }
+
+    let name_bytes = full_path
+        .file_name()
+        .map(|n| n.as_encoded_bytes())
+        .unwrap_or(b"");
+    let is_ruby = SCANNABLE_FILENAMES
+        .iter()
+        .any(|f| f.as_bytes() == name_bytes);
+    (is_ruby, false, false, false)
 }
 
 #[cfg(test)]
@@ -1485,9 +1724,9 @@ mod tests {
     #[test]
     fn inline_comment_require_is_filtered() {
         let input = b"x = 1 # require 'unused_gem'\nrequire 'real_gem'\n";
-        let block_ranges = build_block_comment_ranges(input);
+        let _block_ranges = build_block_comment_ranges(input);
         let mut results = Vec::new();
-        scan_requires_filtered(input, true, &block_ranges, &mut results);
+        { let __mask = build_skip_mask(input, true, LineCommentKind::Hash); scan_requires_filtered(input, &__mask, &mut results); }
         assert_eq!(results, vec!["real_gem"]);
     }
 
@@ -1495,18 +1734,18 @@ mod tests {
     fn inline_comment_after_string_not_filtered() {
         // The # inside a string shouldn't trigger comment detection
         let input = b"x = 'has#hash'\nrequire 'real_gem'\n";
-        let block_ranges = build_block_comment_ranges(input);
+        let _block_ranges = build_block_comment_ranges(input);
         let mut results = Vec::new();
-        scan_requires_filtered(input, true, &block_ranges, &mut results);
+        { let __mask = build_skip_mask(input, true, LineCommentKind::Hash); scan_requires_filtered(input, &__mask, &mut results); }
         assert_eq!(results, vec!["real_gem"]);
     }
 
     #[test]
     fn inline_comment_with_code_before() {
         let input = b"configure do |c|\n  c.adapter = :memory # require 'redis' for production\nend\nrequire 'active_support'\n";
-        let block_ranges = build_block_comment_ranges(input);
+        let _block_ranges = build_block_comment_ranges(input);
         let mut results = Vec::new();
-        scan_requires_filtered(input, true, &block_ranges, &mut results);
+        { let __mask = build_skip_mask(input, true, LineCommentKind::Hash); scan_requires_filtered(input, &__mask, &mut results); }
         assert_eq!(results, vec!["active_support"]);
     }
 
@@ -1515,36 +1754,36 @@ mod tests {
     #[test]
     fn heredoc_require_is_filtered() {
         let input = b"doc = <<~HELP\n  require 'fake_gem'\nHELP\nrequire 'real_gem'\n";
-        let block_ranges = build_block_comment_ranges(input);
+        let _block_ranges = build_block_comment_ranges(input);
         let mut results = Vec::new();
-        scan_requires_filtered(input, true, &block_ranges, &mut results);
+        { let __mask = build_skip_mask(input, true, LineCommentKind::Hash); scan_requires_filtered(input, &__mask, &mut results); }
         assert_eq!(results, vec!["real_gem"]);
     }
 
     #[test]
     fn heredoc_with_dash_syntax_is_filtered() {
         let input = b"doc = <<-HEREDOC\n  require 'fake_gem'\nHEREDOC\nrequire 'real_gem'\n";
-        let block_ranges = build_block_comment_ranges(input);
+        let _block_ranges = build_block_comment_ranges(input);
         let mut results = Vec::new();
-        scan_requires_filtered(input, true, &block_ranges, &mut results);
+        { let __mask = build_skip_mask(input, true, LineCommentKind::Hash); scan_requires_filtered(input, &__mask, &mut results); }
         assert_eq!(results, vec!["real_gem"]);
     }
 
     #[test]
     fn heredoc_with_quotes_is_filtered() {
         let input = b"doc = <<~'EOF'\n  require 'fake_gem'\nEOF\nrequire 'real_gem'\n";
-        let block_ranges = build_block_comment_ranges(input);
+        let _block_ranges = build_block_comment_ranges(input);
         let mut results = Vec::new();
-        scan_requires_filtered(input, true, &block_ranges, &mut results);
+        { let __mask = build_skip_mask(input, true, LineCommentKind::Hash); scan_requires_filtered(input, &__mask, &mut results); }
         assert_eq!(results, vec!["real_gem"]);
     }
 
     #[test]
     fn heredoc_modules_are_filtered() {
         let input = b"doc = <<~HELP\n  Use MyGem::Config to configure\nHELP\nMyRealModule.call\n";
-        let block_ranges = build_block_comment_ranges(input);
-        let mut modules: HashMap<String, HashSet<String>> = HashMap::new();
-        scan_modules_filtered_into(input, true, &block_ranges, &mut modules, "test.rb");
+        let _block_ranges = build_block_comment_ranges(input);
+        let mut modules: HashMap<String, HashSet<Arc<str>>> = HashMap::new();
+        { let __mask = build_skip_mask(input, true, LineCommentKind::Hash); { let __rp: Arc<str> = Arc::from("test.rb"); scan_modules_filtered_into(input, &__mask, &mut modules, &__rp) }; }
         assert!(
             !modules.contains_key("MyGem"),
             "MyGem inside heredoc should be filtered"
@@ -1560,9 +1799,9 @@ mod tests {
     #[test]
     fn yaml_comment_require_is_filtered() {
         let input = b"# require 'old_gem'\nkey: value\n";
-        let block_ranges = Vec::new();
+        let _block_ranges: Vec<(usize, usize)> = Vec::new();
         let mut results = Vec::new();
-        scan_requires_filtered(input, false, &block_ranges, &mut results);
+        { let __mask = build_skip_mask(input, false, LineCommentKind::Hash); scan_requires_filtered(input, &__mask, &mut results); }
         assert!(
             results.is_empty(),
             "require in YAML comment should be filtered"
@@ -1572,18 +1811,18 @@ mod tests {
     #[test]
     fn yaml_non_comment_require_is_kept() {
         let input = b"key: value\nrequire 'real_gem'\n";
-        let block_ranges = Vec::new();
+        let _block_ranges: Vec<(usize, usize)> = Vec::new();
         let mut results = Vec::new();
-        scan_requires_filtered(input, false, &block_ranges, &mut results);
+        { let __mask = build_skip_mask(input, false, LineCommentKind::Hash); scan_requires_filtered(input, &__mask, &mut results); }
         assert_eq!(results, vec!["real_gem"]);
     }
 
     #[test]
     fn non_ruby_module_comment_is_filtered() {
         let input = b"# MyOldModule was removed\nMyNewModule:\n  key: value\n";
-        let block_ranges = Vec::new();
-        let mut modules: HashMap<String, HashSet<String>> = HashMap::new();
-        scan_modules_filtered_into(input, false, &block_ranges, &mut modules, "test.yml");
+        let _block_ranges: Vec<(usize, usize)> = Vec::new();
+        let mut modules: HashMap<String, HashSet<Arc<str>>> = HashMap::new();
+        { let __mask = build_skip_mask(input, false, LineCommentKind::Hash); { let __rp: Arc<str> = Arc::from("test.yml"); scan_modules_filtered_into(input, &__mask, &mut modules, &__rp) }; }
         assert!(
             !modules.contains_key("MyOldModule"),
             "module in comment should be filtered"
@@ -1631,7 +1870,7 @@ mod tests {
         let ranges = build_block_comment_ranges(input);
         assert!(!ranges.is_empty());
         let mut results = Vec::new();
-        scan_requires_filtered(input, true, &ranges, &mut results);
+        { let __mask = build_skip_mask(input, true, LineCommentKind::Hash); scan_requires_filtered(input, &__mask, &mut results); }
         assert_eq!(results, vec!["real"]);
     }
 
@@ -1648,7 +1887,7 @@ mod tests {
         let ranges = build_block_comment_ranges(input);
         assert!(!ranges.is_empty());
         let mut results = Vec::new();
-        scan_requires_filtered(input, true, &ranges, &mut results);
+        { let __mask = build_skip_mask(input, true, LineCommentKind::Hash); scan_requires_filtered(input, &__mask, &mut results); }
         assert_eq!(results, vec!["before", "after"]);
     }
 
@@ -1656,9 +1895,9 @@ mod tests {
     fn block_comment_begin_not_full_word() {
         // =beginning should not be treated as =begin
         let input = b"\n=beginning_of_doc\nrequire 'real'\n";
-        let ranges = build_block_comment_ranges(input);
+        let _ranges = build_block_comment_ranges(input);
         let mut results = Vec::new();
-        scan_requires_filtered(input, true, &ranges, &mut results);
+        { let __mask = build_skip_mask(input, true, LineCommentKind::Hash); scan_requires_filtered(input, &__mask, &mut results); }
         assert_eq!(results, vec!["real"]);
     }
 
@@ -1668,9 +1907,9 @@ mod tests {
     fn inline_comment_after_escaped_quote() {
         // The \' inside a string should not confuse quote tracking
         let input = b"x = 'it\\'s' # require 'fake'\nrequire 'real'\n";
-        let ranges = build_block_comment_ranges(input);
+        let _ranges = build_block_comment_ranges(input);
         let mut results = Vec::new();
-        scan_requires_filtered(input, true, &ranges, &mut results);
+        { let __mask = build_skip_mask(input, true, LineCommentKind::Hash); scan_requires_filtered(input, &__mask, &mut results); }
         assert_eq!(results, vec!["real"]);
     }
 
@@ -1678,9 +1917,9 @@ mod tests {
     fn inline_comment_hash_in_double_quoted_string() {
         // "has#hash" should not trigger comment detection
         let input = b"x = \"has#hash\"\nrequire 'real'\n";
-        let ranges = build_block_comment_ranges(input);
+        let _ranges = build_block_comment_ranges(input);
         let mut results = Vec::new();
-        scan_requires_filtered(input, true, &ranges, &mut results);
+        { let __mask = build_skip_mask(input, true, LineCommentKind::Hash); scan_requires_filtered(input, &__mask, &mut results); }
         assert_eq!(results, vec!["real"]);
     }
 
@@ -1936,7 +2175,7 @@ mod tests {
     fn non_ruby_autoload_comment_filtered() {
         let input = b"# autoload :Foo, 'foo'\nautoload :Bar, 'bar'\n";
         let mut results = Vec::new();
-        scan_autoloads_filtered(input, false, &[], &mut results);
+        { let __mask = build_skip_mask(input, false, LineCommentKind::Hash); scan_autoloads_filtered(input, &__mask, &mut results); }
         assert_eq!(results, vec!["bar"]);
     }
 
@@ -1944,7 +2183,7 @@ mod tests {
     fn non_ruby_gem_bin_comment_filtered() {
         let input = b"# Gem.bin_path('old', 'old')\nGem.bin_path('real', 'real')\n";
         let mut results = Vec::new();
-        scan_gem_bin_filtered(input, false, &[], &mut results);
+        { let __mask = build_skip_mask(input, false, LineCommentKind::Hash); scan_gem_bin_filtered(input, &__mask, &mut results); }
         assert_eq!(results, vec!["real"]);
     }
 
@@ -1953,7 +2192,7 @@ mod tests {
         let input = b"# Bundler.require\nBundler.require(:default)\n";
         let mut groups = Vec::new();
         let mut require_all = false;
-        scan_bundler_require_filtered(input, false, &[], &mut groups, &mut require_all);
+        { let __mask = build_skip_mask(input, false, LineCommentKind::Hash); scan_bundler_require_filtered(input, &__mask, &mut groups, &mut require_all); }
         assert!(!require_all);
         assert_eq!(groups, vec!["default"]);
     }
@@ -2400,7 +2639,7 @@ mod tests {
     fn non_ruby_autoload_comment_filtered_with_hash() {
         let input = b"# autoload :Foo, 'foo'\nautoload :Bar, 'bar'\n";
         let mut results = Vec::new();
-        scan_autoloads_filtered(input, false, &[], &mut results);
+        { let __mask = build_skip_mask(input, false, LineCommentKind::Hash); scan_autoloads_filtered(input, &__mask, &mut results); }
         assert_eq!(results, vec!["bar"]);
     }
 
@@ -2408,7 +2647,7 @@ mod tests {
     fn non_ruby_modules_filtered_comment_skipped() {
         let input = b"# MyModule\nRealModule\n";
         let mut modules = HashMap::new();
-        scan_modules_filtered_into(input, false, &[], &mut modules, "test.py");
+        { let __mask = build_skip_mask(input, false, LineCommentKind::Hash); { let __rp: Arc<str> = Arc::from("test.py"); scan_modules_filtered_into(input, &__mask, &mut modules, &__rp) }; }
         assert!(modules.contains_key("RealModule"));
         assert!(!modules.contains_key("MyModule"));
     }
@@ -2416,9 +2655,9 @@ mod tests {
     #[test]
     fn ruby_modules_filtered_block_comment_skipped() {
         let input = b"=begin\nSkippedModule\n=end\nRealModule\n";
-        let ranges = build_block_comment_ranges(input);
+        let _ranges = build_block_comment_ranges(input);
         let mut modules = HashMap::new();
-        scan_modules_filtered_into(input, true, &ranges, &mut modules, "test.rb");
+        { let __mask = build_skip_mask(input, true, LineCommentKind::Hash); { let __rp: Arc<str> = Arc::from("test.rb"); scan_modules_filtered_into(input, &__mask, &mut modules, &__rp) }; }
         assert!(modules.contains_key("RealModule"));
         assert!(!modules.contains_key("SkippedModule"));
     }
@@ -2426,28 +2665,28 @@ mod tests {
     #[test]
     fn ruby_gem_bin_filtered_block_comment() {
         let input = b"=begin\nGem.bin_path('skip')\n=end\nGem.bin_path('real')\n";
-        let ranges = build_block_comment_ranges(input);
+        let _ranges = build_block_comment_ranges(input);
         let mut results = Vec::new();
-        scan_gem_bin_filtered(input, true, &ranges, &mut results);
+        { let __mask = build_skip_mask(input, true, LineCommentKind::Hash); scan_gem_bin_filtered(input, &__mask, &mut results); }
         assert_eq!(results, vec!["real"]);
     }
 
     #[test]
     fn ruby_autoload_filtered_block_comment() {
         let input = b"=begin\nautoload :Foo, 'skip'\n=end\nautoload :Bar, 'real'\n";
-        let ranges = build_block_comment_ranges(input);
+        let _ranges = build_block_comment_ranges(input);
         let mut results = Vec::new();
-        scan_autoloads_filtered(input, true, &ranges, &mut results);
+        { let __mask = build_skip_mask(input, true, LineCommentKind::Hash); scan_autoloads_filtered(input, &__mask, &mut results); }
         assert_eq!(results, vec!["real"]);
     }
 
     #[test]
     fn ruby_bundler_require_filtered_block_comment() {
         let input = b"=begin\nBundler.require\n=end\nBundler.require(:test)\n";
-        let ranges = build_block_comment_ranges(input);
+        let _ranges = build_block_comment_ranges(input);
         let mut groups = Vec::new();
         let mut require_all = false;
-        scan_bundler_require_filtered(input, true, &ranges, &mut groups, &mut require_all);
+        { let __mask = build_skip_mask(input, true, LineCommentKind::Hash); scan_bundler_require_filtered(input, &__mask, &mut groups, &mut require_all); }
         assert!(!require_all);
         assert_eq!(groups, vec!["test"]);
     }
@@ -2497,16 +2736,16 @@ mod tests {
     #[test]
     fn middleware_use_string() {
         let input = b"config.middleware.use \"Bullet::Rack\"\n";
-        let mut modules: HashMap<String, HashSet<String>> = HashMap::new();
-        scan_middleware_refs(input, true, &[], &mut modules, "test.rb");
+        let mut modules: HashMap<String, HashSet<Arc<str>>> = HashMap::new();
+        { let __mask = build_skip_mask(input, true, LineCommentKind::Hash); { let __rp: Arc<str> = Arc::from("test.rb"); scan_middleware_refs(input, &__mask, &mut modules, &__rp) }; }
         assert!(modules.contains_key("Bullet::Rack"), "should detect double-quoted middleware");
     }
 
     #[test]
     fn middleware_insert_before_string() {
         let input = b"config.middleware.insert_before Rack::Runtime, \"BatchLoader::Middleware\"\n";
-        let mut modules: HashMap<String, HashSet<String>> = HashMap::new();
-        scan_middleware_refs(input, true, &[], &mut modules, "test.rb");
+        let mut modules: HashMap<String, HashSet<Arc<str>>> = HashMap::new();
+        { let __mask = build_skip_mask(input, true, LineCommentKind::Hash); { let __rp: Arc<str> = Arc::from("test.rb"); scan_middleware_refs(input, &__mask, &mut modules, &__rp) }; }
         assert!(
             modules.contains_key("BatchLoader::Middleware"),
             "should detect string arg in insert_before"
@@ -2516,8 +2755,8 @@ mod tests {
     #[test]
     fn middleware_symbol_ignored() {
         let input = b"config.middleware.use MyClass\n";
-        let mut modules: HashMap<String, HashSet<String>> = HashMap::new();
-        scan_middleware_refs(input, true, &[], &mut modules, "test.rb");
+        let mut modules: HashMap<String, HashSet<Arc<str>>> = HashMap::new();
+        { let __mask = build_skip_mask(input, true, LineCommentKind::Hash); { let __rp: Arc<str> = Arc::from("test.rb"); scan_middleware_refs(input, &__mask, &mut modules, &__rp) }; }
         assert!(
             !modules.contains_key("MyClass"),
             "bare constants should not be captured by middleware scanner"
@@ -2527,11 +2766,118 @@ mod tests {
     #[test]
     fn middleware_commented() {
         let input = b"# config.middleware.use \"Bullet::Rack\"\n";
-        let mut modules: HashMap<String, HashSet<String>> = HashMap::new();
-        scan_middleware_refs(input, true, &[], &mut modules, "test.rb");
+        let mut modules: HashMap<String, HashSet<Arc<str>>> = HashMap::new();
+        { let __mask = build_skip_mask(input, true, LineCommentKind::Hash); { let __rp: Arc<str> = Arc::from("test.rb"); scan_middleware_refs(input, &__mask, &mut modules, &__rp) }; }
         assert!(
             !modules.contains_key("Bullet::Rack"),
             "commented middleware should be ignored"
         );
+    }
+
+    // ── New tests for fixes #1–#6 ──
+
+    #[test]
+    fn fix1_bundler_require_empty_parens_sets_require_all() {
+        // Fix #1: `Bundler.require()` (no args) should be treated as require-all.
+        let input = b"Bundler.require()\n";
+        let mut groups: Vec<String> = Vec::new();
+        let mut require_all = false;
+        let __mask = build_skip_mask(input, true, LineCommentKind::Hash);
+        scan_bundler_require_filtered(input, &__mask, &mut groups, &mut require_all);
+        assert!(require_all, "empty Bundler.require() must set require_all");
+    }
+
+    #[test]
+    fn fix1_bundler_require_empty_parens_with_space() {
+        let input = b"Bundler.require( )\n";
+        let mut groups: Vec<String> = Vec::new();
+        let mut require_all = false;
+        let __mask = build_skip_mask(input, true, LineCommentKind::Hash);
+        scan_bundler_require_filtered(input, &__mask, &mut groups, &mut require_all);
+        assert!(require_all);
+    }
+
+    #[test]
+    fn fix1_bundler_require_no_args_no_parens() {
+        let input = b"Bundler.require\n";
+        let mut groups: Vec<String> = Vec::new();
+        let mut require_all = false;
+        let __mask = build_skip_mask(input, true, LineCommentKind::Hash);
+        scan_bundler_require_filtered(input, &__mask, &mut groups, &mut require_all);
+        assert!(require_all);
+    }
+
+    #[test]
+    fn fix2_bundler_require_strips_inline_comment() {
+        // Fix #2: trailing `# :test` comment must not become a captured group.
+        let input = b"Bundler.require(:default) # :test removed\n";
+        let mut groups: Vec<String> = Vec::new();
+        let mut require_all = false;
+        let __mask = build_skip_mask(input, true, LineCommentKind::Hash);
+        scan_bundler_require_filtered(input, &__mask, &mut groups, &mut require_all);
+        assert!(groups.iter().any(|g| g == "default"));
+        assert!(!groups.iter().any(|g| g == "test"), "inline-comment :test must not be captured");
+    }
+
+    #[test]
+    fn fix3_string_literal_interior_not_scanned_for_requires() {
+        // Fix #3: gem names mentioned inside string literals must not be extracted.
+        let input = b"raise \"Please require 'oauth2'\"\n";
+        let mut results = Vec::new();
+        let __mask = build_skip_mask(input, true, LineCommentKind::Hash);
+        scan_requires_filtered(input, &__mask, &mut results);
+        assert!(
+            !results.iter().any(|s| s == "oauth2"),
+            "require keyword inside a string literal must not be extracted, got {:?}",
+            results
+        );
+    }
+
+    #[test]
+    fn fix4_slim_slash_comment_is_filtered() {
+        // Fix #4: Slim comment lines start with `/`.
+        let input = b"/ require 'foo'\nrequire 'bar'\n";
+        let mut results = Vec::new();
+        let __mask = build_skip_mask(input, false, LineCommentKind::Slash);
+        scan_requires_filtered(input, &__mask, &mut results);
+        assert_eq!(results, vec!["bar"], "slim `/` line must be skipped");
+    }
+
+    #[test]
+    fn fix4_haml_dash_hash_comment_is_filtered() {
+        // Fix #4: Haml comment lines start with `-#`.
+        let input = b"-# require 'foo'\nrequire 'bar'\n";
+        let mut results = Vec::new();
+        let __mask = build_skip_mask(input, false, LineCommentKind::DashHash);
+        scan_requires_filtered(input, &__mask, &mut results);
+        assert_eq!(results, vec!["bar"], "haml `-#` line must be skipped");
+    }
+
+    #[test]
+    fn fix5_yaml_files_not_scanned_for_modules() {
+        // Fix #5: scan_file must not extract Ruby module references from a YAML file.
+        let dir = tempfile::tempdir().unwrap();
+        let yml = dir.path().join("config.yml");
+        // PascalCase tokens in YAML values must not be reported as module references.
+        std::fs::write(&yml, "default: &default\n  adapter: postgresql\n  pool: SomeModule\n")
+            .unwrap();
+        let cache = std::sync::Arc::new(crate::cache::FileCache::disabled());
+        let (results, _) = scan_source_tree(dir.path(), &[], cache);
+        assert!(
+            !results.modules.contains_key("SomeModule"),
+            "YAML file must not be scanned for module references"
+        );
+    }
+
+    #[test]
+    fn fix6_left_shift_operator_after_word_char_is_not_heredoc() {
+        // Fix #6: `arr<<MY_CONST` (no space) is the `<<` operator on a Ruby Array,
+        // not a heredoc. `MY_CONST` must NOT be misclassified as a heredoc body.
+        let input = b"arr<<MY_CONST\nrequire 'after'\n";
+        let mut results = Vec::new();
+        let __mask = build_skip_mask(input, true, LineCommentKind::Hash);
+        scan_requires_filtered(input, &__mask, &mut results);
+        // The require after the supposed heredoc must still be picked up.
+        assert_eq!(results, vec!["after"]);
     }
 }

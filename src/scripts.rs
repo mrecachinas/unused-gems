@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
@@ -13,17 +14,25 @@ pub(crate) fn is_script_file(rel_path: &str, file_name: &str) -> bool {
     // Exact top-level filenames
     match file_name {
         "Makefile" | "makefile" | "GNUmakefile" | "Dockerfile" | "Procfile" => return true,
+        "Jenkinsfile" => return true,
+        "Earthfile" => return true,
+        "Justfile" | "justfile" | ".justfile" => return true,
+        "Taskfile.yml" | "Taskfile.yaml" => return true,
+        "mise.toml" | ".mise.toml" | ".tool-versions" => return true,
         _ => {}
     }
-    // Dockerfile.* / Procfile.*
-    if file_name.starts_with("Dockerfile.") || file_name.starts_with("Procfile.") {
+    // Dockerfile.* / Procfile.* / Jenkinsfile.*
+    if file_name.starts_with("Dockerfile.")
+        || file_name.starts_with("Procfile.")
+        || file_name.starts_with("Jenkinsfile.")
+    {
         return true;
     }
     // docker-compose.yml/yaml
     if file_name == "docker-compose.yml" || file_name == "docker-compose.yaml" {
         return true;
     }
-    // .github/workflows/*.yml/*.yaml
+    // .github/workflows/*.yml/*.yaml , .github/actions/*.yml/*.yaml
     if (rel_path.starts_with(".github/workflows/") || rel_path.starts_with(".github/actions/"))
         && (file_name.ends_with(".yml") || file_name.ends_with(".yaml"))
     {
@@ -33,10 +42,41 @@ pub(crate) fn is_script_file(rel_path: &str, file_name: &str) -> bool {
     if rel_path == ".circleci/config.yml" || rel_path == ".gitlab-ci.yml" {
         return true;
     }
+    // .buildkite/**/*.yml/*.yaml
+    if rel_path.starts_with(".buildkite/")
+        && (file_name.ends_with(".yml") || file_name.ends_with(".yaml"))
+    {
+        return true;
+    }
+    // .drone.yml/.drone.yaml
+    if rel_path == ".drone.yml" || rel_path == ".drone.yaml" {
+        return true;
+    }
+    // bitbucket-pipelines.yml/yaml (top-level)
+    if rel_path == "bitbucket-pipelines.yml" || rel_path == "bitbucket-pipelines.yaml" {
+        return true;
+    }
+    // azure-pipelines.yml/yaml (top-level) and .azure-pipelines/**/*.yml|yaml
+    if file_name == "azure-pipelines.yml" || file_name == "azure-pipelines.yaml" {
+        return true;
+    }
+    if rel_path.starts_with(".azure-pipelines/")
+        && (file_name.ends_with(".yml") || file_name.ends_with(".yaml"))
+    {
+        return true;
+    }
     // script/**/* , scripts/**/* , bin/**/*
     if rel_path.starts_with("script/")
         || rel_path.starts_with("scripts/")
         || rel_path.starts_with("bin/")
+    {
+        return true;
+    }
+    // Top-level *.sh, *.bash, *.bats
+    if !rel_path.contains('/')
+        && (file_name.ends_with(".sh")
+            || file_name.ends_with(".bash")
+            || file_name.ends_with(".bats"))
     {
         return true;
     }
@@ -122,39 +162,80 @@ fn scan_bin_refs(bytes: &[u8]) -> Vec<String> {
     results
 }
 
-/// Strip comment lines from script file content.
-/// Handles `#` comments for YAML/shell/Ruby, and Makefile-style comments.
-/// Preserves non-comment lines so byte offsets for bundle exec/bin scanners stay valid.
-fn strip_comment_lines(content: &[u8]) -> Vec<u8> {
+/// Strip an inline `#` comment from a single line (no trailing `\n`).
+/// Returns the slice up to (but not including) an unquoted `#` that's preceded
+/// by whitespace or starts the line. Tracks single/double quote state so that
+/// `#` inside string literals is preserved.
+fn strip_inline_comment(line: &[u8]) -> &[u8] {
+    let mut in_double = false;
+    let mut in_single = false;
+    let mut prev_ws = true; // start of line counts as a word boundary
+    let mut i = 0;
+    while i < line.len() {
+        let b = line[i];
+        if in_double {
+            // Handle escapes inside double quotes
+            if b == b'\\' && i + 1 < line.len() {
+                i += 2;
+                continue;
+            }
+            if b == b'"' {
+                in_double = false;
+            }
+            prev_ws = false;
+        } else if in_single {
+            if b == b'\'' {
+                in_single = false;
+            }
+            prev_ws = false;
+        } else if b == b'"' {
+            in_double = true;
+            prev_ws = false;
+        } else if b == b'\'' {
+            in_single = true;
+            prev_ws = false;
+        } else if b == b'#' && prev_ws {
+            return &line[..i];
+        } else {
+            prev_ws = b == b' ' || b == b'\t';
+        }
+        i += 1;
+    }
+    line
+}
+
+/// Strip comment lines and inline `#` comments from script file content.
+/// Handles `#` comments for YAML/shell/Ruby/Makefile-style files. Preserves
+/// non-comment content so byte offsets for downstream scanners remain meaningful.
+///
+/// Returns a borrowed slice when no `#` is present anywhere in the input,
+/// avoiding an allocation for the common case.
+fn strip_comment_lines(content: &[u8]) -> Cow<'_, [u8]> {
+    // Fast path: if there's no `#` at all, nothing to strip.
+    if memchr::memchr(b'#', content).is_none() {
+        return Cow::Borrowed(content);
+    }
+
     let mut result = Vec::with_capacity(content.len());
     let mut i = 0;
     while i < content.len() {
-        // Find end of line
         let line_start = i;
         while i < content.len() && content[i] != b'\n' {
             i += 1;
         }
         let line_end = i;
         if i < content.len() {
-            i += 1; // skip \n
+            i += 1; // consume \n
         }
 
-        // Check if line is a comment (starts with # after whitespace)
-        let mut j = line_start;
-        while j < line_end && (content[j] == b' ' || content[j] == b'\t') {
-            j += 1;
-        }
-        if j < line_end && content[j] == b'#' {
-            // Replace with blank line to preserve structure
+        let line = &content[line_start..line_end];
+        let kept = strip_inline_comment(line);
+        result.extend_from_slice(kept);
+        if line_end < content.len() {
             result.push(b'\n');
-        } else {
-            result.extend_from_slice(&content[line_start..line_end]);
-            if line_end < content.len() {
-                result.push(b'\n');
-            }
         }
     }
-    result
+    Cow::Owned(result)
 }
 
 /// Scan non-Ruby files (Makefile, Dockerfile, CI configs, scripts)
@@ -175,16 +256,18 @@ pub fn scan_scripts_for_gem_usage(
     let ac = AhoCorasick::new(gem_names).unwrap();
 
     // Process pre-collected script files in parallel
+    let num_patterns = gem_names.len();
     let per_file_refs: Vec<Vec<(String, String)>> = script_files
         .par_iter()
         .filter_map(|(rel_path, content)| {
             let mut refs = Vec::new();
 
-            // Strip comment lines to avoid matching gem names in comments
+            // Strip comment lines/inline comments to avoid matching gem names in comments
             let stripped = strip_comment_lines(content);
+            let stripped: &[u8] = stripped.as_ref();
 
             // Byte scanner: bundle exec
-            for cmd in scan_bundle_exec(&stripped) {
+            for cmd in scan_bundle_exec(stripped) {
                 if gem_name_set.contains(cmd.as_str()) {
                     refs.push((cmd, rel_path.clone()));
                 } else if let Some(gem_name) = exe_to_gem.get(&cmd) {
@@ -193,7 +276,7 @@ pub fn scan_scripts_for_gem_usage(
             }
 
             // Byte scanner: bin/ references
-            for cmd in scan_bin_refs(&stripped) {
+            for cmd in scan_bin_refs(stripped) {
                 if gem_name_set.contains(cmd.as_str()) {
                     refs.push((cmd, rel_path.clone()));
                 } else if let Some(gem_name) = exe_to_gem.get(&cmd) {
@@ -201,24 +284,27 @@ pub fn scan_scripts_for_gem_usage(
                 }
             }
 
-            // AhoCorasick: gem name byte match with manual word boundaries
-            let mut seen = HashSet::new();
-            for mat in ac.find_overlapping_iter(&stripped) {
+            // AhoCorasick: gem name byte match with manual word boundaries.
+            // Treat `-` and `_` as part of the gem token so that "rack" inside
+            // "rack-mini-profiler" does NOT count as a match for the "rack" gem.
+            let mut seen = vec![false; num_patterns];
+            for mat in ac.find_overlapping_iter(stripped) {
                 let pid = mat.pattern().as_usize();
-                if !seen.insert(pid) {
+                if seen[pid] {
                     continue;
                 }
                 let start = mat.start();
                 let end = mat.end();
                 let before_ok = start == 0 || {
                     let b = stripped[start - 1];
-                    !b.is_ascii_alphanumeric() && b != b'_'
+                    !b.is_ascii_alphanumeric() && b != b'_' && b != b'-'
                 };
                 let after_ok = end >= stripped.len() || {
                     let b = stripped[end];
-                    !b.is_ascii_alphanumeric() && b != b'_'
+                    !b.is_ascii_alphanumeric() && b != b'_' && b != b'-'
                 };
                 if before_ok && after_ok {
+                    seen[pid] = true;
                     refs.push((gem_names[pid].clone(), rel_path.clone()));
                 }
             }
@@ -262,8 +348,15 @@ fn build_exe_to_gem_map(
         .par_iter()
         .flat_map(|(gem_name, gem_dir)| {
             let mut exes = Vec::new();
-            let pattern = gem_dir.join("*.gemspec").display().to_string();
-            for spec_path in glob::glob(&pattern).into_iter().flatten().flatten() {
+            let rd = match std::fs::read_dir(gem_dir) {
+                Ok(rd) => rd,
+                Err(_) => return exes,
+            };
+            for entry in rd.flatten() {
+                let spec_path = entry.path();
+                if spec_path.extension().and_then(|s| s.to_str()) != Some("gemspec") {
+                    continue;
+                }
                 if let Ok(content) = std::fs::read_to_string(&spec_path) {
                     if let Some(cap) = EXE_RE.captures(&content) {
                         for exe in cap[1].split(',') {
@@ -696,5 +789,204 @@ mod tests {
         // "bundle execute" should not match
         let results = scan_bundle_exec(b"bundle execute rspec\n");
         assert!(results.is_empty());
+    }
+
+    // ── inline comment stripping (fix #1) ──
+
+    #[test]
+    fn strip_comments_inline_yaml() {
+        // Inline `#` after whitespace should be stripped
+        let input = b"  - run: bundle exec minitest  # rspec was removed\n";
+        let stripped = strip_comment_lines(input);
+        let s = String::from_utf8_lossy(&stripped);
+        assert!(s.contains("minitest"), "minitest must remain");
+        assert!(!s.contains("rspec"), "inline comment with rspec must be stripped");
+    }
+
+    #[test]
+    fn strip_comments_inline_preserves_hash_in_double_quotes() {
+        // `#` inside a double-quoted string is NOT a comment
+        let input = b"  url: \"https://example.com/#anchor\"\n";
+        let stripped = strip_comment_lines(input);
+        let s = String::from_utf8_lossy(&stripped);
+        assert!(s.contains("#anchor"), "fragment inside quotes must be preserved");
+    }
+
+    #[test]
+    fn strip_comments_inline_preserves_hash_in_single_quotes() {
+        let input = b"  - run: echo 'foo#bar' # trailing\n";
+        let stripped = strip_comment_lines(input);
+        let s = String::from_utf8_lossy(&stripped);
+        assert!(s.contains("foo#bar"), "hash inside single quotes preserved");
+        assert!(!s.contains("trailing"), "trailing comment stripped");
+    }
+
+    #[test]
+    fn strip_comments_inline_no_strip_without_whitespace() {
+        // `#` not preceded by whitespace shouldn't be treated as a comment
+        // (e.g., "id=#123" or anchor-like tokens)
+        let input = b"label=foo#bar\n";
+        let stripped = strip_comment_lines(input);
+        let s = String::from_utf8_lossy(&stripped);
+        assert!(s.contains("foo#bar"), "hash without leading ws is preserved");
+    }
+
+    #[test]
+    fn strip_comments_returns_borrowed_when_no_hash() {
+        let input = b"steps:\n  - run: bundle exec rspec\n";
+        let stripped = strip_comment_lines(input);
+        // No `#` anywhere → must be Borrowed (zero-copy fast path)
+        assert!(matches!(stripped, Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn strip_comments_returns_owned_when_hash_present() {
+        let input = b"# comment\nbundle exec rspec\n";
+        let stripped = strip_comment_lines(input);
+        assert!(matches!(stripped, Cow::Owned(_)));
+    }
+
+    #[test]
+    fn script_scan_ignores_inline_gem_comment() {
+        // End-to-end: gem appearing only in an inline comment must not be marked used
+        let script_files = vec![(
+            ".github/workflows/ci.yml".to_string(),
+            b"steps:\n  - run: bundle exec minitest  # rspec was removed\n".to_vec(),
+        )];
+        let gem_names = vec!["rspec".to_string(), "minitest".to_string()];
+        let gem_index = HashMap::new();
+        let results =
+            scan_scripts_for_gem_usage(Path::new("."), &gem_names, &gem_index, &script_files);
+        assert!(
+            !results.contains_key("rspec"),
+            "rspec in inline comment must not be matched"
+        );
+        assert!(
+            results.contains_key("minitest"),
+            "minitest in command should be matched"
+        );
+    }
+
+    // ── is_script_file expanded coverage (fix #2) ──
+
+    #[test]
+    fn script_file_buildkite() {
+        assert!(is_script_file(".buildkite/pipeline.yml", "pipeline.yml"));
+        assert!(is_script_file(
+            ".buildkite/steps/test.yaml",
+            "test.yaml"
+        ));
+    }
+
+    #[test]
+    fn script_file_drone() {
+        assert!(is_script_file(".drone.yml", ".drone.yml"));
+        assert!(is_script_file(".drone.yaml", ".drone.yaml"));
+    }
+
+    #[test]
+    fn script_file_jenkinsfile() {
+        assert!(is_script_file("Jenkinsfile", "Jenkinsfile"));
+        assert!(is_script_file("ci/Jenkinsfile", "Jenkinsfile"));
+        assert!(is_script_file("Jenkinsfile.release", "Jenkinsfile.release"));
+    }
+
+    #[test]
+    fn script_file_bitbucket() {
+        assert!(is_script_file("bitbucket-pipelines.yml", "bitbucket-pipelines.yml"));
+        assert!(is_script_file("bitbucket-pipelines.yaml", "bitbucket-pipelines.yaml"));
+    }
+
+    #[test]
+    fn script_file_azure_pipelines() {
+        assert!(is_script_file("azure-pipelines.yml", "azure-pipelines.yml"));
+        assert!(is_script_file("azure-pipelines.yaml", "azure-pipelines.yaml"));
+        assert!(is_script_file(
+            ".azure-pipelines/build.yml",
+            "build.yml"
+        ));
+    }
+
+    #[test]
+    fn script_file_earthfile() {
+        assert!(is_script_file("Earthfile", "Earthfile"));
+    }
+
+    #[test]
+    fn script_file_justfile() {
+        assert!(is_script_file("Justfile", "Justfile"));
+        assert!(is_script_file("justfile", "justfile"));
+        assert!(is_script_file(".justfile", ".justfile"));
+    }
+
+    #[test]
+    fn script_file_taskfile() {
+        assert!(is_script_file("Taskfile.yml", "Taskfile.yml"));
+        assert!(is_script_file("Taskfile.yaml", "Taskfile.yaml"));
+    }
+
+    #[test]
+    fn script_file_top_level_shell() {
+        assert!(is_script_file("setup.sh", "setup.sh"));
+        assert!(is_script_file("run.bash", "run.bash"));
+        assert!(is_script_file("test.bats", "test.bats"));
+    }
+
+    #[test]
+    fn script_file_nested_shell_not_top_level() {
+        // Outside script/ scripts/ bin/ a nested shell file should not match
+        assert!(!is_script_file("vendor/setup.sh", "setup.sh"));
+        // But under script/ it does (existing rule)
+        assert!(is_script_file("script/setup.sh", "setup.sh"));
+    }
+
+    #[test]
+    fn script_file_mise_and_tool_versions() {
+        assert!(is_script_file("mise.toml", "mise.toml"));
+        assert!(is_script_file(".mise.toml", ".mise.toml"));
+        assert!(is_script_file(".tool-versions", ".tool-versions"));
+    }
+
+    // ── AhoCorasick word boundary: hyphen is part of the gem token (fix #3) ──
+
+    #[test]
+    fn script_scan_rack_mini_profiler_does_not_match_rack() {
+        let script_files = vec![(
+            "Makefile".to_string(),
+            b"profile:\n\tbundle exec rack-mini-profiler\n".to_vec(),
+        )];
+        let gem_names = vec!["rack".to_string(), "rack-mini-profiler".to_string()];
+        let gem_index = HashMap::new();
+        let results =
+            scan_scripts_for_gem_usage(Path::new("."), &gem_names, &gem_index, &script_files);
+        assert!(
+            results.contains_key("rack-mini-profiler"),
+            "rack-mini-profiler must be matched"
+        );
+        assert!(
+            !results.contains_key("rack"),
+            "rack must NOT be matched as a substring of rack-mini-profiler"
+        );
+    }
+
+    #[test]
+    fn script_scan_rack_alone_still_matches() {
+        // Standalone "rack" reference still works
+        let script_files = vec![(
+            "config/puma.rb".to_string(),
+            b"# load rack middleware\nrequire 'rack'\nuse rack\n".to_vec(),
+        )];
+        let gem_names = vec!["rack".to_string()];
+        let gem_index = HashMap::new();
+        let script_files: Vec<(String, Vec<u8>)> = script_files.into_iter().collect();
+        // Use a path that is_script_file recognises so the scanner runs.
+        // Actually scan_scripts_for_gem_usage operates on whatever we hand it,
+        // independent of is_script_file.
+        let results =
+            scan_scripts_for_gem_usage(Path::new("."), &gem_names, &gem_index, &script_files);
+        assert!(
+            results.contains_key("rack"),
+            "standalone rack reference must still match"
+        );
     }
 }

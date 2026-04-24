@@ -1,15 +1,18 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use rayon::prelude::*;
 
 use crate::types::{Evidence, GemEntry, GemResult, GemStatus, ScanResults};
 
+/// Entry stored per top-level module segment: (lowercased_full_name, original_name, files).
+type ModuleEntry<'a> = (String, String, &'a HashSet<String>);
+
 /// Shared indexes built once from scan results and reused across all gem matching.
 struct MatchIndexes<'a> {
     requires: &'a HashMap<String, HashSet<String>>,
     prefix_map: HashMap<&'a str, Vec<(&'a str, &'a HashSet<String>)>>,
-    /// (lowercased_name, original_name, files)
-    modules_indexed: Vec<(String, String, &'a HashSet<String>)>,
+    /// Modules keyed by the lowercased top "::" segment of the module name.
+    modules_by_top: HashMap<String, Vec<ModuleEntry<'a>>>,
     bundler_groups: &'a HashSet<String>,
     bundler_require_all: bool,
 }
@@ -27,32 +30,64 @@ impl<'a> MatchIndexes<'a> {
                 .push((req_name.as_str(), files));
         }
 
-        let modules_indexed: Vec<(String, String, &HashSet<String>)> = scan_results
-            .modules
-            .iter()
-            .map(|(name, files)| (name.to_lowercase(), name.clone(), files))
-            .collect();
+        let mut modules_by_top: HashMap<String, Vec<ModuleEntry>> = HashMap::new();
+        for (name, files) in &scan_results.modules {
+            let lowered = name.to_lowercase();
+            let top = lowered
+                .split("::")
+                .next()
+                .unwrap_or(lowered.as_str())
+                .to_string();
+            modules_by_top
+                .entry(top)
+                .or_default()
+                .push((lowered, name.clone(), files));
+        }
 
         MatchIndexes {
             requires,
             prefix_map,
-            modules_indexed,
+            modules_by_top,
             bundler_groups: &scan_results.bundler_groups,
             bundler_require_all: scan_results.bundler_require_all,
         }
     }
 }
 
+/// Per-gem precomputed lowercased forms used during matching.
+struct GemMeta {
+    name_lower: String,
+    simple: String,
+    segments_lower: Vec<String>,
+}
+
+impl GemMeta {
+    fn for_gem(gem: &GemEntry) -> Self {
+        let name_lower = gem.name.to_lowercase();
+        let simple = gem.name.replace(['-', '_'], "").to_lowercase();
+        let segments_lower = gem.name.split('-').map(|s| s.to_lowercase()).collect();
+        GemMeta {
+            name_lower,
+            simple,
+            segments_lower,
+        }
+    }
+}
+
 /// Build a single GemResult for one gem entry against the shared indexes.
-fn build_gem_result(gem_entry: &GemEntry, indexes: &MatchIndexes<'_>) -> GemResult {
+fn build_gem_result(
+    gem_entry: &GemEntry,
+    meta: &GemMeta,
+    indexes: &MatchIndexes<'_>,
+) -> GemResult {
     let mut found_files: HashSet<String> = HashSet::new();
-    let mut evidence: Vec<Evidence> = Vec::new();
+    let mut evidence: BTreeSet<Evidence> = BTreeSet::new();
 
     // Check each require path for this gem
     for req_path in &gem_entry.require_paths {
         if let Some(files) = indexes.requires.get(req_path) {
             for f in files {
-                evidence.push(Evidence::Require {
+                evidence.insert(Evidence::Require {
                     path: req_path.clone(),
                     file: f.clone(),
                 });
@@ -67,7 +102,7 @@ fn build_gem_result(gem_entry: &GemEntry, indexes: &MatchIndexes<'_>) -> GemResu
             for (req_name, files) in entries {
                 if req_name.starts_with(&prefix) {
                     for f in *files {
-                        evidence.push(Evidence::Require {
+                        evidence.insert(Evidence::Require {
                             path: req_name.to_string(),
                             file: f.clone(),
                         });
@@ -78,24 +113,40 @@ fn build_gem_result(gem_entry: &GemEntry, indexes: &MatchIndexes<'_>) -> GemResu
         }
     }
 
-    // Hoist per-gem computations out of the inner module loop
-    let gem_name_lower = gem_entry.name.to_lowercase();
-    let gem_simple = gem_entry.name.replace(['-', '_'], "").to_lowercase();
-
-    // Check module/class name references against pre-lowercased source modules
+    // Check module/class name references against pre-lowercased source modules.
+    // Use the modules-by-top-segment index to limit work to candidates that share
+    // the pattern's lowercased top segment.
     for mod_pattern in &gem_entry.module_names {
         let mod_down = mod_pattern.to_lowercase();
         // Skip very short module names that cause false positives (e.g., "Cli", "Api")
-        // UNLESS they match the gem name exactly (e.g. "aws", "jwt", "csv")
-        if mod_down.len() < 4 && mod_down != gem_simple && mod_down != gem_name_lower {
+        // UNLESS they match the gem name exactly (e.g. "aws", "jwt", "csv"),
+        // its de-punctuated form, or any of its hyphen segments (>= 2 chars).
+        // This lets `Pry` match `pry-rails` / `pry-byebug` / `pry-rescue`.
+        if mod_down.len() < 4
+            && mod_down != meta.simple
+            && mod_down != meta.name_lower
+            && !(mod_down.len() >= 2 && meta.segments_lower.iter().any(|s| s == &mod_down))
+        {
             continue;
         }
-        let prefix = format!("{}::", mod_down);
 
-        for (name_down, original_name, files) in &indexes.modules_indexed {
-            if *name_down == mod_down || name_down.starts_with(&prefix) {
+        let Some(entries) = indexes.modules_by_top.get(&mod_down) else {
+            continue;
+        };
+        let mod_len = mod_down.len();
+        for (name_down, original_name, files) in entries {
+            // Match either an exact module name or a `mod_down::...` descendant,
+            // without allocating a `mod_down + "::"` string each iteration.
+            let matches = if name_down.len() == mod_len {
+                name_down == &mod_down
+            } else if name_down.len() > mod_len + 2 && name_down.starts_with(&mod_down) {
+                name_down.as_bytes()[mod_len..mod_len + 2] == *b"::"
+            } else {
+                false
+            };
+            if matches {
                 for f in *files {
-                    evidence.push(Evidence::Module {
+                    evidence.insert(Evidence::Module {
                         name: original_name.clone(),
                         file: f.clone(),
                     });
@@ -107,7 +158,7 @@ fn build_gem_result(gem_entry: &GemEntry, indexes: &MatchIndexes<'_>) -> GemResu
 
     // Determine status
     let is_bundler_required = indexes.bundler_require_all
-        && gem_entry.groups.contains(&"default".to_string())
+        && gem_entry.groups.iter().any(|g| g == "default")
         || gem_entry
             .groups
             .iter()
@@ -118,7 +169,7 @@ fn build_gem_result(gem_entry: &GemEntry, indexes: &MatchIndexes<'_>) -> GemResu
     } else if gem_entry.require_false {
         GemStatus::RequireFalse
     } else if is_bundler_required {
-        evidence.push(Evidence::BundlerRequire);
+        evidence.insert(Evidence::BundlerRequire);
         GemStatus::BundlerRequired
     } else {
         GemStatus::Unused
@@ -127,13 +178,10 @@ fn build_gem_result(gem_entry: &GemEntry, indexes: &MatchIndexes<'_>) -> GemResu
     let mut files: Vec<String> = found_files.into_iter().collect();
     files.sort();
 
-    evidence.sort();
-    evidence.dedup();
-
     GemResult {
         status,
         files,
-        evidence,
+        evidence: evidence.into_iter().collect(),
         gem: gem_entry.clone(),
     }
 }
@@ -147,11 +195,19 @@ pub fn match_gem_subset(
 ) -> HashMap<String, GemResult> {
     let indexes = MatchIndexes::build(scan_results);
 
+    // Precompute per-gem lowercased forms once (avoids repeated allocations
+    // inside the parallel match loop and per inner pattern iteration).
+    let metas: Vec<GemMeta> = indices.iter().map(|&i| GemMeta::for_gem(&gems[i])).collect();
+
     indices
         .par_iter()
-        .map(|&i| {
+        .zip(metas.par_iter())
+        .map(|(&i, meta)| {
             let gem_entry = &gems[i];
-            (gem_entry.name.clone(), build_gem_result(gem_entry, &indexes))
+            (
+                gem_entry.name.clone(),
+                build_gem_result(gem_entry, meta, &indexes),
+            )
         })
         .collect()
 }
@@ -334,6 +390,28 @@ mod tests {
         let scan = scan(&[], &[("Aws", "app.rb")]);
         let results = match_gem_usage(&gems, &scan);
         assert_eq!(results["aws"].status, GemStatus::Used);
+    }
+
+    #[test]
+    fn short_module_name_allowed_for_hyphen_segment() {
+        // "Pry" (3 chars) should match gem "pry-rails" via its first hyphen segment.
+        let gems = vec![gem("pry-rails", &[], &["Pry"])];
+        let scan = scan(&[], &[("Pry", "config/initializers/pry.rb")]);
+        let results = match_gem_usage(&gems, &scan);
+        assert_eq!(results["pry-rails"].status, GemStatus::Used);
+        assert!(results["pry-rails"]
+            .evidence
+            .iter()
+            .any(|e| matches!(e, Evidence::Module { name, .. } if name == "Pry")));
+    }
+
+    #[test]
+    fn short_module_name_allowed_for_hyphen_segment_with_descendant() {
+        // Pry::Commands should also match for `pry-byebug` via segment "pry".
+        let gems = vec![gem("pry-byebug", &[], &["Pry"])];
+        let scan = scan(&[], &[("Pry::Commands", "app.rb")]);
+        let results = match_gem_usage(&gems, &scan);
+        assert_eq!(results["pry-byebug"].status, GemStatus::Used);
     }
 
     #[test]
