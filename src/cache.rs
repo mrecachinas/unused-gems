@@ -5,7 +5,7 @@ use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
 
-const CACHE_VERSION: u32 = 4; // bumped: Bundler.require splat detection + middleware string refs
+const CACHE_VERSION: u32 = 5; // bumped: refined Bundler.require splat semantics
 const CACHE_FILE: &str = ".unused_gems_cache";
 
 #[derive(Serialize, Deserialize)]

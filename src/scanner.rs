@@ -321,6 +321,57 @@ fn build_block_comment_ranges(bytes: &[u8]) -> Vec<(usize, usize)> {
     ranges
 }
 
+fn mask_percent_q_strings(bytes: &[u8], mask: &mut [bool]) {
+    let mut i = 0;
+    while i + 2 < bytes.len() {
+        if bytes[i] != b'%' || (bytes[i + 1] != b'q' && bytes[i + 1] != b'Q') {
+            i += 1;
+            continue;
+        }
+
+        let (open, close) = match bytes[i + 2] {
+            b'{' => (b'{', b'}'),
+            b'(' => (b'(', b')'),
+            b'[' => (b'[', b']'),
+            b'<' => (b'<', b'>'),
+            _ => {
+                i += 1;
+                continue;
+            }
+        };
+
+        let content_start = i + 3;
+        let mut depth = 1usize;
+        let mut k = content_start;
+        while k < bytes.len() {
+            if bytes[k] == b'\\' {
+                k = (k + 2).min(bytes.len());
+                continue;
+            }
+            if bytes[k] == open {
+                depth += 1;
+            } else if bytes[k] == close {
+                depth -= 1;
+                if depth == 0 {
+                    for b in mask.iter_mut().take(k).skip(content_start) {
+                        *b = true;
+                    }
+                    i = k + 1;
+                    break;
+                }
+            }
+            k += 1;
+        }
+
+        if depth != 0 {
+            for b in mask.iter_mut().skip(content_start) {
+                *b = true;
+            }
+            break;
+        }
+    }
+}
+
 /// Check if position `pos` falls within a block comment range.
 #[inline]
 #[allow(dead_code)]
@@ -366,6 +417,7 @@ fn build_skip_mask(bytes: &[u8], is_ruby: bool, line_kind: LineCommentKind) -> V
                 *b = true;
             }
         }
+        mask_percent_q_strings(bytes, &mut mask);
     }
 
     // Pass 2: line-by-line walk for line comments, inline comments, strings.
@@ -716,16 +768,26 @@ fn scan_bundler_require(
         while end < bytes.len() && bytes[end] != b'\n' {
             end += 1;
         }
-        let rest = std::str::from_utf8(&bytes[after..end]).unwrap_or("").trim();
+        let rest_owned =
+            strip_inline_comment(std::str::from_utf8(&bytes[after..end]).unwrap_or(""));
+        let rest = rest_owned.trim();
         let rest_inner = rest.strip_prefix('(').map(|s| s.trim()).unwrap_or(rest);
-        if rest.is_empty()
-            || rest.starts_with('#')
-            || rest.contains("Rails.groups")
-            || rest.contains("Rails.env")
-            || rest_inner.starts_with('*')
-        {
+        let is_empty_call = rest.is_empty() || rest == "(" || rest == "()" || rest == "( )" || {
+            let r = rest_inner.trim_start();
+            let r = r.strip_prefix(')').map(|s| s.trim()).unwrap_or(r);
+            rest.starts_with('(') && r.is_empty()
+        };
+        if rest.contains("Rails.groups") || rest.contains("Rails.env") {
             *bundler_require_all = true;
         } else {
+            if is_empty_call || rest_inner.starts_with('*') {
+                bundler_groups.push("default".to_string());
+                if let Some(var) = splat_var_name(rest_inner) {
+                    if push_rails_groups_for_splat_var(bytes, var, bundler_groups) {
+                        *bundler_require_all = true;
+                    }
+                }
+            }
             for g in GROUP_SYM_RE.captures_iter(rest) {
                 bundler_groups.push(g[1].to_string());
             }
@@ -982,19 +1044,67 @@ fn scan_bundler_require_filtered(
             rest.starts_with('(') && r.is_empty()
         };
 
-        if is_empty_call
-            || rest.contains("Rails.groups")
-            || rest.contains("Rails.env")
-            || rest_inner.starts_with('*')
-        {
+        if rest.contains("Rails.groups") || rest.contains("Rails.env") {
             *bundler_require_all = true;
         } else {
+            if is_empty_call || rest_inner.starts_with('*') {
+                bundler_groups.push("default".to_string());
+                if let Some(var) = splat_var_name(rest_inner) {
+                    if push_rails_groups_for_splat_var(bytes, var, bundler_groups) {
+                        *bundler_require_all = true;
+                    }
+                }
+            }
             for g in GROUP_SYM_RE.captures_iter(rest) {
                 bundler_groups.push(g[1].to_string());
             }
         }
         pos = abs + 1;
     }
+}
+
+fn splat_var_name(rest_inner: &str) -> Option<&str> {
+    let rest = rest_inner.trim_start();
+    let rest = rest.strip_prefix('*')?.trim_start();
+    let end = rest
+        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .unwrap_or(rest.len());
+    (end > 0).then_some(&rest[..end])
+}
+
+fn push_rails_groups_for_splat_var(
+    bytes: &[u8],
+    var: &str,
+    bundler_groups: &mut Vec<String>,
+) -> bool {
+    static GROUP_SYM_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r":(\w+)").unwrap());
+    static PERCENT_W_RE: Lazy<Regex> =
+        Lazy::new(|| Regex::new(r"%w[\[\(]\s*([^\]\)]*)[\]\)]").unwrap());
+
+    let mut aliases_unfiltered_rails_groups = false;
+    for line in bytes.split(|&b| b == b'\n') {
+        let Ok(line) = std::str::from_utf8(line) else {
+            continue;
+        };
+        if !line.contains(var) || !line.contains("Rails.groups") {
+            continue;
+        }
+        let before = bundler_groups.len();
+        for cap in GROUP_SYM_RE.captures_iter(line) {
+            bundler_groups.push(cap[1].to_string());
+        }
+        for cap in PERCENT_W_RE.captures_iter(line) {
+            for group in cap[1].split_whitespace() {
+                if !group.is_empty() {
+                    bundler_groups.push(group.to_string());
+                }
+            }
+        }
+        if bundler_groups.len() == before {
+            aliases_unfiltered_rails_groups = true;
+        }
+    }
+    aliases_unfiltered_rails_groups
 }
 
 /// Strip an inline `#` comment from `s`, respecting single- and double-quoted
@@ -1036,25 +1146,37 @@ fn scan_middleware_refs(
     modules: &mut HashMap<String, HashSet<Arc<str>>>,
     rel_path: &Arc<str>,
 ) {
-    static MIDDLEWARE_FINDER: Lazy<memmem::Finder<'static>> =
-        Lazy::new(|| memmem::Finder::new(b".middleware."));
-    let mut pos = 0;
-    while let Some(idx) = MIDDLEWARE_FINDER.find(&bytes[pos..]) {
-        let abs = pos + idx;
-        if is_skipped(mask, abs) {
-            pos = abs + 1;
-            continue;
-        }
-        // Find end of line
-        let mut eol = abs;
+    let has_candidate = memmem::find(bytes, b".middleware.").is_some()
+        || memmem::find(bytes, b"middleware_stack").is_some()
+        || memmem::find(bytes, b"Rack::Builder").is_some();
+    if !has_candidate {
+        return;
+    }
+
+    let mut line_start = 0;
+    while line_start < bytes.len() {
+        let mut eol = line_start;
         while eol < bytes.len() && bytes[eol] != b'\n' {
             eol += 1;
         }
+        let line = &bytes[line_start..eol];
+        let candidate = memmem::find(line, b".middleware.")
+            .or_else(|| memmem::find(line, b"middleware_stack"))
+            .or_else(|| memmem::find(line, b"Rack::Builder"));
+        let Some(candidate) = candidate else {
+            line_start = if eol < bytes.len() { eol + 1 } else { eol };
+            continue;
+        };
+        if is_skipped(mask, line_start + candidate) {
+            line_start = if eol < bytes.len() { eol + 1 } else { eol };
+            continue;
+        }
+
         // Extract all quoted string literals from the rest of the line.
         // NOTE: we walk raw bytes here (not the mask) because string interiors
         // are exactly what the middleware scanner cares about — masking them
         // would defeat the purpose.
-        let mut i = abs + 12; // skip ".middleware."
+        let mut i = line_start + candidate;
         while i < eol {
             if bytes[i] == b'"' || bytes[i] == b'\'' {
                 let quote = bytes[i];
@@ -1082,7 +1204,7 @@ fn scan_middleware_refs(
                 i += 1;
             }
         }
-        pos = abs + 1;
+        line_start = if eol < bytes.len() { eol + 1 } else { eol };
     }
 }
 
@@ -1743,6 +1865,28 @@ mod tests {
     }
 
     #[test]
+    fn percent_q_require_is_filtered() {
+        let input = b"message = %q{\n  require 'fake_gem'\n}\nrequire 'real_gem'\n";
+        let mut results = Vec::new();
+        {
+            let __mask = build_skip_mask(input, true, LineCommentKind::Hash);
+            scan_requires_filtered(input, &__mask, &mut results);
+        }
+        assert_eq!(results, vec!["real_gem"]);
+    }
+
+    #[test]
+    fn percent_upper_q_require_is_filtered_with_nested_braces() {
+        let input = b"message = %Q{before { require 'fake_gem' } after}\nrequire 'real_gem'\n";
+        let mut results = Vec::new();
+        {
+            let __mask = build_skip_mask(input, true, LineCommentKind::Hash);
+            scan_requires_filtered(input, &__mask, &mut results);
+        }
+        assert_eq!(results, vec!["real_gem"]);
+    }
+
+    #[test]
     fn heredoc_with_dash_syntax_is_filtered() {
         let input = b"doc = <<-HEREDOC\n  require 'fake_gem'\nHEREDOC\nrequire 'real_gem'\n";
         let _block_ranges = build_block_comment_ranges(input);
@@ -2042,6 +2186,75 @@ mod tests {
         assert!(result.is_some());
         let r = result.unwrap();
         assert!(r.bundler_require_all);
+    }
+
+    #[test]
+    fn scan_file_bundler_unknown_splat_only_loads_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let rb = dir.path().join("config.rb");
+        std::fs::write(
+            &rb,
+            "bundler_groups = [:default]\nBundler.require(*bundler_groups)\n",
+        )
+        .unwrap();
+        let dir_str = dir.path().to_string_lossy().to_string();
+        let mut modules = HashMap::new();
+        let result = scan_file(rb.to_str().unwrap(), &dir_str, &mut modules);
+        assert!(result.is_some());
+        let r = result.unwrap();
+        assert!(!r.bundler_require_all);
+        assert_eq!(r.bundler_groups, vec!["default"]);
+    }
+
+    #[test]
+    fn scan_file_bundler_splat_var_uses_explicit_rails_groups() {
+        let dir = tempfile::tempdir().unwrap();
+        let rb = dir.path().join("config.rb");
+        std::fs::write(
+            &rb,
+            "bundler_groups = [:default]\n\
+             bundler_groups = bundler_groups.concat(Rails.groups(assets: %w[development test profile]))\n\
+             Bundler.require(*bundler_groups)\n",
+        )
+        .unwrap();
+        let dir_str = dir.path().to_string_lossy().to_string();
+        let mut modules = HashMap::new();
+        let result = scan_file(rb.to_str().unwrap(), &dir_str, &mut modules);
+        assert!(result.is_some());
+        let r = result.unwrap();
+        assert!(!r.bundler_require_all);
+        assert!(r.bundler_groups.contains(&"default".to_string()));
+        assert!(r.bundler_groups.contains(&"development".to_string()));
+        assert!(r.bundler_groups.contains(&"test".to_string()));
+        assert!(r.bundler_groups.contains(&"profile".to_string()));
+        assert!(!r.bundler_groups.contains(&"migrations".to_string()));
+    }
+
+    #[test]
+    fn scan_file_bundler_splat_var_aliasing_rails_groups_loads_all() {
+        let dir = tempfile::tempdir().unwrap();
+        let rb = dir.path().join("config.rb");
+        std::fs::write(&rb, "groups = Rails.groups\nBundler.require(*groups)\n").unwrap();
+        let dir_str = dir.path().to_string_lossy().to_string();
+        let mut modules = HashMap::new();
+        let result = scan_file(rb.to_str().unwrap(), &dir_str, &mut modules);
+        assert!(result.is_some());
+        let r = result.unwrap();
+        assert!(r.bundler_require_all);
+    }
+
+    #[test]
+    fn scan_file_empty_bundler_require_only_loads_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let rb = dir.path().join("config.rb");
+        std::fs::write(&rb, "Bundler.require\n").unwrap();
+        let dir_str = dir.path().to_string_lossy().to_string();
+        let mut modules = HashMap::new();
+        let result = scan_file(rb.to_str().unwrap(), &dir_str, &mut modules);
+        assert!(result.is_some());
+        let r = result.unwrap();
+        assert!(!r.bundler_require_all);
+        assert_eq!(r.bundler_groups, vec!["default"]);
     }
 
     #[test]
@@ -2371,7 +2584,8 @@ mod tests {
         let mut groups = Vec::new();
         let mut require_all = false;
         scan_bundler_require(b"Bundler.require\n", &mut groups, &mut require_all);
-        assert!(require_all);
+        assert!(!require_all);
+        assert_eq!(groups, vec!["default"]);
     }
 
     #[test]
@@ -2421,7 +2635,8 @@ mod tests {
             &mut groups,
             &mut require_all,
         );
-        assert!(require_all);
+        assert!(!require_all);
+        assert_eq!(groups, vec!["default"]);
     }
 
     #[test]
@@ -2754,10 +2969,10 @@ mod tests {
         let mut require_all = false;
         scan_bundler_require(input, &mut groups, &mut require_all);
         assert!(
-            require_all,
-            "splat local var should set bundler_require_all"
+            !require_all,
+            "splat local var should not synthesize all declared groups"
         );
-        assert!(groups.is_empty());
+        assert_eq!(groups, vec!["default"]);
     }
 
     #[test]
@@ -2864,17 +3079,38 @@ mod tests {
         );
     }
 
+    #[test]
+    fn middleware_stack_shovel_string() {
+        let input = b"config.middleware_stack << \"Bullet::Rack\"\n";
+        let mut modules: HashMap<String, HashSet<Arc<str>>> = HashMap::new();
+        let __mask = build_skip_mask(input, true, LineCommentKind::Hash);
+        let __rp: Arc<str> = Arc::from("test.rb");
+        scan_middleware_refs(input, &__mask, &mut modules, &__rp);
+        assert!(modules.contains_key("Bullet::Rack"));
+    }
+
+    #[test]
+    fn rack_builder_use_string() {
+        let input = b"Rack::Builder.new { use \"BatchLoader::Middleware\" }\n";
+        let mut modules: HashMap<String, HashSet<Arc<str>>> = HashMap::new();
+        let __mask = build_skip_mask(input, true, LineCommentKind::Hash);
+        let __rp: Arc<str> = Arc::from("test.rb");
+        scan_middleware_refs(input, &__mask, &mut modules, &__rp);
+        assert!(modules.contains_key("BatchLoader::Middleware"));
+    }
+
     // ── New tests for fixes #1–#6 ──
 
     #[test]
-    fn fix1_bundler_require_empty_parens_sets_require_all() {
-        // Fix #1: `Bundler.require()` (no args) should be treated as require-all.
+    fn fix1_bundler_require_empty_parens_loads_default() {
+        // `Bundler.require()` (no args) auto-requires only the default group.
         let input = b"Bundler.require()\n";
         let mut groups: Vec<String> = Vec::new();
         let mut require_all = false;
         let __mask = build_skip_mask(input, true, LineCommentKind::Hash);
         scan_bundler_require_filtered(input, &__mask, &mut groups, &mut require_all);
-        assert!(require_all, "empty Bundler.require() must set require_all");
+        assert!(!require_all);
+        assert_eq!(groups, vec!["default"]);
     }
 
     #[test]
@@ -2884,7 +3120,8 @@ mod tests {
         let mut require_all = false;
         let __mask = build_skip_mask(input, true, LineCommentKind::Hash);
         scan_bundler_require_filtered(input, &__mask, &mut groups, &mut require_all);
-        assert!(require_all);
+        assert!(!require_all);
+        assert_eq!(groups, vec!["default"]);
     }
 
     #[test]
@@ -2894,7 +3131,8 @@ mod tests {
         let mut require_all = false;
         let __mask = build_skip_mask(input, true, LineCommentKind::Hash);
         scan_bundler_require_filtered(input, &__mask, &mut groups, &mut require_all);
-        assert!(require_all);
+        assert!(!require_all);
+        assert_eq!(groups, vec!["default"]);
     }
 
     #[test]

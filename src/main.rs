@@ -941,6 +941,20 @@ fn resolve_module_names(
             names.push(prefix);
         }
     }
+    if !gem.name.contains('-') && gem.name.matches('_').count() >= 2 {
+        let segments: Vec<&str> = gem.name.split('_').filter(|s| !s.is_empty()).collect();
+        if segments.len() >= 3 {
+            for i in 2..segments.len() {
+                let prefix = segments[..i]
+                    .iter()
+                    .map(|s| capitalize(s))
+                    .collect::<String>();
+                if prefix.len() >= 4 {
+                    names.push(prefix);
+                }
+            }
+        }
+    }
     names.sort();
     names.dedup();
     names
@@ -960,14 +974,53 @@ fn capitalize(s: &str) -> String {
 /// `.yml.erb` source.
 fn read_yaml_or_erb(yml_path: &std::path::Path) -> Option<String> {
     if let Ok(c) = std::fs::read_to_string(yml_path) {
-        return Some(c);
+        return Some(strip_erb_blocks(&c));
     }
     let erb_path = {
         let mut s = yml_path.as_os_str().to_owned();
         s.push(".erb");
         std::path::PathBuf::from(s)
     };
-    std::fs::read_to_string(&erb_path).ok()
+    std::fs::read_to_string(&erb_path)
+        .ok()
+        .map(|c| strip_erb_blocks(&c))
+}
+
+fn strip_erb_blocks(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = String::with_capacity(input.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if let Some(start_rel) = memchr::memmem::find(&bytes[i..], b"<%") {
+            let start = i + start_rel;
+            out.push_str(&input[i..start]);
+            let body_start = start + 2;
+            if let Some(end_rel) = memchr::memmem::find(&bytes[body_start..], b"%>") {
+                let end = body_start + end_rel;
+                for &b in &bytes[start..end + 2] {
+                    if b == b'\n' {
+                        out.push('\n');
+                    } else {
+                        out.push(' ');
+                    }
+                }
+                i = end + 2;
+            } else {
+                for &b in &bytes[start..] {
+                    if b == b'\n' {
+                        out.push('\n');
+                    } else {
+                        out.push(' ');
+                    }
+                }
+                break;
+            }
+        } else {
+            out.push_str(&input[i..]);
+            break;
+        }
+    }
+    out
 }
 
 /// Scan config/database.yml (or .yml.erb) for adapter: values and map them to gem names.
@@ -978,8 +1031,9 @@ fn scan_database_adapters(dir: &std::path::Path) -> std::collections::HashMap<St
         None => return std::collections::HashMap::new(),
     };
 
-    static ADAPTER_RE: once_cell::sync::Lazy<regex::Regex> =
-        once_cell::sync::Lazy::new(|| regex::Regex::new(r"(?m)^\s*adapter:\s*(\S+)").unwrap());
+    static ADAPTER_RE: once_cell::sync::Lazy<regex::Regex> = once_cell::sync::Lazy::new(|| {
+        regex::Regex::new(r"(?m)^[ \t]*adapter:[ \t]*(\S+)").unwrap()
+    });
 
     let mut adapters = std::collections::HashMap::new();
     for cap in ADAPTER_RE.captures_iter(&content) {
@@ -1008,8 +1062,9 @@ fn scan_cable_adapters(dir: &std::path::Path) -> std::collections::HashMap<Strin
         None => return std::collections::HashMap::new(),
     };
 
-    static ADAPTER_RE: once_cell::sync::Lazy<regex::Regex> =
-        once_cell::sync::Lazy::new(|| regex::Regex::new(r"(?m)^\s*adapter:\s*(\S+)").unwrap());
+    static ADAPTER_RE: once_cell::sync::Lazy<regex::Regex> = once_cell::sync::Lazy::new(|| {
+        regex::Regex::new(r"(?m)^[ \t]*adapter:[ \t]*(\S+)").unwrap()
+    });
 
     let mut adapters = std::collections::HashMap::new();
     for cap in ADAPTER_RE.captures_iter(&content) {
@@ -1034,8 +1089,9 @@ fn scan_storage_adapters(dir: &std::path::Path) -> std::collections::HashMap<Str
         None => return std::collections::HashMap::new(),
     };
 
-    static SERVICE_RE: once_cell::sync::Lazy<regex::Regex> =
-        once_cell::sync::Lazy::new(|| regex::Regex::new(r"(?m)^\s*service:\s*(\S+)").unwrap());
+    static SERVICE_RE: once_cell::sync::Lazy<regex::Regex> = once_cell::sync::Lazy::new(|| {
+        regex::Regex::new(r"(?m)^[ \t]*service:[ \t]*(\S+)").unwrap()
+    });
 
     let mut adapters = std::collections::HashMap::new();
     for cap in SERVICE_RE.captures_iter(&content) {
@@ -1103,7 +1159,8 @@ static CURRENT_PLATFORM_SET: once_cell::sync::Lazy<std::collections::HashSet<&'s
         platforms.insert("mri");
         for v in &[
             "mri_24", "mri_25", "mri_26", "mri_27", "mri_28", "mri_29", "mri_30", "mri_31",
-            "mri_32", "mri_33", "mri_34",
+            "mri_32", "mri_33", "mri_34", "mri_35", "mri_36", "mri_37", "mri_38", "mri_39",
+            "mri_40",
         ] {
             platforms.insert(*v);
         }
@@ -1230,6 +1287,16 @@ mod tests {
     }
 
     #[test]
+    fn resolve_module_names_adds_underscore_compound_prefixes() {
+        let g = gem("active_model_serializers", &[]);
+        let idx = std::collections::HashMap::new();
+        let names = resolve_module_names(&g, &idx);
+        assert!(names.iter().any(|n| n == "ActiveModel"));
+        assert!(names.iter().any(|n| n == "ActiveModelSerializers"));
+        assert!(!names.iter().any(|n| n == "Active"));
+    }
+
+    #[test]
     fn scan_database_adapters_reads_yml_erb_when_yml_missing() {
         let tmp = tempfile::tempdir().unwrap();
         let cfg = tmp.path().join("config");
@@ -1242,6 +1309,31 @@ mod tests {
 
         let adapters = scan_database_adapters(tmp.path());
         assert_eq!(adapters.get("pg").map(|s| s.as_str()), Some("postgresql"));
+    }
+
+    #[test]
+    fn scan_database_adapters_strips_dynamic_erb_values() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = tmp.path().join("config");
+        std::fs::create_dir_all(&cfg).unwrap();
+        std::fs::write(
+            cfg.join("database.yml.erb"),
+            "default:\n  adapter: <%= ENV['DB_ADAPTER'] %>\n  replica_adapter: postgresql\n",
+        )
+        .unwrap();
+
+        let adapters = scan_database_adapters(tmp.path());
+        assert!(!adapters.contains_key("<%="));
+        assert!(adapters.is_empty());
+    }
+
+    #[test]
+    fn strip_erb_blocks_preserves_static_yaml_lines() {
+        let stripped =
+            strip_erb_blocks("<% if ENV['DATABASE_URL'] %>\n  adapter: postgresql\n<% end %>\n");
+        assert!(stripped.contains("  adapter: postgresql"));
+        assert!(!stripped.contains("<%"));
+        assert!(!stripped.contains("%>"));
     }
 
     #[test]
@@ -1298,5 +1390,6 @@ mod tests {
         assert!(p.contains("ruby"));
         assert!(p.contains("mri"));
         assert!(p.contains("mri_31"));
+        assert!(p.contains("mri_40"));
     }
 }
