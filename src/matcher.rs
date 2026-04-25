@@ -75,11 +75,7 @@ impl GemMeta {
 }
 
 /// Build a single GemResult for one gem entry against the shared indexes.
-fn build_gem_result(
-    gem_entry: &GemEntry,
-    meta: &GemMeta,
-    indexes: &MatchIndexes<'_>,
-) -> GemResult {
+fn build_gem_result(gem_entry: &GemEntry, meta: &GemMeta, indexes: &MatchIndexes<'_>) -> GemResult {
     let mut found_files: HashSet<String> = HashSet::new();
     let mut evidence: BTreeSet<Evidence> = BTreeSet::new();
 
@@ -197,7 +193,10 @@ pub fn match_gem_subset(
 
     // Precompute per-gem lowercased forms once (avoids repeated allocations
     // inside the parallel match loop and per inner pattern iteration).
-    let metas: Vec<GemMeta> = indices.iter().map(|&i| GemMeta::for_gem(&gems[i])).collect();
+    let metas: Vec<GemMeta> = indices
+        .iter()
+        .map(|&i| GemMeta::for_gem(&gems[i]))
+        .collect();
 
     indices
         .par_iter()

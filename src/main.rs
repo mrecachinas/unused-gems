@@ -157,7 +157,13 @@ fn main() {
     let ignore_file_ref = cli.ignore_file.as_deref();
     let (
         ((gem_index, vendor_path_index), (mut scan_results, cache_updates)),
-        (lock_deps, (db_adapters, (cable_adapters, (storage_adapters, (cache_config_adapters, ignore_config))))),
+        (
+            lock_deps,
+            (
+                db_adapters,
+                (cable_adapters, (storage_adapters, (cache_config_adapters, ignore_config))),
+            ),
+        ),
     ) = timed!(
         "concurrent_init",
         rayon::join(
@@ -184,14 +190,27 @@ fn main() {
                                     || timed!("scan_cable_adapters", scan_cable_adapters(&dir)),
                                     || {
                                         rayon::join(
-                                            || timed!("scan_storage_adapters", scan_storage_adapters(&dir)),
+                                            || {
+                                                timed!(
+                                                    "scan_storage_adapters",
+                                                    scan_storage_adapters(&dir)
+                                                )
+                                            },
                                             || {
                                                 rayon::join(
-                                                    || timed!("scan_cache_config", scan_cache_config(&dir)),
+                                                    || {
+                                                        timed!(
+                                                            "scan_cache_config",
+                                                            scan_cache_config(&dir)
+                                                        )
+                                                    },
                                                     || {
                                                         timed!(
                                                             "load_ignore_file",
-                                                            crate::ignore::load_ignore_file(&dir, ignore_file_ref)
+                                                            crate::ignore::load_ignore_file(
+                                                                &dir,
+                                                                ignore_file_ref
+                                                            )
                                                         )
                                                     },
                                                 )
@@ -262,8 +281,9 @@ fn main() {
                                 let meta = match cached {
                                     Some(m) => m,
                                     None => {
-                                        let computed = introspect::extract_vendor_gem_metadata(path)
-                                            .map(Arc::new);
+                                        let computed =
+                                            introspect::extract_vendor_gem_metadata(path)
+                                                .map(Arc::new);
                                         vendor_memo
                                             .lock()
                                             .unwrap()
@@ -456,11 +476,14 @@ fn main() {
             output::print_results_sarif(&results, &dir, &lock_deps)
         )
     } else {
-        timed!("output", match cli.output.as_str() {
-            "json" => output::print_results_json(&results, &lock_deps),
-            "github" => output::print_results_github(&results, &dir, &lock_deps),
-            _ => output::print_results_text(&results, cli.verbose, &lock_deps),
-        })
+        timed!(
+            "output",
+            match cli.output.as_str() {
+                "json" => output::print_results_json(&results, &lock_deps),
+                "github" => output::print_results_github(&results, &dir, &lock_deps),
+                _ => output::print_results_text(&results, cli.verbose, &lock_deps),
+            }
+        )
     };
 
     // Save cache
@@ -468,13 +491,8 @@ fn main() {
 
     let exit_code = match cli.fail_on.as_str() {
         "none" => 0,
-        "any" => {
-            if unused_count > 0 {
-                1
-            } else {
-                0
-            }
-        }
+        "any" if unused_count > 0 => 1,
+        "any" => 0,
         // "new" only meaningful in diff mode; non-diff treats as none
         _ => 0,
     };
@@ -532,14 +550,23 @@ fn resolve_require_paths(
         once_cell::sync::Lazy::new(|| {
             let mut m = std::collections::HashMap::new();
             // --- A-B ---
-            m.insert("active_model_serializers", &["active_model_serializers", "active_model/serializer"][..]);
-            m.insert("activerecord-session_store", &["active_record/session_store"][..]);
+            m.insert(
+                "active_model_serializers",
+                &["active_model_serializers", "active_model/serializer"][..],
+            );
+            m.insert(
+                "activerecord-session_store",
+                &["active_record/session_store"][..],
+            );
             m.insert("argon2", &["argon2"][..]);
             m.insert("attr_encrypted", &["attr_encrypted"][..]);
             m.insert("aws-sdk-core", &["aws-sdk-core"][..]);
             m.insert("aws-sdk-s3", &["aws-sdk-s3"][..]);
             m.insert("aws-sdk-sqs", &["aws-sdk-sqs"][..]);
-            m.insert("azure-storage-blob", &["azure/storage/blob", "azure-storage-blob"][..]);
+            m.insert(
+                "azure-storage-blob",
+                &["azure/storage/blob", "azure-storage-blob"][..],
+            );
             m.insert("batch-loader", &["batch-loader", "batch_loader"][..]);
             m.insert("bcrypt", &["bcrypt"][..]);
             m.insert("better_errors", &["better_errors"][..]);
@@ -555,7 +582,13 @@ fn resolve_require_paths(
             // --- D ---
             m.insert("dalli", &["dalli"][..]);
             m.insert("database_cleaner", &["database_cleaner"][..]);
-            m.insert("database_cleaner-active_record", &["database_cleaner/active_record", "database_cleaner-active_record"][..]);
+            m.insert(
+                "database_cleaner-active_record",
+                &[
+                    "database_cleaner/active_record",
+                    "database_cleaner-active_record",
+                ][..],
+            );
             m.insert("ddtrace", &["datadog", "ddtrace"][..]);
             m.insert("delayed_job", &["delayed_job"][..]);
             m.insert("devise", &["devise"][..]);
@@ -583,8 +616,18 @@ fn resolve_require_paths(
             m.insert("http", &["http"][..]);
             m.insert("httparty", &["httparty"][..]);
             // --- I-J ---
-            m.insert("image_processing", &["image_processing", "image_processing/vips", "image_processing/mini_magick"][..]);
-            m.insert("importmap-rails", &["importmap-rails", "importmap/rails"][..]);
+            m.insert(
+                "image_processing",
+                &[
+                    "image_processing",
+                    "image_processing/vips",
+                    "image_processing/mini_magick",
+                ][..],
+            );
+            m.insert(
+                "importmap-rails",
+                &["importmap-rails", "importmap/rails"][..],
+            );
             m.insert("jsbundling-rails", &["jsbundling-rails"][..]);
             m.insert("jwt", &["jwt"][..]);
             // --- K ---
@@ -602,12 +645,18 @@ fn resolve_require_paths(
             m.insert("nokogiri-diff", &["nokogiri/diff"][..]);
             // --- O ---
             m.insert("omniauth", &["omniauth"][..]);
-            m.insert("omniauth-oauth2", &["omniauth-oauth2", "omniauth/oauth2"][..]);
+            m.insert(
+                "omniauth-oauth2",
+                &["omniauth-oauth2", "omniauth/oauth2"][..],
+            );
             m.insert("opensearch-ruby", &["opensearch-ruby", "opensearch"][..]);
             // --- P ---
             m.insert("pagy", &["pagy"][..]);
             m.insert("pg", &["pg"][..]);
-            m.insert("premailer-rails", &["premailer/rails", "premailer-rails"][..]);
+            m.insert(
+                "premailer-rails",
+                &["premailer/rails", "premailer-rails"][..],
+            );
             m.insert("pry", &["pry"][..]);
             m.insert("pry-byebug", &["pry-byebug", "pry/byebug"][..]);
             m.insert("pry-rails", &["pry-rails"][..]);
@@ -616,10 +665,16 @@ fn resolve_require_paths(
             // --- R ---
             m.insert("rack-attack", &["rack/attack"][..]);
             m.insert("rack-cors", &["rack/cors", "rack-cors"][..]);
-            m.insert("rack-mini-profiler", &["rack-mini-profiler", "rack/mini_profiler"][..]);
+            m.insert(
+                "rack-mini-profiler",
+                &["rack-mini-profiler", "rack/mini_profiler"][..],
+            );
             m.insert("ransack", &["ransack"][..]);
             m.insert("redis", &["redis"][..]);
-            m.insert("redis-namespace", &["redis-namespace", "redis/namespace"][..]);
+            m.insert(
+                "redis-namespace",
+                &["redis-namespace", "redis/namespace"][..],
+            );
             m.insert("redis-rails", &["redis-rails", "redis/rails"][..]);
             m.insert("resque", &["resque"][..]);
             m.insert("rest-client", &["rest-client", "rest_client"][..]);
@@ -628,7 +683,10 @@ fn resolve_require_paths(
             m.insert("rspec-mocks", &["rspec/mocks"][..]);
             m.insert("rspec-rails", &["rspec/rails", "rspec-rails"][..]);
             m.insert("rubocop", &["rubocop"][..]);
-            m.insert("rubocop-performance", &["rubocop-performance", "rubocop/performance"][..]);
+            m.insert(
+                "rubocop-performance",
+                &["rubocop-performance", "rubocop/performance"][..],
+            );
             m.insert("rubocop-rails", &["rubocop-rails", "rubocop/rails"][..]);
             m.insert("rubocop-rspec", &["rubocop-rspec", "rubocop/rspec"][..]);
             m.insert("ruby-kafka", &["kafka"][..]);
@@ -643,7 +701,10 @@ fn resolve_require_paths(
             m.insert("sassc-rails", &["sassc-rails", "sassc/rails"][..]);
             m.insert("scout_apm", &["scout_apm"][..]);
             m.insert("searchkick", &["searchkick"][..]);
-            m.insert("selenium-webdriver", &["selenium-webdriver", "selenium/webdriver"][..]);
+            m.insert(
+                "selenium-webdriver",
+                &["selenium-webdriver", "selenium/webdriver"][..],
+            );
             m.insert("sidekiq", &["sidekiq"][..]);
             m.insert("sidekiq-cron", &["sidekiq-cron", "sidekiq/cron"][..]);
             m.insert("simplecov", &["simplecov"][..]);
@@ -653,7 +714,10 @@ fn resolve_require_paths(
             m.insert("solid_cache", &["solid_cache"][..]);
             m.insert("solid_queue", &["solid_queue"][..]);
             m.insert("spring", &["spring"][..]);
-            m.insert("spring-watcher-listen", &["spring-watcher-listen", "spring/watcher/listen"][..]);
+            m.insert(
+                "spring-watcher-listen",
+                &["spring-watcher-listen", "spring/watcher/listen"][..],
+            );
             m.insert("sqlite3", &["sqlite3"][..]);
             m.insert("stackprof", &["stackprof"][..]);
             m.insert("stimulus-rails", &["stimulus-rails", "stimulus/rails"][..]);
@@ -714,9 +778,15 @@ fn resolve_module_names(
     static KNOWN_MODULE_NAMES: once_cell::sync::Lazy<std::collections::HashMap<&str, &[&str]>> =
         once_cell::sync::Lazy::new(|| {
             let mut m = std::collections::HashMap::new();
-            m.insert("active_model_serializers", &["ActiveModel::Serializer", "ActiveModelSerializers"][..]);
+            m.insert(
+                "active_model_serializers",
+                &["ActiveModel::Serializer", "ActiveModelSerializers"][..],
+            );
             m.insert("activerecord-import", &["ActiveRecord::Import"][..]);
-            m.insert("activerecord-session_store", &["ActiveRecord::SessionStore"][..]);
+            m.insert(
+                "activerecord-session_store",
+                &["ActiveRecord::SessionStore"][..],
+            );
             m.insert("argon2", &["Argon2"][..]);
             m.insert("aws-sdk-cloudwatch", &["Aws::CloudWatch"][..]);
             m.insert("aws-sdk-core", &["Aws"][..]);
@@ -732,8 +802,14 @@ fn resolve_module_names(
             m.insert("concurrent-ruby", &["Concurrent"][..]);
             m.insert("dalli", &["Dalli"][..]);
             m.insert("database_cleaner", &["DatabaseCleaner"][..]);
-            m.insert("database_cleaner-active_record", &["DatabaseCleaner::ActiveRecord", "DatabaseCleaner"][..]);
-            m.insert("database_cleaner-redis", &["DatabaseCleaner::Redis", "DatabaseCleaner"][..]);
+            m.insert(
+                "database_cleaner-active_record",
+                &["DatabaseCleaner::ActiveRecord", "DatabaseCleaner"][..],
+            );
+            m.insert(
+                "database_cleaner-redis",
+                &["DatabaseCleaner::Redis", "DatabaseCleaner"][..],
+            );
             m.insert("delayed_job", &["Delayed::Job", "DelayedJob"][..]);
             m.insert("devise", &["Devise"][..]);
             m.insert("doorkeeper", &["Doorkeeper"][..]);
@@ -766,7 +842,10 @@ fn resolve_module_names(
             m.insert("net-http-persistent", &["Net::HTTP::Persistent"][..]);
             m.insert("nokogiri", &["Nokogiri"][..]);
             m.insert("omniauth", &["OmniAuth"][..]);
-            m.insert("omniauth-oauth2", &["OmniAuth::Strategies::OAuth2", "OmniAuth"][..]);
+            m.insert(
+                "omniauth-oauth2",
+                &["OmniAuth::Strategies::OAuth2", "OmniAuth"][..],
+            );
             m.insert("pagy", &["Pagy"][..]);
             m.insert("parallel", &["Parallel"][..]);
             m.insert("parallel_tests", &["ParallelTests"][..]);
@@ -789,7 +868,10 @@ fn resolve_module_names(
             m.insert("rspec-mocks", &["RSpec::Mocks", "RSpec"][..]);
             m.insert("rspec-rails", &["RSpec", "RSpec::Rails"][..]);
             m.insert("rubocop-ast", &["RuboCop::AST", "RuboCop"][..]);
-            m.insert("rubocop-performance", &["RuboCop::Performance", "RuboCop"][..]);
+            m.insert(
+                "rubocop-performance",
+                &["RuboCop::Performance", "RuboCop"][..],
+            );
             m.insert("rubocop-rails", &["RuboCop::Rails", "RuboCop"][..]);
             m.insert("rubocop-rspec", &["RuboCop::RSpec", "RuboCop"][..]);
             m.insert("ruby-vips", &["Vips"][..]);
@@ -974,9 +1056,8 @@ fn scan_storage_adapters(dir: &std::path::Path) -> std::collections::HashMap<Str
 
 /// Scan config/environments/*.rb and config/application.rb for cache_store settings.
 fn scan_cache_config(dir: &std::path::Path) -> std::collections::HashMap<String, String> {
-    static CACHE_RE: once_cell::sync::Lazy<regex::Regex> = once_cell::sync::Lazy::new(|| {
-        regex::Regex::new(r"cache_store\s*=\s*:(\w+)").unwrap()
-    });
+    static CACHE_RE: once_cell::sync::Lazy<regex::Regex> =
+        once_cell::sync::Lazy::new(|| regex::Regex::new(r"cache_store\s*=\s*:(\w+)").unwrap());
 
     let mut adapters = std::collections::HashMap::new();
     let mut files_to_check = vec![dir.join("config").join("application.rb")];
@@ -1199,7 +1280,11 @@ mod tests {
         let cfg = tmp.path().join("config");
         std::fs::create_dir_all(&cfg).unwrap();
         std::fs::write(cfg.join("database.yml"), "default:\n  adapter: mysql2\n").unwrap();
-        std::fs::write(cfg.join("database.yml.erb"), "default:\n  adapter: postgresql\n").unwrap();
+        std::fs::write(
+            cfg.join("database.yml.erb"),
+            "default:\n  adapter: postgresql\n",
+        )
+        .unwrap();
 
         let adapters = scan_database_adapters(tmp.path());
         // .yml takes precedence

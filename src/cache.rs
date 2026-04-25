@@ -105,9 +105,7 @@ impl FileCache {
         let duration = mtime.duration_since(SystemTime::UNIX_EPOCH).ok()?;
         let mtime_secs = duration.as_secs();
         let mtime_nanos = duration.subsec_nanos();
-        if entry.mtime_secs != mtime_secs
-            || entry.mtime_nanos != mtime_nanos
-            || entry.size != size
+        if entry.mtime_secs != mtime_secs || entry.mtime_nanos != mtime_nanos || entry.size != size
         {
             return None;
         }

@@ -98,10 +98,7 @@ pub fn print_results_text(
     }
 
     if !cats.platform_excluded.is_empty() {
-        println!(
-            "ℹ️  Platform-excluded ({})",
-            cats.platform_excluded.len()
-        );
+        println!("ℹ️  Platform-excluded ({})", cats.platform_excluded.len());
         println!();
         let names: Vec<&str> = cats.platform_excluded.iter().map(|(n, _)| *n).collect();
         println!("  {}", names.join(", "));
@@ -156,7 +153,10 @@ pub fn print_results_text(
             parts.push(format!("{} ignored", cats.ignored.len()));
         }
         if !cats.platform_excluded.is_empty() {
-            parts.push(format!("{} platform-excluded", cats.platform_excluded.len()));
+            parts.push(format!(
+                "{} platform-excluded",
+                cats.platform_excluded.len()
+            ));
         }
         if parts.is_empty() {
             String::new()

@@ -221,7 +221,9 @@ impl<'s> Visit<'_> for GemfileVisitor<'s> {
             ruby_prism::visit_call_node(self, node);
             self.current_groups.truncate(prev_len);
             return;
-        } else if (name_bytes == b"platforms" || name_bytes == b"platform") && node.receiver().is_none() {
+        } else if (name_bytes == b"platforms" || name_bytes == b"platform")
+            && node.receiver().is_none()
+        {
             let platforms = self.extract_platform_names(node);
             let prev_len = self.current_platforms.len();
             self.current_platforms.extend(platforms);
@@ -238,7 +240,9 @@ impl<'s> Visit<'_> for GemfileVisitor<'s> {
                         if call.name().as_slice() == b"expand_path" {
                             if let Some(inner_args) = call.arguments() {
                                 if let Some(inner_first) = inner_args.arguments().iter().next() {
-                                    if let Some(path) = extract_string_value(&inner_first, self.source) {
+                                    if let Some(path) =
+                                        extract_string_value(&inner_first, self.source)
+                                    {
                                         self.eval_gemfiles.push(path);
                                     }
                                 }
@@ -731,7 +735,8 @@ end
 
     #[test]
     fn merges_nested_platforms_and_groups() {
-        let gems = parse_gems("platforms :mingw do\n  group :development do\n    gem 'x'\n  end\nend\n");
+        let gems =
+            parse_gems("platforms :mingw do\n  group :development do\n    gem 'x'\n  end\nend\n");
         let g = find_gem(&gems, "x");
         assert_eq!(g.platforms, vec!["mingw"]);
         assert!(g.groups.contains(&"development".to_string()));

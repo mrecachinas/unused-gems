@@ -731,7 +731,9 @@ pub fn build_vendor_cache_path_index(project_dir: &Path) -> HashMap<String, Path
             }
         }
     }
-    best.into_iter().map(|(name, (_, path))| (name, path)).collect()
+    best.into_iter()
+        .map(|(name, (_, path))| (name, path))
+        .collect()
 }
 
 /// Extract metadata (require_paths, executables) from a single `.gem` tarball.
@@ -1064,11 +1066,7 @@ mod tests {
         std::fs::create_dir_all(&sub_dir).unwrap();
         std::fs::write(lib_dir.join("mygem.rb"), "module MyGem\nend\n").unwrap();
         // A sibling top-level rb file that is NOT the gem entry — must be ignored.
-        std::fs::write(
-            lib_dir.join("unrelated.rb"),
-            "module Unrelated\nend\n",
-        )
-        .unwrap();
+        std::fs::write(lib_dir.join("unrelated.rb"), "module Unrelated\nend\n").unwrap();
         std::fs::write(
             sub_dir.join("base.rb"),
             "class MyGem::Base\nend\nclass MyGem::Configuration\nend\n",
@@ -1088,11 +1086,7 @@ mod tests {
         let gem_dir = gems_dir.join("google-cloud-1.0.0");
         let lib_dir = gem_dir.join("lib");
         std::fs::create_dir_all(&lib_dir).unwrap();
-        std::fs::write(
-            lib_dir.join("google_cloud.rb"),
-            "module GoogleCloud\nend\n",
-        )
-        .unwrap();
+        std::fs::write(lib_dir.join("google_cloud.rb"), "module GoogleCloud\nend\n").unwrap();
 
         let index = build_gem_index(&[dir.path().to_path_buf()]);
         let modules = discover_gem_module_names("google-cloud", &index);
@@ -1692,7 +1686,10 @@ mod tests {
             index["nokogiri"],
             cache_dir.join("nokogiri-1.16.0-x86_64-linux.gem")
         );
-        assert_eq!(index["aws-sdk-s3"], cache_dir.join("aws-sdk-s3-1.143.0.gem"));
+        assert_eq!(
+            index["aws-sdk-s3"],
+            cache_dir.join("aws-sdk-s3-1.143.0.gem")
+        );
         assert!(!index.contains_key("README"));
     }
 

@@ -15,8 +15,7 @@ static RUBOCOP_RE: Lazy<BytesRegex> =
     Lazy::new(|| BytesRegex::new(r"(?m)^\s*-\s*(rubocop[\w-]*)").unwrap());
 static YAML_REQUIRE_BLOCK_RE: Lazy<BytesRegex> =
     Lazy::new(|| BytesRegex::new(r"(?:require|plugins):\s*\n((?:\s*-\s*.+\n)*)").unwrap());
-static YAML_ITEM_RE: Lazy<BytesRegex> =
-    Lazy::new(|| BytesRegex::new(r"(?m)^\s*-\s*(.+)").unwrap());
+static YAML_ITEM_RE: Lazy<BytesRegex> = Lazy::new(|| BytesRegex::new(r"(?m)^\s*-\s*(.+)").unwrap());
 static INHERIT_GEM_RE: Lazy<BytesRegex> =
     Lazy::new(|| BytesRegex::new(r"inherit_gem:\s*\n((?:\s+\S+:\s*\n(?:\s+-.+\n)*)*)").unwrap());
 static INHERIT_GEM_KEY_RE: Lazy<BytesRegex> =
@@ -26,14 +25,12 @@ static INHERIT_GEM_KEY_RE: Lazy<BytesRegex> =
 static NEWLINE_BEGIN_FINDER: Lazy<memmem::Finder<'static>> =
     Lazy::new(|| memmem::Finder::new(b"\n=begin"));
 static BEGIN_FINDER: Lazy<memmem::Finder<'static>> = Lazy::new(|| memmem::Finder::new(b"=begin"));
-static HEREDOC_FINDER: Lazy<memmem::Finder<'static>> =
-    Lazy::new(|| memmem::Finder::new(b"<<"));
+static HEREDOC_FINDER: Lazy<memmem::Finder<'static>> = Lazy::new(|| memmem::Finder::new(b"<<"));
 static REQUIRE_FINDER: Lazy<memmem::Finder<'static>> =
     Lazy::new(|| memmem::Finder::new(b"require"));
 static AUTOLOAD_FINDER: Lazy<memmem::Finder<'static>> =
     Lazy::new(|| memmem::Finder::new(b"autoload"));
-static GEM_DOT_FINDER: Lazy<memmem::Finder<'static>> =
-    Lazy::new(|| memmem::Finder::new(b"Gem."));
+static GEM_DOT_FINDER: Lazy<memmem::Finder<'static>> = Lazy::new(|| memmem::Finder::new(b"Gem."));
 static BUNDLER_REQUIRE_FINDER: Lazy<memmem::Finder<'static>> =
     Lazy::new(|| memmem::Finder::new(b"Bundler.require"));
 
@@ -392,9 +389,7 @@ fn build_skip_mask(bytes: &[u8], is_ruby: bool, line_kind: LineCommentKind) -> V
         let line_is_comment = match line_kind {
             LineCommentKind::Hash => ws < eol && bytes[ws] == b'#',
             LineCommentKind::Slash => ws < eol && bytes[ws] == b'/',
-            LineCommentKind::DashHash => {
-                ws + 1 < eol && bytes[ws] == b'-' && bytes[ws + 1] == b'#'
-            }
+            LineCommentKind::DashHash => ws + 1 < eol && bytes[ws] == b'-' && bytes[ws + 1] == b'#',
         };
 
         if line_is_comment {
@@ -743,11 +738,7 @@ fn scan_bundler_require(
 /// using a precomputed `mask`. For non-Ruby files the caller still passes a
 /// mask built with appropriate `LineCommentKind` so YAML `#` comments etc.
 /// continue to be filtered.
-fn scan_requires_filtered(
-    bytes: &[u8],
-    mask: &[bool],
-    results: &mut Vec<String>,
-) {
+fn scan_requires_filtered(bytes: &[u8], mask: &[bool], results: &mut Vec<String>) {
     let mut pos = 0;
     while let Some(idx) = REQUIRE_FINDER.find(&bytes[pos..]) {
         let abs = pos + idx;
@@ -781,11 +772,7 @@ fn scan_requires_filtered(
     }
 }
 
-fn scan_autoloads_filtered(
-    bytes: &[u8],
-    mask: &[bool],
-    results: &mut Vec<String>,
-) {
+fn scan_autoloads_filtered(bytes: &[u8], mask: &[bool], results: &mut Vec<String>) {
     let mut pos = 0;
     while let Some(idx) = AUTOLOAD_FINDER.find(&bytes[pos..]) {
         let abs = pos + idx;
@@ -836,11 +823,7 @@ fn scan_autoloads_filtered(
     }
 }
 
-fn scan_gem_bin_filtered(
-    bytes: &[u8],
-    mask: &[bool],
-    results: &mut Vec<String>,
-) {
+fn scan_gem_bin_filtered(bytes: &[u8], mask: &[bool], results: &mut Vec<String>) {
     let mut pos = 0;
     while let Some(idx) = GEM_DOT_FINDER.find(&bytes[pos..]) {
         let abs = pos + idx;
@@ -993,15 +976,11 @@ fn scan_bundler_require_filtered(
         // Fix #1: `Bundler.require`, `Bundler.require()`, `Bundler.require( )`
         // and `Bundler.require(\n)` all mean "auto-require the :default group".
         // Detect the "no args" form before falling through to group extraction.
-        let is_empty_call = rest.is_empty()
-            || rest == "("
-            || rest == "()"
-            || rest == "( )"
-            || {
-                let r = rest_inner.trim_start();
-                let r = r.strip_prefix(')').map(|s| s.trim()).unwrap_or(r);
-                rest.starts_with('(') && r.is_empty()
-            };
+        let is_empty_call = rest.is_empty() || rest == "(" || rest == "()" || rest == "( )" || {
+            let r = rest_inner.trim_start();
+            let r = r.strip_prefix(')').map(|s| s.trim()).unwrap_or(r);
+            rest.starts_with('(') && r.is_empty()
+        };
 
         if is_empty_call
             || rest.contains("Rails.groups")
@@ -1042,9 +1021,7 @@ fn strip_inline_comment(s: &str) -> String {
             continue;
         }
         if b == b'#' {
-            return std::str::from_utf8(&bytes[..i])
-                .unwrap_or("")
-                .to_string();
+            return std::str::from_utf8(&bytes[..i]).unwrap_or("").to_string();
         }
         i += 1;
     }
@@ -1292,9 +1269,7 @@ pub fn scan_source_tree(
                                         let new_modules: Vec<String> = flush_buf
                                             .local_modules
                                             .iter()
-                                            .filter(|(_, files)| {
-                                                files.contains(&rel_for_filter)
-                                            })
+                                            .filter(|(_, files)| files.contains(&rel_for_filter))
                                             .map(|(name, _)| name.clone())
                                             .collect();
                                         flush_buf.cache_buf.push((
@@ -1584,12 +1559,7 @@ fn scan_file(
     }
 
     // Bundler.require detection
-    scan_bundler_require_filtered(
-        bytes,
-        &mask,
-        &mut bundler_groups,
-        &mut bundler_require_all,
-    );
+    scan_bundler_require_filtered(bytes, &mask, &mut bundler_groups, &mut bundler_require_all);
 
     Some(FileResult {
         rel_path,
@@ -1726,7 +1696,10 @@ mod tests {
         let input = b"x = 1 # require 'unused_gem'\nrequire 'real_gem'\n";
         let _block_ranges = build_block_comment_ranges(input);
         let mut results = Vec::new();
-        { let __mask = build_skip_mask(input, true, LineCommentKind::Hash); scan_requires_filtered(input, &__mask, &mut results); }
+        {
+            let __mask = build_skip_mask(input, true, LineCommentKind::Hash);
+            scan_requires_filtered(input, &__mask, &mut results);
+        }
         assert_eq!(results, vec!["real_gem"]);
     }
 
@@ -1736,7 +1709,10 @@ mod tests {
         let input = b"x = 'has#hash'\nrequire 'real_gem'\n";
         let _block_ranges = build_block_comment_ranges(input);
         let mut results = Vec::new();
-        { let __mask = build_skip_mask(input, true, LineCommentKind::Hash); scan_requires_filtered(input, &__mask, &mut results); }
+        {
+            let __mask = build_skip_mask(input, true, LineCommentKind::Hash);
+            scan_requires_filtered(input, &__mask, &mut results);
+        }
         assert_eq!(results, vec!["real_gem"]);
     }
 
@@ -1745,7 +1721,10 @@ mod tests {
         let input = b"configure do |c|\n  c.adapter = :memory # require 'redis' for production\nend\nrequire 'active_support'\n";
         let _block_ranges = build_block_comment_ranges(input);
         let mut results = Vec::new();
-        { let __mask = build_skip_mask(input, true, LineCommentKind::Hash); scan_requires_filtered(input, &__mask, &mut results); }
+        {
+            let __mask = build_skip_mask(input, true, LineCommentKind::Hash);
+            scan_requires_filtered(input, &__mask, &mut results);
+        }
         assert_eq!(results, vec!["active_support"]);
     }
 
@@ -1756,7 +1735,10 @@ mod tests {
         let input = b"doc = <<~HELP\n  require 'fake_gem'\nHELP\nrequire 'real_gem'\n";
         let _block_ranges = build_block_comment_ranges(input);
         let mut results = Vec::new();
-        { let __mask = build_skip_mask(input, true, LineCommentKind::Hash); scan_requires_filtered(input, &__mask, &mut results); }
+        {
+            let __mask = build_skip_mask(input, true, LineCommentKind::Hash);
+            scan_requires_filtered(input, &__mask, &mut results);
+        }
         assert_eq!(results, vec!["real_gem"]);
     }
 
@@ -1765,7 +1747,10 @@ mod tests {
         let input = b"doc = <<-HEREDOC\n  require 'fake_gem'\nHEREDOC\nrequire 'real_gem'\n";
         let _block_ranges = build_block_comment_ranges(input);
         let mut results = Vec::new();
-        { let __mask = build_skip_mask(input, true, LineCommentKind::Hash); scan_requires_filtered(input, &__mask, &mut results); }
+        {
+            let __mask = build_skip_mask(input, true, LineCommentKind::Hash);
+            scan_requires_filtered(input, &__mask, &mut results);
+        }
         assert_eq!(results, vec!["real_gem"]);
     }
 
@@ -1774,7 +1759,10 @@ mod tests {
         let input = b"doc = <<~'EOF'\n  require 'fake_gem'\nEOF\nrequire 'real_gem'\n";
         let _block_ranges = build_block_comment_ranges(input);
         let mut results = Vec::new();
-        { let __mask = build_skip_mask(input, true, LineCommentKind::Hash); scan_requires_filtered(input, &__mask, &mut results); }
+        {
+            let __mask = build_skip_mask(input, true, LineCommentKind::Hash);
+            scan_requires_filtered(input, &__mask, &mut results);
+        }
         assert_eq!(results, vec!["real_gem"]);
     }
 
@@ -1783,7 +1771,13 @@ mod tests {
         let input = b"doc = <<~HELP\n  Use MyGem::Config to configure\nHELP\nMyRealModule.call\n";
         let _block_ranges = build_block_comment_ranges(input);
         let mut modules: HashMap<String, HashSet<Arc<str>>> = HashMap::new();
-        { let __mask = build_skip_mask(input, true, LineCommentKind::Hash); { let __rp: Arc<str> = Arc::from("test.rb"); scan_modules_filtered_into(input, &__mask, &mut modules, &__rp) }; }
+        {
+            let __mask = build_skip_mask(input, true, LineCommentKind::Hash);
+            {
+                let __rp: Arc<str> = Arc::from("test.rb");
+                scan_modules_filtered_into(input, &__mask, &mut modules, &__rp)
+            };
+        }
         assert!(
             !modules.contains_key("MyGem"),
             "MyGem inside heredoc should be filtered"
@@ -1801,7 +1795,10 @@ mod tests {
         let input = b"# require 'old_gem'\nkey: value\n";
         let _block_ranges: Vec<(usize, usize)> = Vec::new();
         let mut results = Vec::new();
-        { let __mask = build_skip_mask(input, false, LineCommentKind::Hash); scan_requires_filtered(input, &__mask, &mut results); }
+        {
+            let __mask = build_skip_mask(input, false, LineCommentKind::Hash);
+            scan_requires_filtered(input, &__mask, &mut results);
+        }
         assert!(
             results.is_empty(),
             "require in YAML comment should be filtered"
@@ -1813,7 +1810,10 @@ mod tests {
         let input = b"key: value\nrequire 'real_gem'\n";
         let _block_ranges: Vec<(usize, usize)> = Vec::new();
         let mut results = Vec::new();
-        { let __mask = build_skip_mask(input, false, LineCommentKind::Hash); scan_requires_filtered(input, &__mask, &mut results); }
+        {
+            let __mask = build_skip_mask(input, false, LineCommentKind::Hash);
+            scan_requires_filtered(input, &__mask, &mut results);
+        }
         assert_eq!(results, vec!["real_gem"]);
     }
 
@@ -1822,7 +1822,13 @@ mod tests {
         let input = b"# MyOldModule was removed\nMyNewModule:\n  key: value\n";
         let _block_ranges: Vec<(usize, usize)> = Vec::new();
         let mut modules: HashMap<String, HashSet<Arc<str>>> = HashMap::new();
-        { let __mask = build_skip_mask(input, false, LineCommentKind::Hash); { let __rp: Arc<str> = Arc::from("test.yml"); scan_modules_filtered_into(input, &__mask, &mut modules, &__rp) }; }
+        {
+            let __mask = build_skip_mask(input, false, LineCommentKind::Hash);
+            {
+                let __rp: Arc<str> = Arc::from("test.yml");
+                scan_modules_filtered_into(input, &__mask, &mut modules, &__rp)
+            };
+        }
         assert!(
             !modules.contains_key("MyOldModule"),
             "module in comment should be filtered"
@@ -1870,7 +1876,10 @@ mod tests {
         let ranges = build_block_comment_ranges(input);
         assert!(!ranges.is_empty());
         let mut results = Vec::new();
-        { let __mask = build_skip_mask(input, true, LineCommentKind::Hash); scan_requires_filtered(input, &__mask, &mut results); }
+        {
+            let __mask = build_skip_mask(input, true, LineCommentKind::Hash);
+            scan_requires_filtered(input, &__mask, &mut results);
+        }
         assert_eq!(results, vec!["real"]);
     }
 
@@ -1887,7 +1896,10 @@ mod tests {
         let ranges = build_block_comment_ranges(input);
         assert!(!ranges.is_empty());
         let mut results = Vec::new();
-        { let __mask = build_skip_mask(input, true, LineCommentKind::Hash); scan_requires_filtered(input, &__mask, &mut results); }
+        {
+            let __mask = build_skip_mask(input, true, LineCommentKind::Hash);
+            scan_requires_filtered(input, &__mask, &mut results);
+        }
         assert_eq!(results, vec!["before", "after"]);
     }
 
@@ -1897,7 +1909,10 @@ mod tests {
         let input = b"\n=beginning_of_doc\nrequire 'real'\n";
         let _ranges = build_block_comment_ranges(input);
         let mut results = Vec::new();
-        { let __mask = build_skip_mask(input, true, LineCommentKind::Hash); scan_requires_filtered(input, &__mask, &mut results); }
+        {
+            let __mask = build_skip_mask(input, true, LineCommentKind::Hash);
+            scan_requires_filtered(input, &__mask, &mut results);
+        }
         assert_eq!(results, vec!["real"]);
     }
 
@@ -1909,7 +1924,10 @@ mod tests {
         let input = b"x = 'it\\'s' # require 'fake'\nrequire 'real'\n";
         let _ranges = build_block_comment_ranges(input);
         let mut results = Vec::new();
-        { let __mask = build_skip_mask(input, true, LineCommentKind::Hash); scan_requires_filtered(input, &__mask, &mut results); }
+        {
+            let __mask = build_skip_mask(input, true, LineCommentKind::Hash);
+            scan_requires_filtered(input, &__mask, &mut results);
+        }
         assert_eq!(results, vec!["real"]);
     }
 
@@ -1919,7 +1937,10 @@ mod tests {
         let input = b"x = \"has#hash\"\nrequire 'real'\n";
         let _ranges = build_block_comment_ranges(input);
         let mut results = Vec::new();
-        { let __mask = build_skip_mask(input, true, LineCommentKind::Hash); scan_requires_filtered(input, &__mask, &mut results); }
+        {
+            let __mask = build_skip_mask(input, true, LineCommentKind::Hash);
+            scan_requires_filtered(input, &__mask, &mut results);
+        }
         assert_eq!(results, vec!["real"]);
     }
 
@@ -2175,7 +2196,10 @@ mod tests {
     fn non_ruby_autoload_comment_filtered() {
         let input = b"# autoload :Foo, 'foo'\nautoload :Bar, 'bar'\n";
         let mut results = Vec::new();
-        { let __mask = build_skip_mask(input, false, LineCommentKind::Hash); scan_autoloads_filtered(input, &__mask, &mut results); }
+        {
+            let __mask = build_skip_mask(input, false, LineCommentKind::Hash);
+            scan_autoloads_filtered(input, &__mask, &mut results);
+        }
         assert_eq!(results, vec!["bar"]);
     }
 
@@ -2183,7 +2207,10 @@ mod tests {
     fn non_ruby_gem_bin_comment_filtered() {
         let input = b"# Gem.bin_path('old', 'old')\nGem.bin_path('real', 'real')\n";
         let mut results = Vec::new();
-        { let __mask = build_skip_mask(input, false, LineCommentKind::Hash); scan_gem_bin_filtered(input, &__mask, &mut results); }
+        {
+            let __mask = build_skip_mask(input, false, LineCommentKind::Hash);
+            scan_gem_bin_filtered(input, &__mask, &mut results);
+        }
         assert_eq!(results, vec!["real"]);
     }
 
@@ -2192,7 +2219,10 @@ mod tests {
         let input = b"# Bundler.require\nBundler.require(:default)\n";
         let mut groups = Vec::new();
         let mut require_all = false;
-        { let __mask = build_skip_mask(input, false, LineCommentKind::Hash); scan_bundler_require_filtered(input, &__mask, &mut groups, &mut require_all); }
+        {
+            let __mask = build_skip_mask(input, false, LineCommentKind::Hash);
+            scan_bundler_require_filtered(input, &__mask, &mut groups, &mut require_all);
+        }
         assert!(!require_all);
         assert_eq!(groups, vec!["default"]);
     }
@@ -2639,7 +2669,10 @@ mod tests {
     fn non_ruby_autoload_comment_filtered_with_hash() {
         let input = b"# autoload :Foo, 'foo'\nautoload :Bar, 'bar'\n";
         let mut results = Vec::new();
-        { let __mask = build_skip_mask(input, false, LineCommentKind::Hash); scan_autoloads_filtered(input, &__mask, &mut results); }
+        {
+            let __mask = build_skip_mask(input, false, LineCommentKind::Hash);
+            scan_autoloads_filtered(input, &__mask, &mut results);
+        }
         assert_eq!(results, vec!["bar"]);
     }
 
@@ -2647,7 +2680,13 @@ mod tests {
     fn non_ruby_modules_filtered_comment_skipped() {
         let input = b"# MyModule\nRealModule\n";
         let mut modules = HashMap::new();
-        { let __mask = build_skip_mask(input, false, LineCommentKind::Hash); { let __rp: Arc<str> = Arc::from("test.py"); scan_modules_filtered_into(input, &__mask, &mut modules, &__rp) }; }
+        {
+            let __mask = build_skip_mask(input, false, LineCommentKind::Hash);
+            {
+                let __rp: Arc<str> = Arc::from("test.py");
+                scan_modules_filtered_into(input, &__mask, &mut modules, &__rp)
+            };
+        }
         assert!(modules.contains_key("RealModule"));
         assert!(!modules.contains_key("MyModule"));
     }
@@ -2657,7 +2696,13 @@ mod tests {
         let input = b"=begin\nSkippedModule\n=end\nRealModule\n";
         let _ranges = build_block_comment_ranges(input);
         let mut modules = HashMap::new();
-        { let __mask = build_skip_mask(input, true, LineCommentKind::Hash); { let __rp: Arc<str> = Arc::from("test.rb"); scan_modules_filtered_into(input, &__mask, &mut modules, &__rp) }; }
+        {
+            let __mask = build_skip_mask(input, true, LineCommentKind::Hash);
+            {
+                let __rp: Arc<str> = Arc::from("test.rb");
+                scan_modules_filtered_into(input, &__mask, &mut modules, &__rp)
+            };
+        }
         assert!(modules.contains_key("RealModule"));
         assert!(!modules.contains_key("SkippedModule"));
     }
@@ -2667,7 +2712,10 @@ mod tests {
         let input = b"=begin\nGem.bin_path('skip')\n=end\nGem.bin_path('real')\n";
         let _ranges = build_block_comment_ranges(input);
         let mut results = Vec::new();
-        { let __mask = build_skip_mask(input, true, LineCommentKind::Hash); scan_gem_bin_filtered(input, &__mask, &mut results); }
+        {
+            let __mask = build_skip_mask(input, true, LineCommentKind::Hash);
+            scan_gem_bin_filtered(input, &__mask, &mut results);
+        }
         assert_eq!(results, vec!["real"]);
     }
 
@@ -2676,7 +2724,10 @@ mod tests {
         let input = b"=begin\nautoload :Foo, 'skip'\n=end\nautoload :Bar, 'real'\n";
         let _ranges = build_block_comment_ranges(input);
         let mut results = Vec::new();
-        { let __mask = build_skip_mask(input, true, LineCommentKind::Hash); scan_autoloads_filtered(input, &__mask, &mut results); }
+        {
+            let __mask = build_skip_mask(input, true, LineCommentKind::Hash);
+            scan_autoloads_filtered(input, &__mask, &mut results);
+        }
         assert_eq!(results, vec!["real"]);
     }
 
@@ -2686,7 +2737,10 @@ mod tests {
         let _ranges = build_block_comment_ranges(input);
         let mut groups = Vec::new();
         let mut require_all = false;
-        { let __mask = build_skip_mask(input, true, LineCommentKind::Hash); scan_bundler_require_filtered(input, &__mask, &mut groups, &mut require_all); }
+        {
+            let __mask = build_skip_mask(input, true, LineCommentKind::Hash);
+            scan_bundler_require_filtered(input, &__mask, &mut groups, &mut require_all);
+        }
         assert!(!require_all);
         assert_eq!(groups, vec!["test"]);
     }
@@ -2699,7 +2753,10 @@ mod tests {
         let mut groups = Vec::new();
         let mut require_all = false;
         scan_bundler_require(input, &mut groups, &mut require_all);
-        assert!(require_all, "splat local var should set bundler_require_all");
+        assert!(
+            require_all,
+            "splat local var should set bundler_require_all"
+        );
         assert!(groups.is_empty());
     }
 
@@ -2718,7 +2775,10 @@ mod tests {
         let mut groups = Vec::new();
         let mut require_all = false;
         scan_bundler_require(input, &mut groups, &mut require_all);
-        assert!(!require_all, "symbol groups should not set bundler_require_all");
+        assert!(
+            !require_all,
+            "symbol groups should not set bundler_require_all"
+        );
         assert_eq!(groups, vec!["default", "production"]);
     }
 
@@ -2728,7 +2788,10 @@ mod tests {
         let mut groups = Vec::new();
         let mut require_all = false;
         scan_bundler_require(input, &mut groups, &mut require_all);
-        assert!(require_all, "Rails.groups splat should set bundler_require_all");
+        assert!(
+            require_all,
+            "Rails.groups splat should set bundler_require_all"
+        );
     }
 
     // ── Middleware string references ──
@@ -2737,15 +2800,30 @@ mod tests {
     fn middleware_use_string() {
         let input = b"config.middleware.use \"Bullet::Rack\"\n";
         let mut modules: HashMap<String, HashSet<Arc<str>>> = HashMap::new();
-        { let __mask = build_skip_mask(input, true, LineCommentKind::Hash); { let __rp: Arc<str> = Arc::from("test.rb"); scan_middleware_refs(input, &__mask, &mut modules, &__rp) }; }
-        assert!(modules.contains_key("Bullet::Rack"), "should detect double-quoted middleware");
+        {
+            let __mask = build_skip_mask(input, true, LineCommentKind::Hash);
+            {
+                let __rp: Arc<str> = Arc::from("test.rb");
+                scan_middleware_refs(input, &__mask, &mut modules, &__rp)
+            };
+        }
+        assert!(
+            modules.contains_key("Bullet::Rack"),
+            "should detect double-quoted middleware"
+        );
     }
 
     #[test]
     fn middleware_insert_before_string() {
         let input = b"config.middleware.insert_before Rack::Runtime, \"BatchLoader::Middleware\"\n";
         let mut modules: HashMap<String, HashSet<Arc<str>>> = HashMap::new();
-        { let __mask = build_skip_mask(input, true, LineCommentKind::Hash); { let __rp: Arc<str> = Arc::from("test.rb"); scan_middleware_refs(input, &__mask, &mut modules, &__rp) }; }
+        {
+            let __mask = build_skip_mask(input, true, LineCommentKind::Hash);
+            {
+                let __rp: Arc<str> = Arc::from("test.rb");
+                scan_middleware_refs(input, &__mask, &mut modules, &__rp)
+            };
+        }
         assert!(
             modules.contains_key("BatchLoader::Middleware"),
             "should detect string arg in insert_before"
@@ -2756,7 +2834,13 @@ mod tests {
     fn middleware_symbol_ignored() {
         let input = b"config.middleware.use MyClass\n";
         let mut modules: HashMap<String, HashSet<Arc<str>>> = HashMap::new();
-        { let __mask = build_skip_mask(input, true, LineCommentKind::Hash); { let __rp: Arc<str> = Arc::from("test.rb"); scan_middleware_refs(input, &__mask, &mut modules, &__rp) }; }
+        {
+            let __mask = build_skip_mask(input, true, LineCommentKind::Hash);
+            {
+                let __rp: Arc<str> = Arc::from("test.rb");
+                scan_middleware_refs(input, &__mask, &mut modules, &__rp)
+            };
+        }
         assert!(
             !modules.contains_key("MyClass"),
             "bare constants should not be captured by middleware scanner"
@@ -2767,7 +2851,13 @@ mod tests {
     fn middleware_commented() {
         let input = b"# config.middleware.use \"Bullet::Rack\"\n";
         let mut modules: HashMap<String, HashSet<Arc<str>>> = HashMap::new();
-        { let __mask = build_skip_mask(input, true, LineCommentKind::Hash); { let __rp: Arc<str> = Arc::from("test.rb"); scan_middleware_refs(input, &__mask, &mut modules, &__rp) }; }
+        {
+            let __mask = build_skip_mask(input, true, LineCommentKind::Hash);
+            {
+                let __rp: Arc<str> = Arc::from("test.rb");
+                scan_middleware_refs(input, &__mask, &mut modules, &__rp)
+            };
+        }
         assert!(
             !modules.contains_key("Bullet::Rack"),
             "commented middleware should be ignored"
@@ -2816,7 +2906,10 @@ mod tests {
         let __mask = build_skip_mask(input, true, LineCommentKind::Hash);
         scan_bundler_require_filtered(input, &__mask, &mut groups, &mut require_all);
         assert!(groups.iter().any(|g| g == "default"));
-        assert!(!groups.iter().any(|g| g == "test"), "inline-comment :test must not be captured");
+        assert!(
+            !groups.iter().any(|g| g == "test"),
+            "inline-comment :test must not be captured"
+        );
     }
 
     #[test]
@@ -2859,8 +2952,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let yml = dir.path().join("config.yml");
         // PascalCase tokens in YAML values must not be reported as module references.
-        std::fs::write(&yml, "default: &default\n  adapter: postgresql\n  pool: SomeModule\n")
-            .unwrap();
+        std::fs::write(
+            &yml,
+            "default: &default\n  adapter: postgresql\n  pool: SomeModule\n",
+        )
+        .unwrap();
         let cache = std::sync::Arc::new(crate::cache::FileCache::disabled());
         let (results, _) = scan_source_tree(dir.path(), &[], cache);
         assert!(

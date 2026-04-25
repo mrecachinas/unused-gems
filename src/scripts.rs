@@ -2,9 +2,9 @@ use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
+use aho_corasick::AhoCorasick;
 use memchr::memmem;
 use rayon::prelude::*;
-use aho_corasick::AhoCorasick;
 use regex::Regex;
 
 /// Check if a path matches our script file patterns.
@@ -800,7 +800,10 @@ mod tests {
         let stripped = strip_comment_lines(input);
         let s = String::from_utf8_lossy(&stripped);
         assert!(s.contains("minitest"), "minitest must remain");
-        assert!(!s.contains("rspec"), "inline comment with rspec must be stripped");
+        assert!(
+            !s.contains("rspec"),
+            "inline comment with rspec must be stripped"
+        );
     }
 
     #[test]
@@ -809,7 +812,10 @@ mod tests {
         let input = b"  url: \"https://example.com/#anchor\"\n";
         let stripped = strip_comment_lines(input);
         let s = String::from_utf8_lossy(&stripped);
-        assert!(s.contains("#anchor"), "fragment inside quotes must be preserved");
+        assert!(
+            s.contains("#anchor"),
+            "fragment inside quotes must be preserved"
+        );
     }
 
     #[test]
@@ -828,7 +834,10 @@ mod tests {
         let input = b"label=foo#bar\n";
         let stripped = strip_comment_lines(input);
         let s = String::from_utf8_lossy(&stripped);
-        assert!(s.contains("foo#bar"), "hash without leading ws is preserved");
+        assert!(
+            s.contains("foo#bar"),
+            "hash without leading ws is preserved"
+        );
     }
 
     #[test]
@@ -872,10 +881,7 @@ mod tests {
     #[test]
     fn script_file_buildkite() {
         assert!(is_script_file(".buildkite/pipeline.yml", "pipeline.yml"));
-        assert!(is_script_file(
-            ".buildkite/steps/test.yaml",
-            "test.yaml"
-        ));
+        assert!(is_script_file(".buildkite/steps/test.yaml", "test.yaml"));
     }
 
     #[test]
@@ -893,18 +899,24 @@ mod tests {
 
     #[test]
     fn script_file_bitbucket() {
-        assert!(is_script_file("bitbucket-pipelines.yml", "bitbucket-pipelines.yml"));
-        assert!(is_script_file("bitbucket-pipelines.yaml", "bitbucket-pipelines.yaml"));
+        assert!(is_script_file(
+            "bitbucket-pipelines.yml",
+            "bitbucket-pipelines.yml"
+        ));
+        assert!(is_script_file(
+            "bitbucket-pipelines.yaml",
+            "bitbucket-pipelines.yaml"
+        ));
     }
 
     #[test]
     fn script_file_azure_pipelines() {
         assert!(is_script_file("azure-pipelines.yml", "azure-pipelines.yml"));
-        assert!(is_script_file("azure-pipelines.yaml", "azure-pipelines.yaml"));
         assert!(is_script_file(
-            ".azure-pipelines/build.yml",
-            "build.yml"
+            "azure-pipelines.yaml",
+            "azure-pipelines.yaml"
         ));
+        assert!(is_script_file(".azure-pipelines/build.yml", "build.yml"));
     }
 
     #[test]
