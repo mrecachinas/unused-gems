@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 
 use rayon::prelude::*;
 
@@ -77,13 +77,13 @@ impl GemMeta {
 /// Build a single GemResult for one gem entry against the shared indexes.
 fn build_gem_result(gem_entry: &GemEntry, meta: &GemMeta, indexes: &MatchIndexes<'_>) -> GemResult {
     let mut found_files: HashSet<String> = HashSet::new();
-    let mut evidence: BTreeSet<Evidence> = BTreeSet::new();
+    let mut evidence: Vec<Evidence> = Vec::new();
 
     // Check each require path for this gem
     for req_path in &gem_entry.require_paths {
         if let Some(files) = indexes.requires.get(req_path) {
             for f in files {
-                evidence.insert(Evidence::Require {
+                evidence.push(Evidence::Require {
                     path: req_path.clone(),
                     file: f.clone(),
                 });
@@ -98,7 +98,7 @@ fn build_gem_result(gem_entry: &GemEntry, meta: &GemMeta, indexes: &MatchIndexes
             for (req_name, files) in entries {
                 if req_name.starts_with(&prefix) {
                     for f in *files {
-                        evidence.insert(Evidence::Require {
+                        evidence.push(Evidence::Require {
                             path: req_name.to_string(),
                             file: f.clone(),
                         });
@@ -111,7 +111,9 @@ fn build_gem_result(gem_entry: &GemEntry, meta: &GemMeta, indexes: &MatchIndexes
 
     // Check module/class name references against pre-lowercased source modules.
     // Use the modules-by-top-segment index to limit work to candidates that share
-    // the pattern's lowercased top segment.
+    // the pattern's lowercased top segment. Note: `mod_down` may itself be a
+    // multi-segment name (e.g. "aws::s3"), so we look up by ITS top segment,
+    // then match the full pattern below.
     for mod_pattern in &gem_entry.module_names {
         let mod_down = mod_pattern.to_lowercase();
         // Skip very short module names that cause false positives (e.g., "Cli", "Api")
@@ -126,23 +128,26 @@ fn build_gem_result(gem_entry: &GemEntry, meta: &GemMeta, indexes: &MatchIndexes
             continue;
         }
 
-        let Some(entries) = indexes.modules_by_top.get(&mod_down) else {
+        let mod_top = mod_down.split("::").next().unwrap_or(&mod_down);
+        let Some(entries) = indexes.modules_by_top.get(mod_top) else {
             continue;
         };
         let mod_len = mod_down.len();
+        let mod_bytes = mod_down.as_bytes();
         for (name_down, original_name, files) in entries {
             // Match either an exact module name or a `mod_down::...` descendant,
             // without allocating a `mod_down + "::"` string each iteration.
-            let matches = if name_down.len() == mod_len {
-                name_down == &mod_down
-            } else if name_down.len() > mod_len + 2 && name_down.starts_with(&mod_down) {
-                name_down.as_bytes()[mod_len..mod_len + 2] == *b"::"
+            let nb = name_down.as_bytes();
+            let matches = if nb.len() == mod_len {
+                nb == mod_bytes
+            } else if nb.len() > mod_len + 2 && nb.starts_with(mod_bytes) {
+                nb[mod_len] == b':' && nb[mod_len + 1] == b':'
             } else {
                 false
             };
             if matches {
                 for f in *files {
-                    evidence.insert(Evidence::Module {
+                    evidence.push(Evidence::Module {
                         name: original_name.clone(),
                         file: f.clone(),
                     });
@@ -165,7 +170,7 @@ fn build_gem_result(gem_entry: &GemEntry, meta: &GemMeta, indexes: &MatchIndexes
     } else if gem_entry.require_false {
         GemStatus::RequireFalse
     } else if is_bundler_required {
-        evidence.insert(Evidence::BundlerRequire);
+        evidence.push(Evidence::BundlerRequire);
         GemStatus::BundlerRequired
     } else {
         GemStatus::Unused
@@ -174,10 +179,13 @@ fn build_gem_result(gem_entry: &GemEntry, meta: &GemMeta, indexes: &MatchIndexes
     let mut files: Vec<String> = found_files.into_iter().collect();
     files.sort();
 
+    evidence.sort();
+    evidence.dedup();
+
     GemResult {
         status,
         files,
-        evidence: evidence.into_iter().collect(),
+        evidence,
         gem: gem_entry.clone(),
     }
 }
@@ -287,6 +295,26 @@ mod tests {
             .evidence
             .iter()
             .any(|e| matches!(e, Evidence::Module { .. })));
+    }
+
+    #[test]
+    fn match_by_multi_segment_module_pattern() {
+        // Regression: gem.module_names may contain multi-segment names like "Aws::S3"
+        // (from KNOWN_MODULE_NAMES). Lookup must succeed for source modules in the
+        // same namespace.
+        let gems = vec![gem("aws-sdk-s3", &[], &["Aws::S3"])];
+        let scan = scan(&[], &[("Aws::S3::Client", "app.rb")]);
+        let results = match_gem_usage(&gems, &scan);
+        assert_eq!(results["aws-sdk-s3"].status, GemStatus::Used);
+    }
+
+    #[test]
+    fn multi_segment_module_pattern_does_not_overmatch_sibling() {
+        // `Aws::S3` should NOT match a sibling like `Aws::SQS::Client`.
+        let gems = vec![gem("aws-sdk-s3", &[], &["Aws::S3"])];
+        let scan = scan(&[], &[("Aws::SQS::Client", "app.rb")]);
+        let results = match_gem_usage(&gems, &scan);
+        assert_eq!(results["aws-sdk-s3"].status, GemStatus::Unused);
     }
 
     #[test]
