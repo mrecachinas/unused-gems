@@ -10,6 +10,7 @@ struct Categories<'a> {
     require_false: Vec<(&'a str, &'a GemResult)>,
     used: Vec<(&'a str, &'a GemResult)>,
     ignored: Vec<(&'a str, &'a GemResult)>,
+    platform_excluded: Vec<(&'a str, &'a GemResult)>,
 }
 
 fn categorize(results: &HashMap<String, GemResult>) -> Categories<'_> {
@@ -19,6 +20,7 @@ fn categorize(results: &HashMap<String, GemResult>) -> Categories<'_> {
         require_false: Vec::new(),
         used: Vec::new(),
         ignored: Vec::new(),
+        platform_excluded: Vec::new(),
     };
 
     for (name, info) in results {
@@ -28,6 +30,7 @@ fn categorize(results: &HashMap<String, GemResult>) -> Categories<'_> {
             GemStatus::RequireFalse => cats.require_false.push((name.as_str(), info)),
             GemStatus::Used => cats.used.push((name.as_str(), info)),
             GemStatus::Ignored => cats.ignored.push((name.as_str(), info)),
+            GemStatus::PlatformExcluded => cats.platform_excluded.push((name.as_str(), info)),
         }
     }
 
@@ -36,6 +39,7 @@ fn categorize(results: &HashMap<String, GemResult>) -> Categories<'_> {
     cats.require_false.sort_by_key(|(n, _)| *n);
     cats.used.sort_by_key(|(n, _)| *n);
     cats.ignored.sort_by_key(|(n, _)| *n);
+    cats.platform_excluded.sort_by_key(|(n, _)| *n);
 
     cats
 }
@@ -93,6 +97,14 @@ pub fn print_results_text(
         println!();
     }
 
+    if !cats.platform_excluded.is_empty() {
+        println!("ℹ️  Platform-excluded ({})", cats.platform_excluded.len());
+        println!();
+        let names: Vec<&str> = cats.platform_excluded.iter().map(|(n, _)| *n).collect();
+        println!("  {}", names.join(", "));
+        println!();
+    }
+
     if !cats.ignored.is_empty() {
         println!("🔇 Ignored via .unused_gems.yml ({})", cats.ignored.len());
         println!();
@@ -135,6 +147,23 @@ pub fn print_results_text(
         }
     }
 
+    let extra = {
+        let mut parts = Vec::new();
+        if !cats.ignored.is_empty() {
+            parts.push(format!("{} ignored", cats.ignored.len()));
+        }
+        if !cats.platform_excluded.is_empty() {
+            parts.push(format!(
+                "{} platform-excluded",
+                cats.platform_excluded.len()
+            ));
+        }
+        if parts.is_empty() {
+            String::new()
+        } else {
+            format!(", {}", parts.join(", "))
+        }
+    };
     println!(
         "{} gems: {} used, {} unused, {} bundler.require, {} lazy{}",
         total,
@@ -142,11 +171,7 @@ pub fn print_results_text(
         cats.unused.len(),
         cats.bundler_required.len(),
         cats.require_false.len(),
-        if !cats.ignored.is_empty() {
-            format!(", {} ignored", cats.ignored.len())
-        } else {
-            String::new()
-        }
+        extra,
     );
 
     cats.unused.len()
@@ -194,11 +219,69 @@ pub fn print_results_json(
         .collect();
 
     records.sort_by(|a, b| a.name.cmp(&b.name));
-    println!("{}", serde_json::to_string_pretty(&records).unwrap());
+
+    let envelope = serde_json::json!({
+        "schema_version": "1",
+        "results": records,
+    });
+    println!("{}", serde_json::to_string_pretty(&envelope).unwrap());
 
     results
         .values()
         .filter(|v| v.status == GemStatus::Unused)
+        .count()
+}
+
+pub fn print_results_sarif(
+    results: &HashMap<String, GemResult>,
+    _dir: &Path,
+    _lock_deps: &HashMap<String, Vec<String>>,
+) -> usize {
+    let mut sarif_results = Vec::new();
+    let mut sorted: Vec<(&String, &GemResult)> = results.iter().collect();
+    sorted.sort_by_key(|(n, _)| n.as_str());
+
+    for (name, info) in &sorted {
+        if info.status != GemStatus::Unused {
+            continue;
+        }
+        sarif_results.push(serde_json::json!({
+            "ruleId": "unused-gem",
+            "level": "warning",
+            "message": { "text": format!("Gem '{}' appears unused", name) },
+            "locations": [{
+                "physicalLocation": {
+                    "artifactLocation": { "uri": "Gemfile" }
+                }
+            }]
+        }));
+    }
+
+    let sarif = serde_json::json!({
+        "$schema": "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/master/Schemata/sarif-schema-2.1.0.json",
+        "version": "2.1.0",
+        "runs": [{
+            "tool": {
+                "driver": {
+                    "name": "unused-gems",
+                    "version": env!("CARGO_PKG_VERSION"),
+                    "informationUri": "https://github.com/mrecachinas/unused-gems",
+                    "rules": [{
+                        "id": "unused-gem",
+                        "shortDescription": { "text": "Gem declared in Gemfile but not referenced in source" },
+                        "defaultConfiguration": { "level": "warning" }
+                    }]
+                }
+            },
+            "results": sarif_results
+        }]
+    });
+
+    println!("{}", serde_json::to_string_pretty(&sarif).unwrap());
+
+    sorted
+        .iter()
+        .filter(|(_, info)| info.status == GemStatus::Unused)
         .count()
 }
 
@@ -215,7 +298,10 @@ pub fn print_results_github(
     entries.sort_by_key(|(n, _)| *n);
 
     for (name, info) in entries {
-        if info.status != GemStatus::Unused && info.status != GemStatus::BundlerRequired {
+        if info.status != GemStatus::Unused
+            && info.status != GemStatus::BundlerRequired
+            && info.status != GemStatus::PlatformExcluded
+        {
             continue;
         }
 
@@ -241,6 +327,12 @@ pub fn print_results_github(
 
         let msg = match info.status {
             GemStatus::Unused => format!("Gem '{}' appears unused{}", name, transitive),
+            GemStatus::PlatformExcluded => {
+                format!(
+                    "Gem '{}' excluded (platform {:?} does not match current)",
+                    name, info.gem.platforms
+                )
+            }
             GemStatus::BundlerRequired => {
                 let evidence_summary = summarize_evidence(&info.evidence);
                 if evidence_summary.is_empty() {
@@ -321,6 +413,7 @@ mod tests {
         GemEntry {
             name: name.to_string(),
             groups: groups.iter().map(|s| s.to_string()).collect(),
+            platforms: Vec::new(),
             require_paths: vec![name.to_string()],
             module_names: Vec::new(),
             require_false: false,

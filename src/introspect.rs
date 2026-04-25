@@ -8,6 +8,37 @@ use regex::Regex;
 static MODULE_DECL_RE: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"(?m)^\s*(?:module|class)\s+([A-Z][\w:]+)").unwrap());
 
+/// Generic module/class names that appear in many gems and would over-match
+/// when used as a usage signal (e.g. any `Configuration` reference in app code
+/// would mark the gem Used). These are filtered out of discovered module names;
+/// canonical names are still preserved via the curated `KNOWN_MODULE_NAMES`
+/// table in main.rs which is unioned with the discovery output.
+const GENERIC_MODULE_BLACKLIST: &[&str] = &[
+    "VERSION",
+    "Error",
+    "Errors",
+    "Base",
+    "Configuration",
+    "Config",
+    "Engine",
+    "Railtie",
+    "ClassMethods",
+    "Cli",
+    "Util",
+    "Utils",
+    "Helpers",
+    "Helper",
+    "Result",
+    "Response",
+    "Request",
+    "Client",
+    "Server",
+];
+
+fn is_generic_module_name(name: &str) -> bool {
+    GENERIC_MODULE_BLACKLIST.contains(&name)
+}
+
 /// Metadata extracted from a .gem tarball's metadata.gz
 #[derive(Debug, Default)]
 pub struct GemMetadata {
@@ -92,7 +123,7 @@ pub fn find_gem_paths(project_dir: &Path) -> Vec<PathBuf> {
     }
 
     // 5. Probe rvm filesystem directly
-    if let Some(path) = probe_rvm() {
+    if let Some(path) = probe_rvm(project_dir) {
         return vec![path];
     }
 
@@ -228,8 +259,36 @@ fn find_ruby_version_file(start_dir: &Path) -> Option<String> {
     }
 }
 
+/// Walk from project_dir upward to find a `.ruby-gemset` file (RVM convention).
+fn find_ruby_gemset_file(start_dir: &Path) -> Option<String> {
+    let mut dir = start_dir
+        .canonicalize()
+        .ok()
+        .unwrap_or_else(|| start_dir.to_path_buf());
+    loop {
+        let candidate = dir.join(".ruby-gemset");
+        if let Ok(content) = std::fs::read_to_string(&candidate) {
+            let v = content.trim().to_string();
+            if !v.is_empty() {
+                return Some(v);
+            }
+        }
+        if !dir.pop() {
+            return None;
+        }
+    }
+}
+
 /// Probe rvm filesystem to find gem path without spawning a process.
-fn probe_rvm() -> Option<PathBuf> {
+///
+/// Selection (deterministic):
+///   1. If both `.ruby-version` and `.ruby-gemset` are present in/above
+///      `project_dir`, prefer `<rvm>/gems/ruby-<version>@<gemset>`.
+///   2. Else if `.ruby-version` is present, prefer `<rvm>/gems/ruby-<version>`.
+///   3. Else fall back to a deterministic scan: skip `@global` and dotfiles,
+///      prefer entries with no `@gemset` suffix, then sort by longest version
+///      string (newest), breaking ties alphabetically (descending).
+fn probe_rvm(project_dir: &Path) -> Option<PathBuf> {
     let home = std::env::var("HOME").ok().map(PathBuf::from)?;
     let rvm_dir = std::env::var("rvm_path")
         .map(PathBuf::from)
@@ -240,22 +299,58 @@ fn probe_rvm() -> Option<PathBuf> {
         return None;
     }
 
-    // Find the default or current gemset
-    if let Ok(entries) = std::fs::read_dir(&gems_dir) {
-        let mut best: Option<PathBuf> = None;
+    select_rvm_gemset(&gems_dir, project_dir)
+}
+
+/// Pure selection logic over an RVM-style `gems/` directory. Extracted for
+/// testability — no env or HOME access here.
+fn select_rvm_gemset(gems_dir: &Path, project_dir: &Path) -> Option<PathBuf> {
+    let version = find_ruby_version_file(project_dir);
+    let gemset = find_ruby_gemset_file(project_dir);
+
+    // 1. version + gemset → exact match
+    if let (Some(v), Some(g)) = (version.as_ref(), gemset.as_ref()) {
+        let candidate = gems_dir.join(format!("ruby-{}@{}", v, g));
+        if candidate.join("gems").is_dir() {
+            return Some(candidate);
+        }
+    }
+
+    // 2. version only → exact match without @gemset
+    if let Some(v) = version.as_ref() {
+        let candidate = gems_dir.join(format!("ruby-{}", v));
+        if candidate.join("gems").is_dir() {
+            return Some(candidate);
+        }
+    }
+
+    // 3. Deterministic fallback: collect candidates, sort, return best.
+    let mut candidates: Vec<(PathBuf, String)> = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(gems_dir) {
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().to_string();
-            // Skip @global and non-directories
             if !entry.path().is_dir() || name.contains("@global") || name.starts_with('.') {
                 continue;
             }
-            if entry.path().join("gems").is_dir() {
-                best = Some(entry.path());
+            if !entry.path().join("gems").is_dir() {
+                continue;
             }
+            candidates.push((entry.path(), name));
         }
-        return best;
     }
-    None
+
+    // Order: plain (no @) before @gemset; then longest name (proxy for newest);
+    // then descending lexical order. Fully deterministic.
+    candidates.sort_by(|a, b| {
+        let a_plain = !a.1.contains('@');
+        let b_plain = !b.1.contains('@');
+        b_plain
+            .cmp(&a_plain)
+            .then_with(|| b.1.len().cmp(&a.1.len()))
+            .then_with(|| b.1.cmp(&a.1))
+    });
+
+    candidates.into_iter().next().map(|(p, _)| p)
 }
 
 /// Pre-build an index of gem_name -> gem_dir for fast lookups.
@@ -388,9 +483,13 @@ pub fn discover_gem_require_paths(
 
 /// Read require_paths from a gem's .gemspec file (static parse).
 fn read_gemspec_require_paths(gem_dir: &Path) -> Option<Vec<String>> {
-    let pattern = gem_dir.join("*.gemspec").display().to_string();
-    for spec_path in glob::glob(&pattern).into_iter().flatten().flatten() {
-        if let Ok(content) = std::fs::read_to_string(&spec_path) {
+    let entries = std::fs::read_dir(gem_dir).ok()?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("gemspec") {
+            continue;
+        }
+        if let Ok(content) = std::fs::read_to_string(&path) {
             // Match: s.require_paths = ["lib", "ext"] or s.require_path = "lib"
             static REQ_PATHS_RE: Lazy<Regex> =
                 Lazy::new(|| Regex::new(r#"require_paths?\s*=\s*\[([^\]]+)\]"#).unwrap());
@@ -421,7 +520,20 @@ fn read_gemspec_require_paths(gem_dir: &Path) -> Option<Vec<String>> {
     None
 }
 
-/// Extract top-level module/class names from a gem's lib/*.rb files using regex.
+/// Extract top-level module/class names from a gem's `lib/<gem>.rb` entry
+/// file(s) only. We deliberately skip nested files (`lib/<gem>/...`) because
+/// those tend to declare generic helper names (`Configuration`, `Error`,
+/// `ClassMethods`, ...) that over-match against unrelated app code.
+///
+/// Discovery is restricted to the conventional entry-point file names:
+///   - `lib/<gem_name>.rb`
+///   - `lib/<gem_name with - replaced by _>.rb`
+///   - `lib/<first hyphen segment>.rb`
+///
+/// Generic helper names (see `GENERIC_MODULE_BLACKLIST`) are filtered. The
+/// caller (main.rs) UNIONs this with the curated `KNOWN_MODULE_NAMES` table,
+/// so canonical names for popular gems are still preserved when they would
+/// otherwise be filtered.
 pub fn discover_gem_module_names(
     gem_name: &str,
     gem_index: &HashMap<String, PathBuf>,
@@ -435,35 +547,54 @@ pub fn discover_gem_module_names(
         return Vec::new();
     }
 
-    let mut modules = HashSet::new();
-
-    // Scan top-level lib/*.rb
-    scan_rb_files_for_modules(&lib_dir, &MODULE_DECL_RE, &mut modules);
-
-    // If nothing found, try one level deeper
-    if modules.is_empty() {
-        if let Ok(entries) = std::fs::read_dir(&lib_dir) {
-            for entry in entries.flatten() {
-                if entry.path().is_dir() {
-                    scan_rb_files_for_modules(&entry.path(), &MODULE_DECL_RE, &mut modules);
-                }
-            }
+    let mut candidate_files: Vec<String> = Vec::with_capacity(3);
+    candidate_files.push(format!("{}.rb", gem_name));
+    let underscored = gem_name.replace('-', "_");
+    if underscored != gem_name {
+        candidate_files.push(format!("{}.rb", underscored));
+    }
+    if let Some(first) = gem_name.split('-').next() {
+        let first_rb = format!("{}.rb", first);
+        if !candidate_files.contains(&first_rb) {
+            candidate_files.push(first_rb);
         }
     }
 
-    let mut result: Vec<String> = modules.into_iter().collect();
+    let mut modules: HashSet<String> = HashSet::new();
+    for fname in &candidate_files {
+        let path = lib_dir.join(fname);
+        if !path.is_file() {
+            continue;
+        }
+        scan_rb_file_head_for_modules(&path, &MODULE_DECL_RE, &mut modules);
+    }
+
+    let mut result: Vec<String> = modules
+        .into_iter()
+        .filter(|n| !is_generic_module_name(n))
+        .collect();
     result.sort();
     result
 }
 
-fn scan_rb_files_for_modules(dir: &Path, re: &Regex, modules: &mut HashSet<String>) {
-    let pattern = dir.join("*.rb").display().to_string();
-    for entry in glob::glob(&pattern).into_iter().flatten().flatten() {
-        if let Ok(content) = std::fs::read_to_string(&entry) {
-            for cap in re.captures_iter(&content) {
-                modules.insert(cap[1].to_string());
-            }
-        }
+/// Read up to ~4KB from the head of a Ruby file and extract top-level
+/// `module`/`class` declarations. Top-level declarations conventionally
+/// appear at the file's top, so this avoids loading huge generated files.
+fn scan_rb_file_head_for_modules(path: &Path, re: &Regex, modules: &mut HashSet<String>) {
+    const HEAD_BYTES: usize = 4096;
+    let mut file = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(_) => return,
+    };
+    let mut buf = vec![0u8; HEAD_BYTES];
+    let n = match file.read(&mut buf) {
+        Ok(n) => n,
+        Err(_) => return,
+    };
+    buf.truncate(n);
+    let content = String::from_utf8_lossy(&buf);
+    for cap in re.captures_iter(&content) {
+        modules.insert(cap[1].to_string());
     }
 }
 
@@ -561,35 +692,69 @@ fn parse_gem_metadata_yaml(yaml: &str) -> Option<GemMetadata> {
     Some(meta)
 }
 
-/// Build a gem metadata index from vendor/cache/*.gem tarballs.
-/// Returns gem_name → GemMetadata with require_paths and executables.
-pub fn build_vendor_cache_index(project_dir: &Path) -> HashMap<String, GemMetadata> {
+/// Lightweight directory scan of `vendor/cache/*.gem`.
+/// Returns gem_name → PathBuf mapping, keeping the latest version per gem name.
+/// Does NOT open any tarballs — only inspects filenames.
+pub fn build_vendor_cache_path_index(project_dir: &Path) -> HashMap<String, PathBuf> {
     let cache_dir = project_dir.join("vendor").join("cache");
     if !cache_dir.is_dir() {
         return HashMap::new();
     }
-    let gem_files: Vec<PathBuf> = std::fs::read_dir(&cache_dir)
-        .into_iter()
-        .flatten()
-        .flatten()
-        .filter(|e| e.path().extension().is_some_and(|ext| ext == "gem"))
-        .map(|e| e.path())
-        .collect();
 
-    // Extract in parallel
+    let mut best: HashMap<String, (String, PathBuf)> = HashMap::new();
+    let entries = match std::fs::read_dir(&cache_dir) {
+        Ok(rd) => rd,
+        Err(_) => return HashMap::new(),
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().is_none_or(|ext| ext != "gem") {
+            continue;
+        }
+        let filename = match path.file_stem() {
+            Some(s) => s.to_string_lossy().to_string(),
+            None => continue,
+        };
+        let gem_name = match extract_gem_name_from_filename(&filename) {
+            Some(n) => n,
+            None => continue,
+        };
+        let version = extract_gem_version(&filename).unwrap_or_default();
+        match best.entry(gem_name) {
+            std::collections::hash_map::Entry::Vacant(e) => {
+                e.insert((version, path));
+            }
+            std::collections::hash_map::Entry::Occupied(mut e) => {
+                if compare_gem_versions(&version, &e.get().0) == std::cmp::Ordering::Greater {
+                    e.insert((version, path));
+                }
+            }
+        }
+    }
+    best.into_iter()
+        .map(|(name, (_, path))| (name, path))
+        .collect()
+}
+
+/// Extract metadata (require_paths, executables) from a single `.gem` tarball.
+/// This is the expensive operation — opens the tar, decompresses metadata.gz, parses YAML.
+pub fn extract_vendor_gem_metadata(gem_path: &Path) -> Option<GemMetadata> {
+    extract_gem_metadata(gem_path)
+}
+
+/// Build a gem metadata index from vendor/cache/*.gem tarballs.
+/// Returns gem_name → GemMetadata with require_paths and executables.
+///
+/// Prefer `build_vendor_cache_path_index` + on-demand `extract_vendor_gem_metadata`
+/// for lazy evaluation — this eagerly extracts every gem.
+#[allow(dead_code)]
+pub fn build_vendor_cache_index(project_dir: &Path) -> HashMap<String, GemMetadata> {
+    let paths = build_vendor_cache_path_index(project_dir);
     use rayon::prelude::*;
-    let results: Vec<(String, GemMetadata)> = gem_files
-        .par_iter()
-        .filter_map(|path| {
-            let filename = path.file_stem()?.to_string_lossy().to_string();
-            // Parse gem_name from "gem_name-version" filename
-            let gem_name = extract_gem_name_from_filename(&filename)?;
-            let meta = extract_gem_metadata(path)?;
-            Some((gem_name, meta))
-        })
-        .collect();
-
-    results.into_iter().collect()
+    paths
+        .into_par_iter()
+        .filter_map(|(name, path)| extract_vendor_gem_metadata(&path).map(|m| (name, m)))
+        .collect()
 }
 
 /// Extract gem name from a "name-version" filename (e.g., "activesupport-8.1.1" → "activesupport").
@@ -878,13 +1043,117 @@ mod tests {
         let lib_dir = gem_dir.join("lib");
         let sub_dir = lib_dir.join("mygem");
         std::fs::create_dir_all(&sub_dir).unwrap();
-        // No top-level rb files — should scan one level deeper
+        // No top-level rb files — discovery is restricted to lib/<gem>.rb,
+        // so nested files must NOT be scanned (they tend to declare generic
+        // helper names that over-match in app code). The curated
+        // KNOWN_MODULE_NAMES table in main.rs is the safety net.
         std::fs::write(sub_dir.join("core.rb"), "class MyGem::Core\nend\n").unwrap();
 
         let index = build_gem_index(&[dir.path().to_path_buf()]);
         let modules = discover_gem_module_names("mygem", &index);
-        assert!(modules.contains(&"MyGem::Core".to_string()));
+        assert!(modules.is_empty());
     }
+
+    #[test]
+    fn discover_module_names_only_top_level_entry_file() {
+        // lib/mygem.rb declares MyGem; lib/mygem/internal.rb declares
+        // generic helpers. Only top-level should be picked up.
+        let dir = tempfile::tempdir().unwrap();
+        let gems_dir = dir.path().join("gems");
+        let gem_dir = gems_dir.join("mygem-1.0.0");
+        let lib_dir = gem_dir.join("lib");
+        let sub_dir = lib_dir.join("mygem");
+        std::fs::create_dir_all(&sub_dir).unwrap();
+        std::fs::write(lib_dir.join("mygem.rb"), "module MyGem\nend\n").unwrap();
+        // A sibling top-level rb file that is NOT the gem entry — must be ignored.
+        std::fs::write(lib_dir.join("unrelated.rb"), "module Unrelated\nend\n").unwrap();
+        std::fs::write(
+            sub_dir.join("base.rb"),
+            "class MyGem::Base\nend\nclass MyGem::Configuration\nend\n",
+        )
+        .unwrap();
+
+        let index = build_gem_index(&[dir.path().to_path_buf()]);
+        let modules = discover_gem_module_names("mygem", &index);
+        assert_eq!(modules, vec!["MyGem".to_string()]);
+    }
+
+    #[test]
+    fn discover_module_names_underscore_variant() {
+        // Hyphenated gem name: lib/google_cloud.rb is also considered.
+        let dir = tempfile::tempdir().unwrap();
+        let gems_dir = dir.path().join("gems");
+        let gem_dir = gems_dir.join("google-cloud-1.0.0");
+        let lib_dir = gem_dir.join("lib");
+        std::fs::create_dir_all(&lib_dir).unwrap();
+        std::fs::write(lib_dir.join("google_cloud.rb"), "module GoogleCloud\nend\n").unwrap();
+
+        let index = build_gem_index(&[dir.path().to_path_buf()]);
+        let modules = discover_gem_module_names("google-cloud", &index);
+        assert!(modules.contains(&"GoogleCloud".to_string()));
+    }
+
+    #[test]
+    fn discover_module_names_first_segment_variant() {
+        // Hyphenated gem: lib/<first-segment>.rb is also considered.
+        let dir = tempfile::tempdir().unwrap();
+        let gems_dir = dir.path().join("gems");
+        let gem_dir = gems_dir.join("aws-sdk-s3-1.0.0");
+        let lib_dir = gem_dir.join("lib");
+        std::fs::create_dir_all(&lib_dir).unwrap();
+        std::fs::write(lib_dir.join("aws.rb"), "module Aws\nend\n").unwrap();
+
+        let index = build_gem_index(&[dir.path().to_path_buf()]);
+        let modules = discover_gem_module_names("aws-sdk-s3", &index);
+        assert!(modules.contains(&"Aws".to_string()));
+    }
+
+    #[test]
+    fn discover_module_names_filters_generic_helpers() {
+        // Even in the top-level entry file, generic names like Configuration
+        // / Error / VERSION must be filtered out.
+        let dir = tempfile::tempdir().unwrap();
+        let gems_dir = dir.path().join("gems");
+        let gem_dir = gems_dir.join("mygem-1.0.0");
+        let lib_dir = gem_dir.join("lib");
+        std::fs::create_dir_all(&lib_dir).unwrap();
+        std::fs::write(
+            lib_dir.join("mygem.rb"),
+            "module MyGem\nend\nclass Configuration\nend\nclass Error\nend\nVERSION = '1'\nmodule VERSION\nend\n",
+        )
+        .unwrap();
+
+        let index = build_gem_index(&[dir.path().to_path_buf()]);
+        let modules = discover_gem_module_names("mygem", &index);
+        assert!(modules.contains(&"MyGem".to_string()));
+        assert!(!modules.contains(&"Configuration".to_string()));
+        assert!(!modules.contains(&"Error".to_string()));
+        assert!(!modules.contains(&"VERSION".to_string()));
+    }
+
+    #[test]
+    fn discover_module_names_skips_version_subfile() {
+        // lib/<gem>/version.rb must NOT be scanned (it only contains VERSION).
+        let dir = tempfile::tempdir().unwrap();
+        let gems_dir = dir.path().join("gems");
+        let gem_dir = gems_dir.join("mygem-1.0.0");
+        let lib_dir = gem_dir.join("lib");
+        let sub_dir = lib_dir.join("mygem");
+        std::fs::create_dir_all(&sub_dir).unwrap();
+        std::fs::write(lib_dir.join("mygem.rb"), "module MyGem\nend\n").unwrap();
+        std::fs::write(
+            sub_dir.join("version.rb"),
+            "module MyGem\n  VERSION = '1.0.0'\nend\n",
+        )
+        .unwrap();
+
+        let index = build_gem_index(&[dir.path().to_path_buf()]);
+        let modules = discover_gem_module_names("mygem", &index);
+        // Only top-level scanned; version.rb is not.
+        assert_eq!(modules, vec!["MyGem".to_string()]);
+    }
+
+    // ── select_rvm_gemset (deterministic RVM selection) ──
 
     #[test]
     fn discover_module_names_missing_gem() {
@@ -902,6 +1171,74 @@ mod tests {
         let index = build_gem_index(&[dir.path().to_path_buf()]);
         let modules = discover_gem_module_names("mygem", &index);
         assert!(modules.is_empty());
+    }
+
+    #[test]
+    fn rvm_select_prefers_version_plus_gemset() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("project");
+        let gems = dir.path().join("gems");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join(".ruby-version"), "3.3.0\n").unwrap();
+        std::fs::write(project.join(".ruby-gemset"), "myapp\n").unwrap();
+        // Multiple candidates exist
+        std::fs::create_dir_all(gems.join("ruby-3.3.0").join("gems")).unwrap();
+        std::fs::create_dir_all(gems.join("ruby-3.3.0@myapp").join("gems")).unwrap();
+        std::fs::create_dir_all(gems.join("ruby-3.4.0").join("gems")).unwrap();
+
+        let chosen = select_rvm_gemset(&gems, &project).unwrap();
+        assert_eq!(chosen, gems.join("ruby-3.3.0@myapp"));
+    }
+
+    #[test]
+    fn rvm_select_prefers_version_only_when_no_gemset_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("project");
+        let gems = dir.path().join("gems");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join(".ruby-version"), "3.2.1\n").unwrap();
+        std::fs::create_dir_all(gems.join("ruby-3.2.1").join("gems")).unwrap();
+        std::fs::create_dir_all(gems.join("ruby-3.4.0").join("gems")).unwrap();
+        std::fs::create_dir_all(gems.join("ruby-3.2.1@other").join("gems")).unwrap();
+
+        let chosen = select_rvm_gemset(&gems, &project).unwrap();
+        assert_eq!(chosen, gems.join("ruby-3.2.1"));
+    }
+
+    #[test]
+    fn rvm_select_deterministic_fallback() {
+        // No project hints — fallback must be deterministic regardless of
+        // filesystem read order.
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("project");
+        let gems = dir.path().join("gems");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(gems.join("ruby-3.2.0").join("gems")).unwrap();
+        std::fs::create_dir_all(gems.join("ruby-3.3.10").join("gems")).unwrap();
+        std::fs::create_dir_all(gems.join("ruby-3.3.10@global")).unwrap(); // skipped
+        std::fs::create_dir_all(gems.join("ruby-3.3.10@app").join("gems")).unwrap();
+        std::fs::create_dir_all(gems.join("ruby-3.4.0").join("gems")).unwrap();
+
+        // Run twice — must return the same result both times.
+        let a = select_rvm_gemset(&gems, &project).unwrap();
+        let b = select_rvm_gemset(&gems, &project).unwrap();
+        assert_eq!(a, b);
+        // Plain (no @gemset) is preferred; among plain entries, longest name wins,
+        // ties broken by descending alphabetic order ⇒ "ruby-3.3.10".
+        assert_eq!(a, gems.join("ruby-3.3.10"));
+    }
+
+    #[test]
+    fn rvm_select_fallback_picks_at_gemset_when_no_plain() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("project");
+        let gems = dir.path().join("gems");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(gems.join("ruby-3.3.0@app").join("gems")).unwrap();
+        std::fs::create_dir_all(gems.join("ruby-3.3.0@global")).unwrap();
+
+        let chosen = select_rvm_gemset(&gems, &project).unwrap();
+        assert_eq!(chosen, gems.join("ruby-3.3.0@app"));
     }
 
     // ── parse_gem_metadata_yaml ──
@@ -1325,5 +1662,49 @@ mod tests {
             extract_gem_name_from_filename("rails-7.2.0.beta1"),
             Some("rails".to_string())
         );
+    }
+
+    // ── build_vendor_cache_path_index ──
+
+    #[test]
+    fn path_index_returns_correct_mapping() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache_dir = dir.path().join("vendor").join("cache");
+        std::fs::create_dir_all(&cache_dir).unwrap();
+
+        // Create empty .gem files — path index should not care about contents
+        std::fs::write(cache_dir.join("rails-7.1.3.gem"), b"").unwrap();
+        std::fs::write(cache_dir.join("nokogiri-1.16.0-x86_64-linux.gem"), b"").unwrap();
+        std::fs::write(cache_dir.join("aws-sdk-s3-1.143.0.gem"), b"").unwrap();
+        // Non-gem file should be ignored
+        std::fs::write(cache_dir.join("README.txt"), b"").unwrap();
+
+        let index = build_vendor_cache_path_index(dir.path());
+        assert_eq!(index.len(), 3);
+        assert_eq!(index["rails"], cache_dir.join("rails-7.1.3.gem"));
+        assert_eq!(
+            index["nokogiri"],
+            cache_dir.join("nokogiri-1.16.0-x86_64-linux.gem")
+        );
+        assert_eq!(
+            index["aws-sdk-s3"],
+            cache_dir.join("aws-sdk-s3-1.143.0.gem")
+        );
+        assert!(!index.contains_key("README"));
+    }
+
+    #[test]
+    fn path_index_keeps_latest_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache_dir = dir.path().join("vendor").join("cache");
+        std::fs::create_dir_all(&cache_dir).unwrap();
+
+        std::fs::write(cache_dir.join("rails-6.1.0.gem"), b"").unwrap();
+        std::fs::write(cache_dir.join("rails-7.1.3.gem"), b"").unwrap();
+        std::fs::write(cache_dir.join("rails-7.0.8.gem"), b"").unwrap();
+
+        let index = build_vendor_cache_path_index(dir.path());
+        assert_eq!(index.len(), 1);
+        assert_eq!(index["rails"], cache_dir.join("rails-7.1.3.gem"));
     }
 }

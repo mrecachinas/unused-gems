@@ -1,35 +1,41 @@
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Mutex;
 use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
 
-const CACHE_VERSION: u32 = 3; // bumped: nanosecond mtime precision
+const CACHE_VERSION: u32 = 4; // bumped: Bundler.require splat detection + middleware string refs
 const CACHE_FILE: &str = ".unused_gems_cache";
 
-/// Return type for cache hits: (requires, modules, bundler_groups, bundler_require_all)
-type CacheHit = (Vec<String>, Vec<String>, Vec<String>, bool);
-
 #[derive(Serialize, Deserialize)]
-struct CacheEntry {
+pub(crate) struct CacheEntry {
     mtime_secs: u64,
     mtime_nanos: u32,
     size: u64,
-    requires: Vec<String>,
-    modules: Vec<String>,
-    bundler_groups: Vec<String>,
-    bundler_require_all: bool,
+    pub(crate) requires: Vec<String>,
+    pub(crate) modules: Vec<String>,
+    pub(crate) bundler_groups: Vec<String>,
+    pub(crate) bundler_require_all: bool,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Deserialize, Serialize)]
 struct CacheFile {
     version: u32,
     entries: HashMap<String, CacheEntry>,
 }
 
+#[derive(Serialize)]
+struct CacheFileRef<'a> {
+    version: u32,
+    entries: &'a HashMap<String, CacheEntry>,
+}
+
 pub struct FileCache {
-    entries: HashMap<String, CacheEntry>,
-    dirty: bool,
+    /// Wrapped in Mutex so we can `take()` (consume) entries on cache hit
+    /// without cloning. Lock is held only briefly per file.
+    entries: Mutex<HashMap<String, CacheEntry>>,
+    dirty: std::sync::atomic::AtomicBool,
     cache_path: std::path::PathBuf,
 }
 
@@ -50,37 +56,67 @@ impl FileCache {
             HashMap::new()
         };
         FileCache {
-            entries,
-            dirty: false,
+            entries: Mutex::new(entries),
+            dirty: std::sync::atomic::AtomicBool::new(false),
             cache_path,
         }
     }
 
     pub fn disabled() -> Self {
         FileCache {
-            entries: HashMap::new(),
-            dirty: false,
+            entries: Mutex::new(HashMap::new()),
+            dirty: std::sync::atomic::AtomicBool::new(false),
             cache_path: std::path::PathBuf::new(),
         }
     }
 
-    /// Check cache for a file. Returns Some((requires, modules, bundler_groups, bundler_require_all)) on hit.
-    pub fn get(&self, rel_path: &str, mtime: SystemTime, size: u64) -> Option<CacheHit> {
-        let entry = self.entries.get(rel_path)?;
+    /// Check cache for a file. Returns a borrowed CacheEntry clone on hit.
+    /// Kept for tests / external readers; scanner uses `take()` to avoid clones.
+    #[allow(dead_code)]
+    pub fn get(&self, rel_path: &str, mtime: SystemTime, size: u64) -> Option<CacheEntry> {
+        let entries = self.entries.lock().unwrap();
+        let entry = entries.get(rel_path)?;
         let duration = mtime.duration_since(SystemTime::UNIX_EPOCH).ok()?;
         let mtime_secs = duration.as_secs();
         let mtime_nanos = duration.subsec_nanos();
         if entry.mtime_secs == mtime_secs && entry.mtime_nanos == mtime_nanos && entry.size == size
         {
-            Some((
-                entry.requires.clone(),
-                entry.modules.clone(),
-                entry.bundler_groups.clone(),
-                entry.bundler_require_all,
-            ))
+            Some(CacheEntry {
+                mtime_secs: entry.mtime_secs,
+                mtime_nanos: entry.mtime_nanos,
+                size: entry.size,
+                requires: entry.requires.clone(),
+                modules: entry.modules.clone(),
+                bundler_groups: entry.bundler_groups.clone(),
+                bundler_require_all: entry.bundler_require_all,
+            })
         } else {
             None
         }
+    }
+
+    /// Consume the cache entry on hit (removes from internal map, returns owned CacheEntry).
+    /// This avoids cloning the inner Vec<String>s on the hot path.
+    /// If validation fails, the entry is left in place.
+    pub fn take(&self, rel_path: &str, mtime: SystemTime, size: u64) -> Option<CacheEntry> {
+        let mut entries = self.entries.lock().unwrap();
+        // Validate before removing
+        let entry = entries.get(rel_path)?;
+        let duration = mtime.duration_since(SystemTime::UNIX_EPOCH).ok()?;
+        let mtime_secs = duration.as_secs();
+        let mtime_nanos = duration.subsec_nanos();
+        if entry.mtime_secs != mtime_secs || entry.mtime_nanos != mtime_nanos || entry.size != size
+        {
+            return None;
+        }
+        entries.remove(rel_path)
+    }
+
+    /// Re-insert a previously `take()`n entry back into the cache without marking
+    /// it dirty. Used by the scanner cache-hit path to preserve durability while
+    /// avoiding spurious cache_buf round-trips.
+    pub(crate) fn reinsert(&self, rel_path: String, entry: CacheEntry) {
+        self.entries.lock().unwrap().insert(rel_path, entry);
     }
 
     /// Insert/update a cache entry.
@@ -100,7 +136,7 @@ impl FileCache {
             .unwrap_or_default();
         let mtime_secs = duration.as_secs();
         let mtime_nanos = duration.subsec_nanos();
-        self.entries.insert(
+        self.entries.lock().unwrap().insert(
             rel_path,
             CacheEntry {
                 mtime_secs,
@@ -112,34 +148,20 @@ impl FileCache {
                 bundler_require_all,
             },
         );
-        self.dirty = true;
+        self.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Write cache to disk if modified.
     pub fn save(&self) {
-        if !self.dirty || self.cache_path.as_os_str().is_empty() {
+        if !self.dirty.load(std::sync::atomic::Ordering::Relaxed)
+            || self.cache_path.as_os_str().is_empty()
+        {
             return;
         }
-        let cf = CacheFile {
+        let entries = self.entries.lock().unwrap();
+        let cf = CacheFileRef {
             version: CACHE_VERSION,
-            entries: self
-                .entries
-                .iter()
-                .map(|(k, v)| {
-                    (
-                        k.clone(),
-                        CacheEntry {
-                            mtime_secs: v.mtime_secs,
-                            mtime_nanos: v.mtime_nanos,
-                            size: v.size,
-                            requires: v.requires.clone(),
-                            modules: v.modules.clone(),
-                            bundler_groups: v.bundler_groups.clone(),
-                            bundler_require_all: v.bundler_require_all,
-                        },
-                    )
-                })
-                .collect(),
+            entries: &entries,
         };
         if let Ok(data) = bincode::serialize(&cf) {
             let _ = std::fs::write(&self.cache_path, data);
@@ -181,13 +203,13 @@ mod tests {
             false,
         );
 
-        let result = cache.get("app/foo.rb", mtime, 42);
-        assert!(result.is_some());
-        let (requires, modules, groups, breq) = result.unwrap();
-        assert_eq!(requires, vec!["foo"]);
-        assert_eq!(modules, vec!["Foo"]);
-        assert_eq!(groups, vec!["default"]);
-        assert!(!breq);
+        let entry = cache.get("app/foo.rb", mtime, 42);
+        assert!(entry.is_some());
+        let entry = entry.unwrap();
+        assert_eq!(entry.requires, vec!["foo"]);
+        assert_eq!(entry.modules, vec!["Foo"]);
+        assert_eq!(entry.bundler_groups, vec!["default"]);
+        assert!(!entry.bundler_require_all);
     }
 
     #[test]
@@ -243,12 +265,12 @@ mod tests {
         }
 
         let cache = FileCache::load(dir.path());
-        let result = cache.get("app/bar.rb", mtime, 100);
-        assert!(result.is_some());
-        let (requires, modules, _, breq) = result.unwrap();
-        assert_eq!(requires, vec!["bar"]);
-        assert_eq!(modules, vec!["Bar"]);
-        assert!(breq);
+        let entry = cache.get("app/bar.rb", mtime, 100);
+        assert!(entry.is_some());
+        let entry = entry.unwrap();
+        assert_eq!(entry.requires, vec!["bar"]);
+        assert_eq!(entry.modules, vec!["Bar"]);
+        assert!(entry.bundler_require_all);
     }
 
     #[test]
