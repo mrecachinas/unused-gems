@@ -1,0 +1,3 @@
+adapters:
+  cache:
+    custom_cache_store: custom-cache-gem

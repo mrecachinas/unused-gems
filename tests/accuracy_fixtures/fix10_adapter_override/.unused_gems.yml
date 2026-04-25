@@ -1,0 +1,3 @@
+adapters:
+  database:
+    clickhouse: clickhouse-activerecord

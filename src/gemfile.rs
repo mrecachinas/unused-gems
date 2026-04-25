@@ -12,10 +12,14 @@ pub fn parse_gemfile(dir: &Path) -> Vec<GemEntry> {
         std::process::exit(1);
     }
 
+    parse_gemfiles(dir, &[gemfile_path])
+}
+
+pub fn parse_gemfiles(dir: &Path, gemfile_paths: &[std::path::PathBuf]) -> Vec<GemEntry> {
     let mut gems = Vec::new();
-    let mut files_to_process = vec![dir.join("Gemfile")];
+    let mut files_to_process: Vec<std::path::PathBuf> = gemfile_paths.to_vec();
     let mut processed_files = std::collections::HashSet::new();
-    let mut has_bare_gemspec = false;
+    let mut bare_gemspec_dirs = std::collections::HashSet::new();
 
     while let Some(path) = files_to_process.pop() {
         if !path.exists() {
@@ -34,12 +38,14 @@ pub fn parse_gemfile(dir: &Path) -> Vec<GemEntry> {
         };
 
         let parse_result = ruby_prism::parse(&source);
+        let parent = path.parent().unwrap_or(dir);
 
         let mut visitor = GemfileVisitor {
             gems: Vec::new(),
             current_groups: Vec::new(),
             current_platforms: Vec::new(),
             source: &source,
+            base_dir: parent.to_path_buf(),
             eval_gemfiles: Vec::new(),
             gemspec_paths: Vec::new(),
             has_bare_gemspec: false,
@@ -48,10 +54,9 @@ pub fn parse_gemfile(dir: &Path) -> Vec<GemEntry> {
 
         gems.extend(visitor.gems);
         if visitor.has_bare_gemspec {
-            has_bare_gemspec = true;
+            bare_gemspec_dirs.insert(parent.to_path_buf());
         }
 
-        let parent = path.parent().unwrap_or(dir);
         for eval_path in visitor.eval_gemfiles {
             let p = parent.join(eval_path);
             files_to_process.push(p);
@@ -67,9 +72,9 @@ pub fn parse_gemfile(dir: &Path) -> Vec<GemEntry> {
         }
     }
 
-    // Only parse root gemspecs if a bare `gemspec` directive (no path: arg) was found
-    if has_bare_gemspec {
-        let pattern = dir.join("*.gemspec").display().to_string();
+    // Only parse sibling gemspecs if a bare `gemspec` directive (no path: arg) was found.
+    for spec_dir in bare_gemspec_dirs {
+        let pattern = spec_dir.join("*.gemspec").display().to_string();
         for entry in glob::glob(&pattern).into_iter().flatten().flatten() {
             parse_gemspec_deps(&entry, &mut gems);
         }
@@ -84,6 +89,7 @@ struct GemfileVisitor<'s> {
     current_groups: Vec<String>,
     current_platforms: Vec<String>,
     source: &'s [u8],
+    base_dir: std::path::PathBuf,
     eval_gemfiles: Vec<String>,
     gemspec_paths: Vec<String>,
     has_bare_gemspec: bool,
@@ -110,6 +116,7 @@ impl<'s> GemfileVisitor<'s> {
         let mut require_paths: Vec<String> = Vec::new();
         let mut groups: Vec<String> = self.current_groups.clone();
         let mut platforms: Vec<String> = self.current_platforms.clone();
+        let mut source = None;
 
         // Check remaining args for keyword hash
         for arg in &arg_list[1..] {
@@ -157,6 +164,22 @@ impl<'s> GemfileVisitor<'s> {
                                     }
                                 }
                             }
+                            Some("path") => {
+                                if let Some(s) = extract_string_value(&assoc.value(), self.source) {
+                                    let path = std::path::PathBuf::from(s);
+                                    let path = if path.is_absolute() {
+                                        path
+                                    } else {
+                                        self.base_dir.join(path)
+                                    };
+                                    source = Some(crate::types::GemSource::Path(path));
+                                }
+                            }
+                            Some("git") => {
+                                if let Some(s) = extract_string_value(&assoc.value(), self.source) {
+                                    source = Some(crate::types::GemSource::Git(s));
+                                }
+                            }
                             _ => {}
                         }
                     }
@@ -179,6 +202,7 @@ impl<'s> GemfileVisitor<'s> {
             },
             module_names: Vec::new(),
             require_false,
+            source,
         });
     }
 
@@ -315,6 +339,9 @@ fn merge_duplicate_gems(gems: Vec<GemEntry>) -> Vec<GemEntry> {
             }
             // require_false: logical OR
             existing.require_false = existing.require_false || gem.require_false;
+            if existing.source.is_none() {
+                existing.source = gem.source;
+            }
         } else {
             seen.insert(gem.name.clone(), result.len());
             result.push(gem);
@@ -386,6 +413,7 @@ impl<'s> Visit<'_> for GemspecVisitor<'s> {
                         require_paths: Vec::new(),
                         module_names: Vec::new(),
                         require_false: false,
+                        source: None,
                     });
                 }
             }
@@ -636,6 +664,67 @@ end
     }
 
     #[test]
+    fn gem_path_source_is_resolved_from_declaring_gemfile() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("engines/admin")).unwrap();
+        std::fs::write(
+            dir.path().join("Gemfile"),
+            "gem 'admin_tools', path: 'engines/admin'\n",
+        )
+        .unwrap();
+        let gems = parse_gemfile(dir.path());
+        let g = find_gem(&gems, "admin_tools");
+        assert_eq!(
+            g.source.as_ref(),
+            Some(&crate::types::GemSource::Path(
+                dir.path().join("engines/admin")
+            ))
+        );
+    }
+
+    #[test]
+    fn gem_git_source_is_retained() {
+        let gems = parse_gems("gem 'custom_gem', git: 'https://example.test/custom.git'\n");
+        let g = find_gem(&gems, "custom_gem");
+        assert_eq!(
+            g.source.as_ref(),
+            Some(&crate::types::GemSource::Git(
+                "https://example.test/custom.git".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn parse_gemfiles_merges_multiple_explicit_gemfiles() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = dir.path().join("engines/admin");
+        std::fs::create_dir_all(&engine).unwrap();
+        let root_gemfile = dir.path().join("Gemfile");
+        let engine_gemfile = engine.join("Gemfile");
+        std::fs::write(&root_gemfile, "gem 'rails'\n").unwrap();
+        std::fs::write(&engine_gemfile, "gem 'puma'\n").unwrap();
+        let gems = parse_gemfiles(dir.path(), &[root_gemfile, engine_gemfile]);
+        assert!(gems.iter().any(|g| g.name == "rails"));
+        assert!(gems.iter().any(|g| g.name == "puma"));
+    }
+
+    #[test]
+    fn parse_gemfiles_parses_bare_gemspec_next_to_explicit_gemfile() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = dir.path().join("engines/admin");
+        std::fs::create_dir_all(&engine).unwrap();
+        let engine_gemfile = engine.join("Gemfile");
+        std::fs::write(&engine_gemfile, "gemspec\n").unwrap();
+        std::fs::write(
+            engine.join("admin.gemspec"),
+            "Gem::Specification.new do |s|\n  s.add_dependency 'devise'\nend\n",
+        )
+        .unwrap();
+        let gems = parse_gemfiles(dir.path(), &[engine_gemfile]);
+        assert!(gems.iter().any(|g| g.name == "devise"));
+    }
+
+    #[test]
     fn gemspec_add_runtime_dependency() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("Gemfile"), "gemspec\n").unwrap();
@@ -767,6 +856,23 @@ end
         let g = find_gem(&gems, "x");
         assert!(g.require_false);
         assert!(g.require_paths.contains(&"x/init".to_string()));
+    }
+
+    #[test]
+    fn duplicate_gems_preserve_source_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("vendor/x")).unwrap();
+        std::fs::write(
+            dir.path().join("Gemfile"),
+            "gem 'x'\ngem 'x', path: 'vendor/x'\n",
+        )
+        .unwrap();
+        let gems = parse_gemfile(dir.path());
+        let g = find_gem(&gems, "x");
+        assert_eq!(
+            g.source.as_ref(),
+            Some(&crate::types::GemSource::Path(dir.path().join("vendor/x")))
+        );
     }
 
     #[test]

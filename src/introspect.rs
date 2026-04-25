@@ -5,6 +5,8 @@ use std::path::{Path, PathBuf};
 use once_cell::sync::Lazy;
 use regex::Regex;
 
+use crate::types::{GemEntry, GemSource};
+
 static MODULE_DECL_RE: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"(?m)^\s*(?:module|class)\s+([A-Z][\w:]+)").unwrap());
 
@@ -434,6 +436,75 @@ pub fn build_gem_index(gem_paths: &[PathBuf]) -> HashMap<String, PathBuf> {
     index
 }
 
+pub fn index_declared_gem_sources(
+    project_dir: &Path,
+    gems: &[GemEntry],
+    index: &mut HashMap<String, PathBuf>,
+) {
+    for gem in gems {
+        match gem.source.as_ref() {
+            Some(GemSource::Path(path)) => {
+                if looks_like_gem_source(path) {
+                    index.insert(gem.name.clone(), path.clone());
+                } else {
+                    eprintln!(
+                        "Warning: path gem '{}' does not look introspectable at {}",
+                        gem.name,
+                        path.display()
+                    );
+                }
+            }
+            Some(GemSource::Git(_)) => {
+                if let Some(path) = find_local_git_checkout(project_dir, &gem.name) {
+                    index.insert(gem.name.clone(), path);
+                }
+            }
+            None => {}
+        }
+    }
+}
+
+fn looks_like_gem_source(path: &Path) -> bool {
+    path.is_dir()
+        && (path.join("lib").is_dir()
+            || glob::glob(&path.join("*.gemspec").display().to_string())
+                .into_iter()
+                .flatten()
+                .flatten()
+                .next()
+                .is_some())
+}
+
+fn find_local_git_checkout(project_dir: &Path, gem_name: &str) -> Option<PathBuf> {
+    let mut roots = Vec::new();
+    roots.push(project_dir.join(".bundle"));
+    roots.push(project_dir.join("vendor").join("bundle"));
+    if let Some(bundle_path) = read_bundle_path(project_dir) {
+        roots.push(if bundle_path.is_absolute() {
+            bundle_path
+        } else {
+            project_dir.join(bundle_path)
+        });
+    }
+
+    for root in roots {
+        let pattern = root
+            .join("ruby")
+            .join("*")
+            .join("bundler")
+            .join("gems")
+            .join(format!("{}-*", gem_name))
+            .display()
+            .to_string();
+        for path in glob::glob(&pattern).into_iter().flatten().flatten() {
+            if looks_like_gem_source(&path) {
+                return Some(path);
+            }
+        }
+    }
+    None
+}
+
 /// Discover actual require paths by inspecting the installed gem's lib/ directory.
 /// Also checks gemspec for custom require_paths (e.g., ["lib", "ext"]).
 pub fn discover_gem_require_paths(
@@ -491,22 +562,24 @@ fn read_gemspec_require_paths(gem_dir: &Path) -> Option<Vec<String>> {
         }
         if let Ok(content) = std::fs::read_to_string(&path) {
             // Match: s.require_paths = ["lib", "ext"] or s.require_path = "lib"
-            static REQ_PATHS_RE: Lazy<Regex> =
-                Lazy::new(|| Regex::new(r#"require_paths?\s*=\s*\[([^\]]+)\]"#).unwrap());
+            static REQ_PATHS_ARRAY_RE: Lazy<Regex> =
+                Lazy::new(|| Regex::new(r#"(?s)require_paths?\s*=\s*\[([^\]]+)\]"#).unwrap());
+            static REQ_PATHS_PERCENT_RE: Lazy<Regex> = Lazy::new(|| {
+                Regex::new(r#"(?s)require_paths?\s*=\s*%[wW][\[\(\{]([^\]\)\}]+)[\]\)\}]"#).unwrap()
+            });
             static REQ_PATH_SINGLE_RE: Lazy<Regex> =
                 Lazy::new(|| Regex::new(r#"require_path\s*=\s*['"]([^'"]+)['"]"#).unwrap());
-            if let Some(cap) = REQ_PATHS_RE.captures(&content) {
-                let inner = &cap[1];
-                let paths: Vec<String> = inner
-                    .split(',')
-                    .filter_map(|s| {
-                        let trimmed = s.trim().trim_matches(|c| c == '\'' || c == '"').trim();
-                        if trimmed.is_empty() {
-                            None
-                        } else {
-                            Some(trimmed.to_string())
-                        }
-                    })
+            if let Some(cap) = REQ_PATHS_ARRAY_RE.captures(&content) {
+                let paths = extract_quoted_strings(&cap[1]);
+                if !paths.is_empty() {
+                    return Some(paths);
+                }
+            }
+            if let Some(cap) = REQ_PATHS_PERCENT_RE.captures(&content) {
+                let paths: Vec<String> = cap[1]
+                    .split_whitespace()
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
                     .collect();
                 if !paths.is_empty() {
                     return Some(paths);
@@ -518,6 +591,14 @@ fn read_gemspec_require_paths(gem_dir: &Path) -> Option<Vec<String>> {
         }
     }
     None
+}
+
+fn extract_quoted_strings(input: &str) -> Vec<String> {
+    static QUOTED_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r#"['"]([^'"]+)['"]"#).unwrap());
+    QUOTED_RE
+        .captures_iter(input)
+        .map(|cap| cap[1].to_string())
+        .collect()
 }
 
 /// Extract top-level module/class names from a gem's `lib/<gem>.rb` entry
@@ -916,6 +997,48 @@ mod tests {
     }
 
     #[test]
+    fn gemspec_require_paths_multiline_array() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("multi.gemspec"),
+            "Gem::Specification.new do |s|\n  s.require_paths = [\n    'lib',\n    'ext'\n  ]\nend\n",
+        )
+        .unwrap();
+        assert_eq!(
+            read_gemspec_require_paths(dir.path()),
+            Some(vec!["lib".into(), "ext".into()])
+        );
+    }
+
+    #[test]
+    fn gemspec_require_paths_percent_w_array() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("percent.gemspec"),
+            "Gem::Specification.new do |s|\n  s.require_paths = %w[lib ext]\nend\n",
+        )
+        .unwrap();
+        assert_eq!(
+            read_gemspec_require_paths(dir.path()),
+            Some(vec!["lib".into(), "ext".into()])
+        );
+    }
+
+    #[test]
+    fn gemspec_require_paths_percent_w_braces() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("percent_braces.gemspec"),
+            "Gem::Specification.new do |s|\n  s.require_paths = %w{lib ext}\nend\n",
+        )
+        .unwrap();
+        assert_eq!(
+            read_gemspec_require_paths(dir.path()),
+            Some(vec!["lib".into(), "ext".into()])
+        );
+    }
+
+    #[test]
     fn gemspec_require_paths_default() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
@@ -972,6 +1095,48 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let index = build_gem_index(&[dir.path().to_path_buf()]);
         assert!(index.is_empty());
+    }
+
+    #[test]
+    fn index_declared_path_gem_sources() {
+        let dir = tempfile::tempdir().unwrap();
+        let gem_dir = dir.path().join("engines").join("admin_tools");
+        std::fs::create_dir_all(gem_dir.join("lib")).unwrap();
+        let gems = vec![GemEntry {
+            name: "admin_tools".to_string(),
+            groups: vec!["default".to_string()],
+            platforms: Vec::new(),
+            require_paths: Vec::new(),
+            module_names: Vec::new(),
+            require_false: false,
+            source: Some(GemSource::Path(gem_dir.clone())),
+        }];
+        let mut index = HashMap::new();
+        index_declared_gem_sources(dir.path(), &gems, &mut index);
+        assert_eq!(index.get("admin_tools"), Some(&gem_dir));
+    }
+
+    #[test]
+    fn index_declared_git_gem_sources_from_local_bundle_checkout() {
+        let dir = tempfile::tempdir().unwrap();
+        let checkout = dir
+            .path()
+            .join("vendor/bundle/ruby/3.4.0/bundler/gems/custom_gem-abc123");
+        std::fs::create_dir_all(checkout.join("lib")).unwrap();
+        let gems = vec![GemEntry {
+            name: "custom_gem".to_string(),
+            groups: vec!["default".to_string()],
+            platforms: Vec::new(),
+            require_paths: Vec::new(),
+            module_names: Vec::new(),
+            require_false: false,
+            source: Some(GemSource::Git(
+                "https://example.test/custom_gem.git".to_string(),
+            )),
+        }];
+        let mut index = HashMap::new();
+        index_declared_gem_sources(dir.path(), &gems, &mut index);
+        assert_eq!(index.get("custom_gem"), Some(&checkout));
     }
 
     // ── discover_gem_require_paths ──
