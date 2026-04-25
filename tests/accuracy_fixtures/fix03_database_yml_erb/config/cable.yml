@@ -1,0 +1,6 @@
+default: &default
+  adapter: redis
+  url: <%= ENV["REDIS_URL"] %>
+
+production:
+  <<: *default

@@ -1,0 +1,7 @@
+require "rake"
+
+task :default => :hello
+
+task :hello do
+  puts "Hello from Rake"
+end

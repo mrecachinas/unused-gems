@@ -1,0 +1,16 @@
+source "https://rubygems.org"
+
+gem "rails"
+
+group :development, :test do
+  gem "rspec"
+  gem "factory_bot"
+end
+
+group :test do
+  gem "capybara"
+end
+
+group :development do
+  gem "listen"
+end
