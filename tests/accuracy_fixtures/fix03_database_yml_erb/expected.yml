@@ -1,0 +1,5 @@
+rails: used
+pg: used
+trilogy: used
+redis: used
+leftover_gem: unused
