@@ -1,8 +1,33 @@
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 pub fn parse_gemfile_lock(dir: &Path) -> HashMap<String, Vec<String>> {
     let lock_path = dir.join("Gemfile.lock");
+    parse_lockfile_path(&lock_path)
+}
+
+pub fn parse_gemfile_locks(
+    root_dir: &Path,
+    gemfile_paths: &[PathBuf],
+) -> HashMap<String, Vec<String>> {
+    let mut lockfiles = vec![root_dir.join("Gemfile.lock")];
+    for gemfile in gemfile_paths {
+        if let Some(parent) = gemfile.parent() {
+            let lockfile = parent.join("Gemfile.lock");
+            if !lockfiles.contains(&lockfile) {
+                lockfiles.push(lockfile);
+            }
+        }
+    }
+
+    let mut merged = HashMap::new();
+    for lockfile in lockfiles {
+        merge_lock_deps(&mut merged, parse_lockfile_path(&lockfile));
+    }
+    merged
+}
+
+fn parse_lockfile_path(lock_path: &Path) -> HashMap<String, Vec<String>> {
     let content = match std::fs::read_to_string(lock_path) {
         Ok(c) => c,
         Err(_) => return HashMap::new(),
@@ -49,6 +74,20 @@ pub fn parse_gemfile_lock(dir: &Path) -> HashMap<String, Vec<String>> {
     }
 
     deps
+}
+
+fn merge_lock_deps(
+    target: &mut HashMap<String, Vec<String>>,
+    source: HashMap<String, Vec<String>>,
+) {
+    for (gem, deps) in source {
+        let entry = target.entry(gem).or_default();
+        for dep in deps {
+            if !entry.contains(&dep) {
+                entry.push(dep);
+            }
+        }
+    }
 }
 
 pub fn count_transitive_deps(gem_name: &str, lock_deps: &HashMap<String, Vec<String>>) -> usize {
@@ -165,5 +204,38 @@ BUNDLED WITH
         let deps = parse_gemfile_lock(dir.path());
         assert_eq!(deps["rails"], vec!["actionpack"]);
         assert!(deps["actionpack"].is_empty());
+    }
+
+    #[test]
+    fn parse_multiple_gemfile_locks_merges_nearest_lockfiles() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = dir.path().join("engines/admin");
+        std::fs::create_dir_all(&engine).unwrap();
+        std::fs::write(
+            dir.path().join("Gemfile.lock"),
+            "\
+GEM
+  specs:
+    rails (7.1.0)
+      actionpack (= 7.1.0)
+    actionpack (7.1.0)
+",
+        )
+        .unwrap();
+        std::fs::write(
+            engine.join("Gemfile.lock"),
+            "\
+GEM
+  specs:
+    puma (6.4.0)
+      nio4r (~> 2.0)
+    nio4r (2.7.0)
+",
+        )
+        .unwrap();
+
+        let deps = parse_gemfile_locks(dir.path(), &[engine.join("Gemfile")]);
+        assert_eq!(deps["rails"], vec!["actionpack"]);
+        assert_eq!(deps["puma"], vec!["nio4r"]);
     }
 }

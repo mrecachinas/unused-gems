@@ -4,14 +4,15 @@ High-performance scanner for unused gems in Ruby projects, built in Rust with [r
 
 ## Features
 
-- **Gemfile parsing** via ruby-prism AST — handles `gem`, `group`, `require:`, `gemspec` directives
+- **Gemfile parsing** via ruby-prism AST — handles `gem`, `group`, `require:`, `path:`, `git:`, `gemspec` directives
 - **Parallel source scanning** with rayon — scans Ruby/ERB/HAML/YAML files concurrently
 - **Gem introspection** — discovers actual require paths and module names from installed gems
 - **Script/CI detection** — finds gem usage in Makefiles, Dockerfiles, CI configs
 - **Gemfile.lock analysis** — counts transitive dependency chains
+- **Monorepo support** — merge multiple explicit Gemfiles with one source scan
 - **Multiple output formats** — text, JSON, GitHub Actions annotations
 - **Diff mode** — compare against a baseline JSON to detect regressions
-- **Ignore file** — `.unused_gems.yml` support
+- **Ignore file** — `.unused_gems.yml` support for ignores and custom adapter mappings
 
 ## Installation
 
@@ -80,6 +81,9 @@ unused-gems --diff baseline.json /path/to/project
 
 # Skip additional directories
 unused-gems --skip-dirs tmp,cache /path/to/project
+
+# Scan a monorepo with multiple Gemfiles
+unused-gems --gemfile engines/a/Gemfile --gemfile engines/b/Gemfile /path/to/project
 ```
 
 ## CLI Options
@@ -91,6 +95,7 @@ unused-gems --skip-dirs tmp,cache /path/to/project
 -q, --quiet               Suppress progress messages
     --no-cache            Disable file scan cache
     --ignore-file <PATH>  Path to ignore file (default: .unused_gems.yml)
+    --gemfile <PATH>      Gemfile path to analyze; repeat for monorepos
     --diff <BASELINE>     Compare against previous JSON output
     --skip-dirs <DIRS>    Additional directories to skip (comma-separated)
 -h, --help                Print help
@@ -110,6 +115,28 @@ unused-gems --skip-dirs tmp,cache /path/to/project
 | `output.rs` | Text, JSON, GitHub Actions output formatters |
 | `diff.rs` | Baseline comparison mode |
 | `ignore.rs` | `.unused_gems.yml` ignore file support |
+| `adapters.rs` | Built-in and user-provided Rails adapter-to-gem mappings |
+| `known.rs` | Curated require path and module name metadata |
+| `platforms.rs` | Bundler platform token resolution |
+
+## `.unused_gems.yml`
+
+```yaml
+ignore:
+  - development-only-gem
+
+adapters:
+  database:
+    clickhouse: clickhouse-activerecord
+  cable:
+    custom_cable: custom-cable-gem
+  storage:
+    CustomStorage: custom-storage-gem
+  cache:
+    custom_cache_store: custom-cache-gem
+```
+
+Adapter entries map the value used in Rails config to the gem that provides it.
 
 ## Performance
 

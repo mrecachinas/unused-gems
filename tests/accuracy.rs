@@ -113,6 +113,7 @@ fn run_tool(fixture: &Path) -> serde_json::Value {
     let output = Command::new(bin)
         .arg("--output")
         .arg("json")
+        .arg("--no-cache")
         .arg(fixture)
         .output()
         .unwrap_or_else(|e| panic!("invoke {bin}: {e}"));
@@ -292,4 +293,49 @@ fn accuracy_corpus() {
         total.fn_, 0,
         "false negatives detected on bundled corpus (see lines marked 'FN:' above)"
     );
+}
+
+#[test]
+fn explicit_gemfiles_merge_monorepo_declarations() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine_a = dir.path().join("engines/a");
+    let engine_b = dir.path().join("engines/b");
+    std::fs::create_dir_all(&engine_a).unwrap();
+    std::fs::create_dir_all(&engine_b).unwrap();
+    std::fs::write(engine_a.join("Gemfile"), "gem 'puma'\n").unwrap();
+    std::fs::write(engine_b.join("Gemfile"), "gem 'unused-gem'\n").unwrap();
+    std::fs::write(dir.path().join("app.rb"), "require 'puma'\n").unwrap();
+
+    let bin = env!("CARGO_BIN_EXE_unused-gems");
+    let output = Command::new(bin)
+        .arg("--output")
+        .arg("json")
+        .arg("--gemfile")
+        .arg("engines/a/Gemfile")
+        .arg("--gemfile")
+        .arg("engines/b/Gemfile")
+        .arg("--no-cache")
+        .arg(dir.path())
+        .output()
+        .unwrap_or_else(|e| panic!("invoke {bin}: {e}"));
+    let code = output.status.code().unwrap_or(-1);
+    assert!(
+        code == 0 || code == 1,
+        "unused-gems exited {}: stderr={}",
+        code,
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let json: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("parse unused-gems JSON output");
+    let results = json["results"].as_array().expect("results array");
+    let status = |name: &str| {
+        results
+            .iter()
+            .find(|entry| entry["name"].as_str() == Some(name))
+            .and_then(|entry| entry["status"].as_str())
+            .unwrap_or_else(|| panic!("missing result for {name}"))
+    };
+    assert_ne!(status("puma"), "unused");
+    assert_eq!(status("unused-gem"), "unused");
 }

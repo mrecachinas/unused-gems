@@ -1,11 +1,14 @@
+mod adapters;
 mod cache;
 mod diff;
 mod gemfile;
 mod ignore;
 mod introspect;
+mod known;
 mod lockfile;
 mod matcher;
 mod output;
+mod platforms;
 mod scanner;
 mod scripts;
 mod types;
@@ -43,6 +46,10 @@ struct Cli {
     /// Path to ignore file (default: .unused_gems.yml in project root)
     #[arg(long)]
     ignore_file: Option<String>,
+
+    /// Gemfile path(s) to analyze. Repeat for monorepos. Defaults to <directory>/Gemfile.
+    #[arg(long)]
+    gemfile: Vec<String>,
 
     /// Compare against a previous JSON output file and show changes
     #[arg(long)]
@@ -126,14 +133,45 @@ fn main() {
         eprintln!();
     }
 
+    let explicit_gemfiles = !cli.gemfile.is_empty();
+    let gemfile_paths: Vec<PathBuf> = if explicit_gemfiles {
+        cli.gemfile
+            .iter()
+            .map(|p| {
+                let path = PathBuf::from(p);
+                if path.is_absolute() {
+                    path
+                } else {
+                    dir.join(path)
+                }
+            })
+            .collect()
+    } else {
+        vec![dir.join("Gemfile")]
+    };
+
     // Check Gemfile existence before parsing (exit 2 if missing)
-    let gemfile_path = dir.join("Gemfile");
-    if !gemfile_path.exists() {
+    let missing_gemfiles: Vec<&PathBuf> = gemfile_paths.iter().filter(|p| !p.exists()).collect();
+    if !missing_gemfiles.is_empty() {
         if cli.allow_missing_gemfile {
-            eprintln!("Notice: No Gemfile found in {} — skipping.", dir.display());
+            eprintln!(
+                "Notice: Missing Gemfile(s): {} — skipping.",
+                missing_gemfiles
+                    .iter()
+                    .map(|p| p.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
             std::process::exit(0);
         } else {
-            eprintln!("Error: No Gemfile found in {}", dir.display());
+            eprintln!(
+                "Error: Missing Gemfile(s): {}",
+                missing_gemfiles
+                    .iter()
+                    .map(|p| p.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
             std::process::exit(2);
         }
     }
@@ -146,7 +184,14 @@ fn main() {
     };
 
     // 1. Parse Gemfile
-    let mut gems = timed!("parse_gemfile", gemfile::parse_gemfile(&dir));
+    let mut gems = timed!(
+        "parse_gemfile",
+        if explicit_gemfiles {
+            gemfile::parse_gemfiles(&dir, &gemfile_paths)
+        } else {
+            gemfile::parse_gemfile(&dir)
+        }
+    );
     if !cli.quiet {
         eprintln!("Found {} gem(s) in Gemfile", gems.len());
     }
@@ -155,15 +200,14 @@ fn main() {
     let gem_names: Vec<String> = gems.iter().map(|g| g.name.clone()).collect();
     let cache_for_scan = Arc::clone(&file_cache);
     let ignore_file_ref = cli.ignore_file.as_deref();
+    let ignore_config = timed!(
+        "load_ignore_file",
+        crate::ignore::load_ignore_file(&dir, ignore_file_ref)
+    );
+    let adapter_overrides = &ignore_config.adapter_overrides;
     let (
-        ((gem_index, vendor_path_index), (mut scan_results, cache_updates)),
-        (
-            lock_deps,
-            (
-                db_adapters,
-                (cable_adapters, (storage_adapters, (cache_config_adapters, ignore_config))),
-            ),
-        ),
+        ((mut gem_index, vendor_path_index), (mut scan_results, cache_updates)),
+        (lock_deps, (db_adapters, (cable_adapters, (storage_adapters, cache_config_adapters)))),
     ) = timed!(
         "concurrent_init",
         rayon::join(
@@ -181,38 +225,44 @@ fn main() {
             },
             || {
                 rayon::join(
-                    || timed!("parse_gemfile_lock", lockfile::parse_gemfile_lock(&dir)),
+                    || {
+                        timed!(
+                            "parse_gemfile_lock",
+                            if explicit_gemfiles {
+                                lockfile::parse_gemfile_locks(&dir, &gemfile_paths)
+                            } else {
+                                lockfile::parse_gemfile_lock(&dir)
+                            }
+                        )
+                    },
                     || {
                         rayon::join(
-                            || timed!("scan_db_adapters", scan_database_adapters(&dir)),
+                            || {
+                                timed!(
+                                    "scan_db_adapters",
+                                    scan_database_adapters(&dir, adapter_overrides)
+                                )
+                            },
                             || {
                                 rayon::join(
-                                    || timed!("scan_cable_adapters", scan_cable_adapters(&dir)),
+                                    || {
+                                        timed!(
+                                            "scan_cable_adapters",
+                                            scan_cable_adapters(&dir, adapter_overrides)
+                                        )
+                                    },
                                     || {
                                         rayon::join(
                                             || {
                                                 timed!(
                                                     "scan_storage_adapters",
-                                                    scan_storage_adapters(&dir)
+                                                    scan_storage_adapters(&dir, adapter_overrides)
                                                 )
                                             },
                                             || {
-                                                rayon::join(
-                                                    || {
-                                                        timed!(
-                                                            "scan_cache_config",
-                                                            scan_cache_config(&dir)
-                                                        )
-                                                    },
-                                                    || {
-                                                        timed!(
-                                                            "load_ignore_file",
-                                                            crate::ignore::load_ignore_file(
-                                                                &dir,
-                                                                ignore_file_ref
-                                                            )
-                                                        )
-                                                    },
+                                                timed!(
+                                                    "scan_cache_config",
+                                                    scan_cache_config(&dir, adapter_overrides)
                                                 )
                                             },
                                         )
@@ -225,6 +275,7 @@ fn main() {
             },
         )
     );
+    introspect::index_declared_gem_sources(&dir, &gems, &mut gem_index);
 
     // Apply cache updates from the walk
     let mut file_cache = match Arc::try_unwrap(file_cache) {
@@ -386,7 +437,7 @@ fn main() {
 
     // 7. Apply platform filter
     {
-        let current_platforms = current_platform_set();
+        let current_platforms = platforms::current_platform_set();
         for result in results.values_mut() {
             if !result.gem.platforms.is_empty()
                 && !result
@@ -546,204 +597,7 @@ fn resolve_require_paths(
     }
 
     // Known divergent gem→require mappings (gems where require path ≠ gem name)
-    static KNOWN_REQUIRE_PATHS: once_cell::sync::Lazy<std::collections::HashMap<&str, &[&str]>> =
-        once_cell::sync::Lazy::new(|| {
-            let mut m = std::collections::HashMap::new();
-            // --- A-B ---
-            m.insert(
-                "active_model_serializers",
-                &["active_model_serializers", "active_model/serializer"][..],
-            );
-            m.insert(
-                "activerecord-session_store",
-                &["active_record/session_store"][..],
-            );
-            m.insert("argon2", &["argon2"][..]);
-            m.insert("attr_encrypted", &["attr_encrypted"][..]);
-            m.insert("aws-sdk-core", &["aws-sdk-core"][..]);
-            m.insert("aws-sdk-s3", &["aws-sdk-s3"][..]);
-            m.insert("aws-sdk-sqs", &["aws-sdk-sqs"][..]);
-            m.insert(
-                "azure-storage-blob",
-                &["azure/storage/blob", "azure-storage-blob"][..],
-            );
-            m.insert("batch-loader", &["batch-loader", "batch_loader"][..]);
-            m.insert("bcrypt", &["bcrypt"][..]);
-            m.insert("better_errors", &["better_errors"][..]);
-            m.insert("binding_of_caller", &["binding_of_caller"][..]);
-            m.insert("bootsnap", &["bootsnap", "bootsnap/setup"][..]);
-            m.insert("brakeman", &["brakeman"][..]);
-            m.insert("bullet", &["bullet"][..]);
-            m.insert("bundler-audit", &["bundler/audit", "bundler-audit"][..]);
-            m.insert("byebug", &["byebug"][..]);
-            // --- C ---
-            m.insert("capybara", &["capybara"][..]);
-            m.insert("cssbundling-rails", &["cssbundling-rails"][..]);
-            // --- D ---
-            m.insert("dalli", &["dalli"][..]);
-            m.insert("database_cleaner", &["database_cleaner"][..]);
-            m.insert(
-                "database_cleaner-active_record",
-                &[
-                    "database_cleaner/active_record",
-                    "database_cleaner-active_record",
-                ][..],
-            );
-            m.insert("ddtrace", &["datadog", "ddtrace"][..]);
-            m.insert("delayed_job", &["delayed_job"][..]);
-            m.insert("devise", &["devise"][..]);
-            m.insert("doorkeeper", &["doorkeeper"][..]);
-            // --- E-F ---
-            m.insert("elasticsearch", &["elasticsearch"][..]);
-            m.insert("factory_bot", &["factory_bot"][..]);
-            m.insert("factory_bot_rails", &["factory_bot_rails"][..]);
-            m.insert("faker", &["faker"][..]);
-            m.insert("falcon", &["falcon"][..]);
-            m.insert("faraday", &["faraday"][..]);
-            m.insert("faraday-retry", &["faraday/retry", "faraday-retry"][..]);
-            m.insert("fast_blank", &["fast_blank"][..]);
-            // --- G ---
-            m.insert("goldiloader", &["goldiloader"][..]);
-            m.insert("good_job", &["good_job"][..]);
-            m.insert("google-cloud-pubsub", &["google/cloud/pubsub"][..]);
-            m.insert("google-cloud-storage", &["google/cloud/storage"][..]);
-            m.insert("google-protobuf", &["google/protobuf"][..]);
-            m.insert("graphql", &["graphql"][..]);
-            m.insert("graphql-batch", &["graphql/batch"][..]);
-            m.insert("grpc", &["grpc"][..]);
-            // --- H ---
-            m.insert("hiredis", &["hiredis"][..]);
-            m.insert("http", &["http"][..]);
-            m.insert("httparty", &["httparty"][..]);
-            // --- I-J ---
-            m.insert(
-                "image_processing",
-                &[
-                    "image_processing",
-                    "image_processing/vips",
-                    "image_processing/mini_magick",
-                ][..],
-            );
-            m.insert(
-                "importmap-rails",
-                &["importmap-rails", "importmap/rails"][..],
-            );
-            m.insert("jsbundling-rails", &["jsbundling-rails"][..]);
-            m.insert("jwt", &["jwt"][..]);
-            // --- K ---
-            m.insert("kaminari", &["kaminari"][..]);
-            // --- L ---
-            m.insert("listen", &["listen"][..]);
-            // --- M ---
-            m.insert("mail", &["mail"][..]);
-            m.insert("memory_profiler", &["memory_profiler"][..]);
-            m.insert("mini_magick", &["mini_magick"][..]);
-            m.insert("mysql2", &["mysql2"][..]);
-            // --- N ---
-            m.insert("newrelic_rpm", &["newrelic_rpm"][..]);
-            m.insert("nokogiri", &["nokogiri"][..]);
-            m.insert("nokogiri-diff", &["nokogiri/diff"][..]);
-            // --- O ---
-            m.insert("omniauth", &["omniauth"][..]);
-            m.insert(
-                "omniauth-oauth2",
-                &["omniauth-oauth2", "omniauth/oauth2"][..],
-            );
-            m.insert("opensearch-ruby", &["opensearch-ruby", "opensearch"][..]);
-            // --- P ---
-            m.insert("pagy", &["pagy"][..]);
-            m.insert("pg", &["pg"][..]);
-            m.insert(
-                "premailer-rails",
-                &["premailer/rails", "premailer-rails"][..],
-            );
-            m.insert("pry", &["pry"][..]);
-            m.insert("pry-byebug", &["pry-byebug", "pry/byebug"][..]);
-            m.insert("pry-rails", &["pry-rails"][..]);
-            m.insert("puma", &["puma"][..]);
-            m.insert("pundit", &["pundit"][..]);
-            // --- R ---
-            m.insert("rack-attack", &["rack/attack"][..]);
-            m.insert("rack-cors", &["rack/cors", "rack-cors"][..]);
-            m.insert(
-                "rack-mini-profiler",
-                &["rack-mini-profiler", "rack/mini_profiler"][..],
-            );
-            m.insert("ransack", &["ransack"][..]);
-            m.insert("redis", &["redis"][..]);
-            m.insert(
-                "redis-namespace",
-                &["redis-namespace", "redis/namespace"][..],
-            );
-            m.insert("redis-rails", &["redis-rails", "redis/rails"][..]);
-            m.insert("resque", &["resque"][..]);
-            m.insert("rest-client", &["rest-client", "rest_client"][..]);
-            m.insert("rspec-core", &["rspec/core"][..]);
-            m.insert("rspec-expectations", &["rspec/expectations"][..]);
-            m.insert("rspec-mocks", &["rspec/mocks"][..]);
-            m.insert("rspec-rails", &["rspec/rails", "rspec-rails"][..]);
-            m.insert("rubocop", &["rubocop"][..]);
-            m.insert(
-                "rubocop-performance",
-                &["rubocop-performance", "rubocop/performance"][..],
-            );
-            m.insert("rubocop-rails", &["rubocop-rails", "rubocop/rails"][..]);
-            m.insert("rubocop-rspec", &["rubocop-rspec", "rubocop/rspec"][..]);
-            m.insert("ruby-kafka", &["kafka"][..]);
-            m.insert("ruby-openai", &["openai"][..]);
-            m.insert("ruby-progressbar", &["ruby-progressbar", "progressbar"][..]);
-            m.insert("ruby-saml", &["onelogin/ruby-saml"][..]);
-            m.insert("ruby-vips", &["vips", "ruby-vips"][..]);
-            // --- S ---
-            m.insert("sass-rails", &["sass-rails", "sass/rails"][..]);
-            m.insert("sassc", &["sassc"][..]);
-            m.insert("sassc-embedded", &["sassc-embedded"][..]);
-            m.insert("sassc-rails", &["sassc-rails", "sassc/rails"][..]);
-            m.insert("scout_apm", &["scout_apm"][..]);
-            m.insert("searchkick", &["searchkick"][..]);
-            m.insert(
-                "selenium-webdriver",
-                &["selenium-webdriver", "selenium/webdriver"][..],
-            );
-            m.insert("sidekiq", &["sidekiq"][..]);
-            m.insert("sidekiq-cron", &["sidekiq-cron", "sidekiq/cron"][..]);
-            m.insert("simplecov", &["simplecov"][..]);
-            m.insert("simplecov-lcov", &["simplecov-lcov", "simplecov/lcov"][..]);
-            m.insert("skylight", &["skylight"][..]);
-            m.insert("solid_cable", &["solid_cable"][..]);
-            m.insert("solid_cache", &["solid_cache"][..]);
-            m.insert("solid_queue", &["solid_queue"][..]);
-            m.insert("spring", &["spring"][..]);
-            m.insert(
-                "spring-watcher-listen",
-                &["spring-watcher-listen", "spring/watcher/listen"][..],
-            );
-            m.insert("sqlite3", &["sqlite3"][..]);
-            m.insert("stackprof", &["stackprof"][..]);
-            m.insert("stimulus-rails", &["stimulus-rails", "stimulus/rails"][..]);
-            // --- T ---
-            m.insert("tailwindcss-rails", &["tailwindcss-rails"][..]);
-            m.insert("thin", &["thin"][..]);
-            m.insert("timecop", &["timecop"][..]);
-            m.insert("turbo-rails", &["turbo-rails", "turbo/rails"][..]);
-            m.insert("typhoeus", &["typhoeus"][..]);
-            m.insert("tzinfo-data", &["tzinfo/data", "tzinfo-data"][..]);
-            // --- U ---
-            m.insert("unicorn", &["unicorn"][..]);
-            // --- V ---
-            m.insert("vcr", &["vcr"][..]);
-            m.insert("view_component", &["view_component"][..]);
-            // --- W ---
-            m.insert("webdrivers", &["webdrivers"][..]);
-            m.insert("webmock", &["webmock"][..]);
-            m.insert("will_paginate", &["will_paginate"][..]);
-            // --- Misc (activerecord-import kept from original) ---
-            m.insert("activerecord-import", &["activerecord-import"][..]);
-            m.insert("cancancan", &["cancancan", "cancan"][..]);
-            m
-        });
-
-    if let Some(known) = KNOWN_REQUIRE_PATHS.get(gem.name.as_str()) {
+    if let Some(known) = known::require_paths_for(gem.name.as_str()) {
         let mut paths: Vec<String> = known.iter().map(|s| s.to_string()).collect();
         if !paths.contains(&gem.name) {
             paths.push(gem.name.clone());
@@ -775,131 +629,6 @@ fn resolve_module_names(
     let discovered = introspect::discover_gem_module_names(&gem.name, gem_index);
 
     // Static known module names for gems where PascalCase heuristic fails
-    static KNOWN_MODULE_NAMES: once_cell::sync::Lazy<std::collections::HashMap<&str, &[&str]>> =
-        once_cell::sync::Lazy::new(|| {
-            let mut m = std::collections::HashMap::new();
-            m.insert(
-                "active_model_serializers",
-                &["ActiveModel::Serializer", "ActiveModelSerializers"][..],
-            );
-            m.insert("activerecord-import", &["ActiveRecord::Import"][..]);
-            m.insert(
-                "activerecord-session_store",
-                &["ActiveRecord::SessionStore"][..],
-            );
-            m.insert("argon2", &["Argon2"][..]);
-            m.insert("aws-sdk-cloudwatch", &["Aws::CloudWatch"][..]);
-            m.insert("aws-sdk-core", &["Aws"][..]);
-            m.insert("aws-sdk-dynamodb", &["Aws::DynamoDB"][..]);
-            m.insert("aws-sdk-s3", &["Aws::S3"][..]);
-            m.insert("aws-sdk-sqs", &["Aws::SQS"][..]);
-            m.insert("azure-storage-blob", &["Azure::Storage::Blob"][..]);
-            m.insert("batch-loader", &["BatchLoader"][..]);
-            m.insert("bcrypt", &["BCrypt"][..]);
-            m.insert("bootsnap", &["Bootsnap"][..]);
-            m.insert("bullet", &["Bullet"][..]);
-            m.insert("cancancan", &["CanCanCan", "CanCan"][..]);
-            m.insert("concurrent-ruby", &["Concurrent"][..]);
-            m.insert("dalli", &["Dalli"][..]);
-            m.insert("database_cleaner", &["DatabaseCleaner"][..]);
-            m.insert(
-                "database_cleaner-active_record",
-                &["DatabaseCleaner::ActiveRecord", "DatabaseCleaner"][..],
-            );
-            m.insert(
-                "database_cleaner-redis",
-                &["DatabaseCleaner::Redis", "DatabaseCleaner"][..],
-            );
-            m.insert("delayed_job", &["Delayed::Job", "DelayedJob"][..]);
-            m.insert("devise", &["Devise"][..]);
-            m.insert("doorkeeper", &["Doorkeeper"][..]);
-            m.insert("elasticsearch", &["Elasticsearch"][..]);
-            m.insert("factory_bot", &["FactoryBot"][..]);
-            m.insert("factory_bot_rails", &["FactoryBot"][..]);
-            m.insert("faraday-net_http", &["Faraday::NetHttp"][..]);
-            m.insert("faraday-retry", &["Faraday::Retry"][..]);
-            m.insert("fast_blank", &["FastBlank"][..]);
-            m.insert("ffi", &["FFI"][..]);
-            m.insert("goldiloader", &["Goldiloader"][..]);
-            m.insert("good_job", &["GoodJob"][..]);
-            m.insert("google-cloud-pubsub", &["Google::Cloud::PubSub"][..]);
-            m.insert("google-cloud-storage", &["Google::Cloud::Storage"][..]);
-            m.insert("google-protobuf", &["Google::Protobuf"][..]);
-            m.insert("graphql", &["GraphQL"][..]);
-            m.insert("graphql-batch", &["GraphQL::Batch", "GraphQL"][..]);
-            m.insert("hiredis", &["Hiredis"][..]);
-            m.insert("http", &["HTTP"][..]);
-            m.insert("httparty", &["HTTParty"][..]);
-            m.insert("httpx", &["HTTPX"][..]);
-            m.insert("image_processing", &["ImageProcessing"][..]);
-            m.insert("importmap-rails", &["Importmap"][..]);
-            m.insert("jwt", &["JWT"][..]);
-            m.insert("kaminari", &["Kaminari"][..]);
-            m.insert("mail", &["Mail"][..]);
-            m.insert("mini_magick", &["MiniMagick"][..]);
-            m.insert("mini_portile2", &["MiniPortile"][..]);
-            m.insert("mysql2", &["Mysql2"][..]);
-            m.insert("net-http-persistent", &["Net::HTTP::Persistent"][..]);
-            m.insert("nokogiri", &["Nokogiri"][..]);
-            m.insert("omniauth", &["OmniAuth"][..]);
-            m.insert(
-                "omniauth-oauth2",
-                &["OmniAuth::Strategies::OAuth2", "OmniAuth"][..],
-            );
-            m.insert("pagy", &["Pagy"][..]);
-            m.insert("parallel", &["Parallel"][..]);
-            m.insert("parallel_tests", &["ParallelTests"][..]);
-            m.insert("pg", &["PG"][..]);
-            m.insert("pry-byebug", &["Pry", "Byebug"][..]);
-            m.insert("pry-rails", &["Pry"][..]);
-            m.insert("pry-rescue", &["Pry"][..]);
-            m.insert("pundit", &["Pundit"][..]);
-            m.insert("rack-attack", &["Rack::Attack"][..]);
-            m.insert("rack-cors", &["Rack::Cors"][..]);
-            m.insert("rack-mini-profiler", &["Rack::MiniProfiler"][..]);
-            m.insert("rack-protection", &["Rack::Protection"][..]);
-            m.insert("rack-proxy", &["Rack::Proxy"][..]);
-            m.insert("ransack", &["Ransack"][..]);
-            m.insert("redis", &["Redis"][..]);
-            m.insert("resque", &["Resque"][..]);
-            m.insert("rest-client", &["RestClient"][..]);
-            m.insert("rspec-core", &["RSpec::Core", "RSpec"][..]);
-            m.insert("rspec-expectations", &["RSpec::Expectations", "RSpec"][..]);
-            m.insert("rspec-mocks", &["RSpec::Mocks", "RSpec"][..]);
-            m.insert("rspec-rails", &["RSpec", "RSpec::Rails"][..]);
-            m.insert("rubocop-ast", &["RuboCop::AST", "RuboCop"][..]);
-            m.insert(
-                "rubocop-performance",
-                &["RuboCop::Performance", "RuboCop"][..],
-            );
-            m.insert("rubocop-rails", &["RuboCop::Rails", "RuboCop"][..]);
-            m.insert("rubocop-rspec", &["RuboCop::RSpec", "RuboCop"][..]);
-            m.insert("ruby-vips", &["Vips"][..]);
-            m.insert("rubyzip", &["Zip"][..]);
-            m.insert("sass-rails", &["Sass::Rails"][..]);
-            m.insert("sassc", &["SassC"][..]);
-            m.insert("sassc-embedded", &["SassC"][..]);
-            m.insert("sassc-rails", &["SassC::Rails", "SassC"][..]);
-            m.insert("searchkick", &["Searchkick"][..]);
-            m.insert("shoulda-context", &["Shoulda::Context"][..]);
-            m.insert("shoulda-matchers", &["Shoulda::Matchers"][..]);
-            m.insert("sidekiq", &["Sidekiq"][..]);
-            m.insert("sidekiq-cron", &["Sidekiq::Cron", "Sidekiq"][..]);
-            m.insert("solid_cable", &["SolidCable"][..]);
-            m.insert("solid_cache", &["SolidCache"][..]);
-            m.insert("solid_queue", &["SolidQueue"][..]);
-            m.insert("sqlite3", &["SQLite3"][..]);
-            m.insert("stimulus-rails", &["Stimulus"][..]);
-            m.insert("tilt", &["Tilt"][..]);
-            m.insert("trilogy", &["Trilogy"][..]);
-            m.insert("turbo-rails", &["Turbo"][..]);
-            m.insert("tzinfo", &["TZInfo"][..]);
-            m.insert("tzinfo-data", &["TZInfo::Data", "TZInfo"][..]);
-            m.insert("view_component", &["ViewComponent"][..]);
-            m.insert("will_paginate", &["WillPaginate"][..]);
-            m
-        });
-
     let mut names = Vec::new();
 
     // Always include discovered names from the installed gem (if any).
@@ -908,8 +637,8 @@ fn resolve_module_names(
     }
 
     // Lookup known module names — merge with discovered (do not replace).
-    if let Some(known) = KNOWN_MODULE_NAMES.get(gem.name.as_str()) {
-        for n in *known {
+    if let Some(known) = known::module_names_for(gem.name.as_str()) {
+        for n in known {
             names.push(n.to_string());
         }
     }
@@ -1024,7 +753,10 @@ fn strip_erb_blocks(input: &str) -> String {
 }
 
 /// Scan config/database.yml (or .yml.erb) for adapter: values and map them to gem names.
-fn scan_database_adapters(dir: &std::path::Path) -> std::collections::HashMap<String, String> {
+fn scan_database_adapters(
+    dir: &std::path::Path,
+    overrides: &adapters::AdapterOverrides,
+) -> std::collections::HashMap<String, String> {
     let db_yml = dir.join("config").join("database.yml");
     let content = match read_yaml_or_erb(&db_yml) {
         Some(c) => c,
@@ -1038,24 +770,17 @@ fn scan_database_adapters(dir: &std::path::Path) -> std::collections::HashMap<St
     let mut adapters = std::collections::HashMap::new();
     for cap in ADAPTER_RE.captures_iter(&content) {
         let adapter = cap[1].trim_matches(|c| c == '\'' || c == '"');
-        // Map adapter names to gem names
-        let gem_name = match adapter {
-            "postgresql" => "pg",
-            "mysql" => "mysql2",
-            "sqlite" | "sqlite3" => "sqlite3",
-            "trilogy" => "trilogy",
-            "jdbcmysql" => "activerecord-jdbcmysql-adapter",
-            "jdbcpostgresql" => "activerecord-jdbcpostgresql-adapter",
-            "jdbcsqlite3" => "activerecord-jdbcsqlite3-adapter",
-            other => other,
-        };
+        let gem_name = adapters::database_gem(adapter, overrides);
         adapters.insert(gem_name.to_string(), adapter.to_string());
     }
     adapters
 }
 
 /// Scan config/cable.yml (or .yml.erb) for adapter: values and map them to gem names.
-fn scan_cable_adapters(dir: &std::path::Path) -> std::collections::HashMap<String, String> {
+fn scan_cable_adapters(
+    dir: &std::path::Path,
+    overrides: &adapters::AdapterOverrides,
+) -> std::collections::HashMap<String, String> {
     let cable_yml = dir.join("config").join("cable.yml");
     let content = match read_yaml_or_erb(&cable_yml) {
         Some(c) => c,
@@ -1069,20 +794,17 @@ fn scan_cable_adapters(dir: &std::path::Path) -> std::collections::HashMap<Strin
     let mut adapters = std::collections::HashMap::new();
     for cap in ADAPTER_RE.captures_iter(&content) {
         let adapter = cap[1].trim_matches(|c| c == '\'' || c == '"');
-        let gem_name = match adapter {
-            "redis" => "redis",
-            "postgresql" | "postgres" => "pg",
-            "solid_cable" => "solid_cable",
-            "any_cable" | "anycable" => "anycable",
-            other => other,
-        };
+        let gem_name = adapters::cable_gem(adapter, overrides);
         adapters.insert(gem_name.to_string(), adapter.to_string());
     }
     adapters
 }
 
 /// Scan config/storage.yml (or .yml.erb) for service: values and map them to gem names.
-fn scan_storage_adapters(dir: &std::path::Path) -> std::collections::HashMap<String, String> {
+fn scan_storage_adapters(
+    dir: &std::path::Path,
+    overrides: &adapters::AdapterOverrides,
+) -> std::collections::HashMap<String, String> {
     let storage_yml = dir.join("config").join("storage.yml");
     let content = match read_yaml_or_erb(&storage_yml) {
         Some(c) => c,
@@ -1096,13 +818,7 @@ fn scan_storage_adapters(dir: &std::path::Path) -> std::collections::HashMap<Str
     let mut adapters = std::collections::HashMap::new();
     for cap in SERVICE_RE.captures_iter(&content) {
         let service = cap[1].trim_matches(|c| c == '\'' || c == '"');
-        let gem_name = match service {
-            "S3" | "AmazonS3" => Some("aws-sdk-s3"),
-            "GCS" | "Google" => Some("google-cloud-storage"),
-            "AzureStorage" => Some("azure-storage-blob"),
-            "Disk" | "Mirror" => None,
-            _ => None,
-        };
+        let gem_name = adapters::storage_gem(service, overrides);
         if let Some(gem) = gem_name {
             adapters.insert(gem.to_string(), service.to_string());
         }
@@ -1111,7 +827,10 @@ fn scan_storage_adapters(dir: &std::path::Path) -> std::collections::HashMap<Str
 }
 
 /// Scan config/environments/*.rb and config/application.rb for cache_store settings.
-fn scan_cache_config(dir: &std::path::Path) -> std::collections::HashMap<String, String> {
+fn scan_cache_config(
+    dir: &std::path::Path,
+    overrides: &adapters::AdapterOverrides,
+) -> std::collections::HashMap<String, String> {
     static CACHE_RE: once_cell::sync::Lazy<regex::Regex> =
         once_cell::sync::Lazy::new(|| regex::Regex::new(r"cache_store\s*=\s*:(\w+)").unwrap());
 
@@ -1136,43 +855,13 @@ fn scan_cache_config(dir: &std::path::Path) -> std::collections::HashMap<String,
         };
         for cap in CACHE_RE.captures_iter(&content) {
             let store = &cap[1];
-            let gem_name = match store {
-                "redis_cache_store" => Some("redis"),
-                "mem_cache_store" => Some("dalli"),
-                "solid_cache_store" => Some("solid_cache"),
-                _ => None,
-            };
+            let gem_name = adapters::cache_gem(store, overrides);
             if let Some(gem) = gem_name {
                 adapters.insert(gem.to_string(), store.to_string());
             }
         }
     }
     adapters
-}
-
-/// Set of Ruby platform names that match the current host. Built once at first
-/// use and reused — the contents are static for the lifetime of the process.
-static CURRENT_PLATFORM_SET: once_cell::sync::Lazy<std::collections::HashSet<&'static str>> =
-    once_cell::sync::Lazy::new(|| {
-        let mut platforms = std::collections::HashSet::new();
-        platforms.insert("ruby");
-        platforms.insert("mri");
-        for v in &[
-            "mri_24", "mri_25", "mri_26", "mri_27", "mri_28", "mri_29", "mri_30", "mri_31",
-            "mri_32", "mri_33", "mri_34", "mri_35", "mri_36", "mri_37", "mri_38", "mri_39",
-            "mri_40",
-        ] {
-            platforms.insert(*v);
-        }
-        #[cfg(target_os = "macos")]
-        platforms.insert("darwin");
-        #[cfg(target_os = "linux")]
-        platforms.insert("linux");
-        platforms
-    });
-
-fn current_platform_set() -> &'static std::collections::HashSet<&'static str> {
-    &CURRENT_PLATFORM_SET
 }
 
 /// Populate `target` with every distinct group declared across `gems`, plus
@@ -1200,6 +889,7 @@ mod tests {
             require_paths: vec![],
             module_names: vec![],
             require_false: false,
+            source: None,
         }
     }
 
@@ -1307,7 +997,7 @@ mod tests {
         writeln!(f, "  host: <%= ENV['DB_HOST'] %>").unwrap();
         drop(f);
 
-        let adapters = scan_database_adapters(tmp.path());
+        let adapters = scan_database_adapters(tmp.path(), &adapters::AdapterOverrides::default());
         assert_eq!(adapters.get("pg").map(|s| s.as_str()), Some("postgresql"));
     }
 
@@ -1322,7 +1012,7 @@ mod tests {
         )
         .unwrap();
 
-        let adapters = scan_database_adapters(tmp.path());
+        let adapters = scan_database_adapters(tmp.path(), &adapters::AdapterOverrides::default());
         assert!(!adapters.contains_key("<%="));
         assert!(adapters.is_empty());
     }
@@ -1347,7 +1037,7 @@ mod tests {
         )
         .unwrap();
 
-        let adapters = scan_cable_adapters(tmp.path());
+        let adapters = scan_cable_adapters(tmp.path(), &adapters::AdapterOverrides::default());
         assert_eq!(adapters.get("redis").map(|s| s.as_str()), Some("redis"));
     }
 
@@ -1362,7 +1052,7 @@ mod tests {
         )
         .unwrap();
 
-        let adapters = scan_storage_adapters(tmp.path());
+        let adapters = scan_storage_adapters(tmp.path(), &adapters::AdapterOverrides::default());
         assert_eq!(adapters.get("aws-sdk-s3").map(|s| s.as_str()), Some("S3"));
     }
 
@@ -1378,7 +1068,7 @@ mod tests {
         )
         .unwrap();
 
-        let adapters = scan_database_adapters(tmp.path());
+        let adapters = scan_database_adapters(tmp.path(), &adapters::AdapterOverrides::default());
         // .yml takes precedence
         assert_eq!(adapters.get("mysql2").map(|s| s.as_str()), Some("mysql2"));
         assert!(!adapters.contains_key("pg"));
@@ -1386,7 +1076,7 @@ mod tests {
 
     #[test]
     fn current_platform_set_includes_ruby_and_mri() {
-        let p = current_platform_set();
+        let p = platforms::current_platform_set();
         assert!(p.contains("ruby"));
         assert!(p.contains("mri"));
         assert!(p.contains("mri_31"));

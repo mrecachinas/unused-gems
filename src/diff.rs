@@ -156,6 +156,7 @@ mod tests {
                     require_paths: Vec::new(),
                     module_names: Vec::new(),
                     require_false: false,
+                    source: None,
                 },
             },
         )

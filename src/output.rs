@@ -417,6 +417,7 @@ mod tests {
             require_paths: vec![name.to_string()],
             module_names: Vec::new(),
             require_false: false,
+            source: None,
         }
     }
 

@@ -1,8 +1,11 @@
 use std::collections::HashSet;
 use std::path::Path;
 
+use crate::adapters::AdapterOverrides;
+
 pub struct IgnoreConfig {
     pub ignored: HashSet<String>,
+    pub adapter_overrides: AdapterOverrides,
     pub path: Option<String>,
 }
 
@@ -15,6 +18,7 @@ pub fn load_ignore_file(dir: &Path, override_path: Option<&str>) -> IgnoreConfig
     if !path.exists() {
         return IgnoreConfig {
             ignored: HashSet::new(),
+            adapter_overrides: AdapterOverrides::default(),
             path: None,
         };
     }
@@ -32,8 +36,10 @@ pub fn load_ignore_file(dir: &Path, override_path: Option<&str>) -> IgnoreConfig
                         }
                     }
                 }
+                let adapter_overrides = parse_adapter_overrides(&yaml, &path_str);
                 IgnoreConfig {
                     ignored,
+                    adapter_overrides,
                     path: Some(path_str),
                 }
             }
@@ -41,6 +47,7 @@ pub fn load_ignore_file(dir: &Path, override_path: Option<&str>) -> IgnoreConfig
                 eprintln!("Warning: Could not parse {}: {}", path_str, e);
                 IgnoreConfig {
                     ignored: HashSet::new(),
+                    adapter_overrides: AdapterOverrides::default(),
                     path: Some(path_str),
                 }
             }
@@ -49,10 +56,62 @@ pub fn load_ignore_file(dir: &Path, override_path: Option<&str>) -> IgnoreConfig
             eprintln!("Warning: Could not read {}: {}", path_str, e);
             IgnoreConfig {
                 ignored: HashSet::new(),
+                adapter_overrides: AdapterOverrides::default(),
                 path: Some(path_str),
             }
         }
     }
+}
+
+fn parse_adapter_overrides(yaml: &serde_yaml::Value, path: &str) -> AdapterOverrides {
+    let mut overrides = AdapterOverrides::default();
+    let Some(adapters) = yaml.get("adapters") else {
+        return overrides;
+    };
+    let Some(mapping) = adapters.as_mapping() else {
+        eprintln!("Warning: Ignoring invalid adapters section in {}", path);
+        return overrides;
+    };
+
+    for (key, value) in mapping {
+        let Some(section) = key.as_str() else {
+            eprintln!("Warning: Ignoring invalid adapter section key in {}", path);
+            continue;
+        };
+        let Some(entries) = value.as_mapping() else {
+            eprintln!(
+                "Warning: Ignoring invalid adapters.{} section in {}",
+                section, path
+            );
+            continue;
+        };
+        let target = match section {
+            "database" => &mut overrides.database,
+            "cable" => &mut overrides.cable,
+            "storage" => &mut overrides.storage,
+            "cache" => &mut overrides.cache,
+            other => {
+                eprintln!(
+                    "Warning: Ignoring unknown adapters.{} section in {}",
+                    other, path
+                );
+                continue;
+            }
+        };
+        for (adapter, gem) in entries {
+            match (adapter.as_str(), gem.as_str()) {
+                (Some(adapter), Some(gem)) if !adapter.is_empty() && !gem.is_empty() => {
+                    target.insert(adapter.to_string(), gem.to_string());
+                }
+                _ => eprintln!(
+                    "Warning: Ignoring invalid adapter override in adapters.{} from {}",
+                    section, path
+                ),
+            }
+        }
+    }
+
+    overrides
 }
 
 #[cfg(test)]
@@ -128,5 +187,28 @@ mod tests {
         let config = load_ignore_file(dir.path(), Some(path.to_str().unwrap()));
         assert!(config.ignored.is_empty());
         assert!(config.path.is_some());
+    }
+
+    #[test]
+    fn loads_adapter_overrides() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(".unused_gems.yml"),
+            "adapters:\n  database:\n    clickhouse: clickhouse-activerecord\n  storage:\n    CustomStorage: custom-storage-gem\n  cache:\n    custom_cache_store: custom-cache-gem\n",
+        )
+        .unwrap();
+        let config = load_ignore_file(dir.path(), None);
+        assert_eq!(
+            config.adapter_overrides.database.get("clickhouse"),
+            Some(&"clickhouse-activerecord".to_string())
+        );
+        assert_eq!(
+            config.adapter_overrides.storage.get("CustomStorage"),
+            Some(&"custom-storage-gem".to_string())
+        );
+        assert_eq!(
+            config.adapter_overrides.cache.get("custom_cache_store"),
+            Some(&"custom-cache-gem".to_string())
+        );
     }
 }

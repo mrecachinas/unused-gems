@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 
 #[derive(Debug, Clone)]
 pub struct GemEntry {
@@ -8,6 +9,13 @@ pub struct GemEntry {
     pub require_paths: Vec<String>,
     pub module_names: Vec<String>,
     pub require_false: bool,
+    pub source: Option<GemSource>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GemSource {
+    Path(PathBuf),
+    Git(String),
 }
 
 #[derive(Debug, Clone, Default)]

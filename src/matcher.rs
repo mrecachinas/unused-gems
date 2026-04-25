@@ -239,6 +239,7 @@ mod tests {
             require_paths: require_paths.iter().map(|s| s.to_string()).collect(),
             module_names: module_names.iter().map(|s| s.to_string()).collect(),
             require_false: false,
+            source: None,
         }
     }
 
