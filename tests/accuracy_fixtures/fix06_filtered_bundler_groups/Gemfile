@@ -1,0 +1,8 @@
+source "https://rubygems.org"
+
+gem "rails"
+gem "pg"
+
+group :migrations, optional: true do
+  gem "trilogy"
+end
