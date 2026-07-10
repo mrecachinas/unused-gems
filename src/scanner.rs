@@ -324,7 +324,7 @@ fn build_block_comment_ranges(bytes: &[u8]) -> Vec<(usize, usize)> {
 fn mask_percent_q_strings(bytes: &[u8], mask: &mut [bool]) {
     let mut i = 0;
     while i + 2 < bytes.len() {
-        if bytes[i] != b'%' || (bytes[i + 1] != b'q' && bytes[i + 1] != b'Q') {
+        if mask[i] || bytes[i] != b'%' || (bytes[i + 1] != b'q' && bytes[i + 1] != b'Q') {
             i += 1;
             continue;
         }
@@ -364,10 +364,7 @@ fn mask_percent_q_strings(bytes: &[u8], mask: &mut [bool]) {
         }
 
         if depth != 0 {
-            for b in mask.iter_mut().skip(content_start) {
-                *b = true;
-            }
-            break;
+            i += 1;
         }
     }
 }
@@ -417,7 +414,6 @@ fn build_skip_mask(bytes: &[u8], is_ruby: bool, line_kind: LineCommentKind) -> V
                 *b = true;
             }
         }
-        mask_percent_q_strings(bytes, &mut mask);
     }
 
     // Pass 2: line-by-line walk for line comments, inline comments, strings.
@@ -493,6 +489,10 @@ fn build_skip_mask(bytes: &[u8], is_ruby: bool, line_kind: LineCommentKind) -> V
         }
 
         i = if eol < len { eol + 1 } else { eol };
+    }
+
+    if is_ruby {
+        mask_percent_q_strings(bytes, &mut mask);
     }
 
     mask
@@ -1243,8 +1243,7 @@ pub fn scan_source_tree(
         .filter_entry(move |entry| {
             if entry.file_type().is_some_and(|ft| ft.is_dir()) {
                 let name = entry.file_name().to_string_lossy();
-                let depth = entry.depth();
-                if skip_set.contains(name.as_ref()) && depth < 3 {
+                if skip_set.contains(name.as_ref()) {
                     return false;
                 }
             }
@@ -1887,6 +1886,24 @@ mod tests {
     }
 
     #[test]
+    fn percent_q_in_comment_does_not_mask_later_code() {
+        let input = b"# %q(unclosed\nrequire 'real_gem'\n";
+        let mask = build_skip_mask(input, true, LineCommentKind::Hash);
+        let mut results = Vec::new();
+        scan_requires_filtered(input, &mask, &mut results);
+        assert_eq!(results, vec!["real_gem"]);
+    }
+
+    #[test]
+    fn percent_q_in_heredoc_does_not_mask_later_code() {
+        let input = b"doc = <<~HELP\n  %q(unclosed\nHELP\nrequire 'real_gem'\n";
+        let mask = build_skip_mask(input, true, LineCommentKind::Hash);
+        let mut results = Vec::new();
+        scan_requires_filtered(input, &mask, &mut results);
+        assert_eq!(results, vec!["real_gem"]);
+    }
+
+    #[test]
     fn heredoc_with_dash_syntax_is_filtered() {
         let input = b"doc = <<-HEREDOC\n  require 'fake_gem'\nHEREDOC\nrequire 'real_gem'\n";
         let _block_ranges = build_block_comment_ranges(input);
@@ -2360,6 +2377,19 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir(dir.path().join("vendor")).unwrap();
         std::fs::write(dir.path().join("vendor/gem.rb"), "require 'hidden'\n").unwrap();
+        std::fs::write(dir.path().join("app.rb"), "require 'visible'\n").unwrap();
+        let cache = std::sync::Arc::new(crate::cache::FileCache::disabled());
+        let (results, _) = scan_source_tree(dir.path(), &default_skip_dirs(), cache);
+        assert!(results.requires.contains_key("visible"));
+        assert!(!results.requires.contains_key("hidden"));
+    }
+
+    #[test]
+    fn scan_source_tree_skips_deep_vendor() {
+        let dir = tempfile::tempdir().unwrap();
+        let vendor = dir.path().join("engines/foo/vendor");
+        std::fs::create_dir_all(&vendor).unwrap();
+        std::fs::write(vendor.join("gem.rb"), "require 'hidden'\n").unwrap();
         std::fs::write(dir.path().join("app.rb"), "require 'visible'\n").unwrap();
         let cache = std::sync::Arc::new(crate::cache::FileCache::disabled());
         let (results, _) = scan_source_tree(dir.path(), &default_skip_dirs(), cache);
