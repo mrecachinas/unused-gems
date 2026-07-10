@@ -1233,7 +1233,7 @@ pub fn scan_source_tree(
 
     let mut builder = ignore::WalkBuilder::new(dir);
     builder
-        .threads(std::thread::available_parallelism().map_or(8, |n| n.get()))
+        .threads(rayon::current_num_threads().clamp(1, 4))
         .standard_filters(false)
         .git_ignore(true)
         .git_global(false)
