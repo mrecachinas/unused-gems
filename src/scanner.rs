@@ -324,7 +324,11 @@ fn build_block_comment_ranges(bytes: &[u8]) -> Vec<(usize, usize)> {
 fn mask_percent_q_strings(bytes: &[u8], mask: &mut [bool]) {
     let mut i = 0;
     while i + 2 < bytes.len() {
-        if bytes[i] != b'%' || (bytes[i + 1] != b'q' && bytes[i + 1] != b'Q') {
+        if mask[i]
+            || bytes[i] != b'%'
+            || (bytes[i + 1] != b'q' && bytes[i + 1] != b'Q')
+            || (i > 0 && is_word_char(bytes[i - 1]))
+        {
             i += 1;
             continue;
         }
@@ -364,10 +368,7 @@ fn mask_percent_q_strings(bytes: &[u8], mask: &mut [bool]) {
         }
 
         if depth != 0 {
-            for b in mask.iter_mut().skip(content_start) {
-                *b = true;
-            }
-            break;
+            i += 1;
         }
     }
 }
@@ -417,7 +418,6 @@ fn build_skip_mask(bytes: &[u8], is_ruby: bool, line_kind: LineCommentKind) -> V
                 *b = true;
             }
         }
-        mask_percent_q_strings(bytes, &mut mask);
     }
 
     // Pass 2: line-by-line walk for line comments, inline comments, strings.
@@ -493,6 +493,10 @@ fn build_skip_mask(bytes: &[u8], is_ruby: bool, line_kind: LineCommentKind) -> V
         }
 
         i = if eol < len { eol + 1 } else { eol };
+    }
+
+    if is_ruby {
+        mask_percent_q_strings(bytes, &mut mask);
     }
 
     mask
@@ -1233,7 +1237,7 @@ pub fn scan_source_tree(
 
     let mut builder = ignore::WalkBuilder::new(dir);
     builder
-        .threads(std::thread::available_parallelism().map_or(8, |n| n.get()))
+        .threads(rayon::current_num_threads().clamp(1, 4))
         .standard_filters(false)
         .git_ignore(true)
         .git_global(false)
@@ -1243,8 +1247,7 @@ pub fn scan_source_tree(
         .filter_entry(move |entry| {
             if entry.file_type().is_some_and(|ft| ft.is_dir()) {
                 let name = entry.file_name().to_string_lossy();
-                let depth = entry.depth();
-                if skip_set.contains(name.as_ref()) && depth < 3 {
+                if skip_set.contains(name.as_ref()) {
                     return false;
                 }
             }
@@ -1617,20 +1620,29 @@ fn scan_file(
         LineCommentKind::Hash
     };
 
-    // Fix #7: build a single unified skip mask covering line/inline/block
-    // comments, heredoc bodies, and string-literal interiors. All filtered
-    // scanners now do O(1) lookups against this mask, avoiding the previous
-    // quadratic per-call memrchr/range-scan cost on heredoc-heavy files.
-    let mask = build_skip_mask(bytes, is_ruby, line_kind);
+    let has_ruby_scan_tokens = REQUIRE_FINDER.find(bytes).is_some()
+        || AUTOLOAD_FINDER.find(bytes).is_some()
+        || GEM_DOT_FINDER.find(bytes).is_some()
+        || BUNDLER_REQUIRE_FINDER.find(bytes).is_some();
+
+    // YAML does not use module scanning, so files without Ruby scan tokens can
+    // skip the full-size comment/string mask and all four Ruby token scanners.
+    let mask = if !is_yaml || has_ruby_scan_tokens {
+        build_skip_mask(bytes, is_ruby, line_kind)
+    } else {
+        Vec::new()
+    };
 
     let mut requires = Vec::new();
     let mut bundler_groups = Vec::new();
     let mut bundler_require_all = false;
 
-    // Hand-rolled byte scanners with mask-based skipping
-    scan_requires_filtered(bytes, &mask, &mut requires);
-    scan_autoloads_filtered(bytes, &mask, &mut requires);
-    scan_gem_bin_filtered(bytes, &mask, &mut requires);
+    if has_ruby_scan_tokens {
+        scan_requires_filtered(bytes, &mask, &mut requires);
+        scan_autoloads_filtered(bytes, &mask, &mut requires);
+        scan_gem_bin_filtered(bytes, &mask, &mut requires);
+        scan_bundler_require_filtered(bytes, &mask, &mut bundler_groups, &mut bundler_require_all);
+    }
     // Fix #5: do NOT run the generic uppercase-token module scanner on YAML
     // files — YAML keys/values like `UserNotFound:` would otherwise be
     // extracted as module references. The explicit YAML regex extractors
@@ -1679,9 +1691,6 @@ fn scan_file(
             }
         }
     }
-
-    // Bundler.require detection
-    scan_bundler_require_filtered(bytes, &mask, &mut bundler_groups, &mut bundler_require_all);
 
     Some(FileResult {
         rel_path,
@@ -1883,6 +1892,33 @@ mod tests {
             let __mask = build_skip_mask(input, true, LineCommentKind::Hash);
             scan_requires_filtered(input, &__mask, &mut results);
         }
+        assert_eq!(results, vec!["real_gem"]);
+    }
+
+    #[test]
+    fn percent_q_in_comment_does_not_mask_later_code() {
+        let input = b"# %q(unclosed\nrequire 'real_gem'\n";
+        let mask = build_skip_mask(input, true, LineCommentKind::Hash);
+        let mut results = Vec::new();
+        scan_requires_filtered(input, &mask, &mut results);
+        assert_eq!(results, vec!["real_gem"]);
+    }
+
+    #[test]
+    fn percent_q_in_heredoc_does_not_mask_later_code() {
+        let input = b"doc = <<~HELP\n  %q(unclosed\nHELP\nrequire 'real_gem'\n";
+        let mask = build_skip_mask(input, true, LineCommentKind::Hash);
+        let mut results = Vec::new();
+        scan_requires_filtered(input, &mask, &mut results);
+        assert_eq!(results, vec!["real_gem"]);
+    }
+
+    #[test]
+    fn percent_q_after_word_char_is_modulo_expression() {
+        let input = b"x%q(require 'real_gem')\n";
+        let mask = build_skip_mask(input, true, LineCommentKind::Hash);
+        let mut results = Vec::new();
+        scan_requires_filtered(input, &mask, &mut results);
         assert_eq!(results, vec!["real_gem"]);
     }
 
@@ -2360,6 +2396,19 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir(dir.path().join("vendor")).unwrap();
         std::fs::write(dir.path().join("vendor/gem.rb"), "require 'hidden'\n").unwrap();
+        std::fs::write(dir.path().join("app.rb"), "require 'visible'\n").unwrap();
+        let cache = std::sync::Arc::new(crate::cache::FileCache::disabled());
+        let (results, _) = scan_source_tree(dir.path(), &default_skip_dirs(), cache);
+        assert!(results.requires.contains_key("visible"));
+        assert!(!results.requires.contains_key("hidden"));
+    }
+
+    #[test]
+    fn scan_source_tree_skips_deep_vendor() {
+        let dir = tempfile::tempdir().unwrap();
+        let vendor = dir.path().join("engines/foo/vendor");
+        std::fs::create_dir_all(&vendor).unwrap();
+        std::fs::write(vendor.join("gem.rb"), "require 'hidden'\n").unwrap();
         std::fs::write(dir.path().join("app.rb"), "require 'visible'\n").unwrap();
         let cache = std::sync::Arc::new(crate::cache::FileCache::disabled());
         let (results, _) = scan_source_tree(dir.path(), &default_skip_dirs(), cache);

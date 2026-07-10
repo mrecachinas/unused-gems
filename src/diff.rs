@@ -6,6 +6,13 @@ struct BaselineGem {
     status: String,
 }
 
+#[derive(Debug, serde::Deserialize)]
+#[serde(untagged)]
+enum Baseline {
+    Legacy(Vec<BaselineGem>),
+    Envelope { results: Vec<BaselineGem> },
+}
+
 pub fn print_diff(
     results: &HashMap<String, crate::types::GemResult>,
     baseline_path: &str,
@@ -25,8 +32,8 @@ fn print_diff_from_content(
     results: &HashMap<String, crate::types::GemResult>,
     content: &str,
 ) -> usize {
-    let baseline: Vec<BaselineGem> = match serde_json::from_str(content) {
-        Ok(b) => b,
+    let baseline = match serde_json::from_str::<Baseline>(content) {
+        Ok(Baseline::Legacy(results) | Baseline::Envelope { results }) => results,
         Err(e) => {
             eprintln!("Error: Could not parse baseline: {}", e);
             std::process::exit(1);
@@ -168,6 +175,15 @@ mod tests {
             .into_iter()
             .collect();
         let baseline = r#"[{"name":"rails","status":"used"}]"#;
+        assert_eq!(print_diff_from_content(&results, baseline), 0);
+    }
+
+    #[test]
+    fn accepts_json_output_envelope() {
+        let results: HashMap<String, GemResult> = [make_result("rails", GemStatus::Used)]
+            .into_iter()
+            .collect();
+        let baseline = r#"{"schema_version":"1","results":[{"name":"rails","status":"used"}]}"#;
         assert_eq!(print_diff_from_content(&results, baseline), 0);
     }
 

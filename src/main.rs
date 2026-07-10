@@ -71,10 +71,6 @@ struct Cli {
     #[arg(long)]
     sarif: bool,
 
-    /// Write formatted output to file instead of stdout
-    #[arg(long)]
-    output_file: Option<String>,
-
     /// Exit 0 with a notice when Gemfile is missing instead of failing
     #[arg(long)]
     allow_missing_gemfile: bool,
@@ -469,26 +465,18 @@ fn main() {
         }
     }
 
+    for result in results.values_mut() {
+        result.files.sort();
+        result.files.dedup();
+        result.evidence.sort();
+        result.evidence.dedup();
+    }
+
     // Gemfile.lock transitive dep info (computed in concurrent init)
 
     if !cli.quiet {
         eprintln!();
     }
-
-    // Redirect stdout if --output-file specified
-    let _output_redirect: Option<Box<dyn std::io::Write>> = if let Some(ref path) = cli.output_file
-    {
-        let file = std::fs::File::create(path).unwrap_or_else(|e| {
-            eprintln!("Error: Cannot write to {}: {}", path, e);
-            std::process::exit(3);
-        });
-        // We can't easily redirect println!, so we skip redirect for now
-        // and rely on shell-level redirection. The flag is still accepted.
-        drop(file);
-        None
-    } else {
-        None
-    };
 
     // 9. Diff mode: compare and exit
     if let Some(ref baseline_path) = cli.diff {
