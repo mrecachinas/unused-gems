@@ -1616,20 +1616,34 @@ fn scan_file(
         LineCommentKind::Hash
     };
 
-    // Fix #7: build a single unified skip mask covering line/inline/block
-    // comments, heredoc bodies, and string-literal interiors. All filtered
-    // scanners now do O(1) lookups against this mask, avoiding the previous
-    // quadratic per-call memrchr/range-scan cost on heredoc-heavy files.
-    let mask = build_skip_mask(bytes, is_ruby, line_kind);
+    let has_ruby_scan_tokens = REQUIRE_FINDER.find(bytes).is_some()
+        || AUTOLOAD_FINDER.find(bytes).is_some()
+        || GEM_DOT_FINDER.find(bytes).is_some()
+        || BUNDLER_REQUIRE_FINDER.find(bytes).is_some();
+
+    // YAML does not use module scanning, so files without Ruby scan tokens can
+    // skip the full-size comment/string mask and all four Ruby token scanners.
+    let mask = if !is_yaml || has_ruby_scan_tokens {
+        build_skip_mask(bytes, is_ruby, line_kind)
+    } else {
+        Vec::new()
+    };
 
     let mut requires = Vec::new();
     let mut bundler_groups = Vec::new();
     let mut bundler_require_all = false;
 
-    // Hand-rolled byte scanners with mask-based skipping
-    scan_requires_filtered(bytes, &mask, &mut requires);
-    scan_autoloads_filtered(bytes, &mask, &mut requires);
-    scan_gem_bin_filtered(bytes, &mask, &mut requires);
+    if has_ruby_scan_tokens {
+        scan_requires_filtered(bytes, &mask, &mut requires);
+        scan_autoloads_filtered(bytes, &mask, &mut requires);
+        scan_gem_bin_filtered(bytes, &mask, &mut requires);
+        scan_bundler_require_filtered(
+            bytes,
+            &mask,
+            &mut bundler_groups,
+            &mut bundler_require_all,
+        );
+    }
     // Fix #5: do NOT run the generic uppercase-token module scanner on YAML
     // files — YAML keys/values like `UserNotFound:` would otherwise be
     // extracted as module references. The explicit YAML regex extractors
@@ -1678,9 +1692,6 @@ fn scan_file(
             }
         }
     }
-
-    // Bundler.require detection
-    scan_bundler_require_filtered(bytes, &mask, &mut bundler_groups, &mut bundler_require_all);
 
     Some(FileResult {
         rel_path,
