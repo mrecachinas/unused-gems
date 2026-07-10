@@ -324,7 +324,11 @@ fn build_block_comment_ranges(bytes: &[u8]) -> Vec<(usize, usize)> {
 fn mask_percent_q_strings(bytes: &[u8], mask: &mut [bool]) {
     let mut i = 0;
     while i + 2 < bytes.len() {
-        if mask[i] || bytes[i] != b'%' || (bytes[i + 1] != b'q' && bytes[i + 1] != b'Q') {
+        if mask[i]
+            || bytes[i] != b'%'
+            || (bytes[i + 1] != b'q' && bytes[i + 1] != b'Q')
+            || (i > 0 && is_word_char(bytes[i - 1]))
+        {
             i += 1;
             continue;
         }
@@ -1637,12 +1641,7 @@ fn scan_file(
         scan_requires_filtered(bytes, &mask, &mut requires);
         scan_autoloads_filtered(bytes, &mask, &mut requires);
         scan_gem_bin_filtered(bytes, &mask, &mut requires);
-        scan_bundler_require_filtered(
-            bytes,
-            &mask,
-            &mut bundler_groups,
-            &mut bundler_require_all,
-        );
+        scan_bundler_require_filtered(bytes, &mask, &mut bundler_groups, &mut bundler_require_all);
     }
     // Fix #5: do NOT run the generic uppercase-token module scanner on YAML
     // files — YAML keys/values like `UserNotFound:` would otherwise be
@@ -1908,6 +1907,15 @@ mod tests {
     #[test]
     fn percent_q_in_heredoc_does_not_mask_later_code() {
         let input = b"doc = <<~HELP\n  %q(unclosed\nHELP\nrequire 'real_gem'\n";
+        let mask = build_skip_mask(input, true, LineCommentKind::Hash);
+        let mut results = Vec::new();
+        scan_requires_filtered(input, &mask, &mut results);
+        assert_eq!(results, vec!["real_gem"]);
+    }
+
+    #[test]
+    fn percent_q_after_word_char_is_modulo_expression() {
+        let input = b"x%q(require 'real_gem')\n";
         let mask = build_skip_mask(input, true, LineCommentKind::Hash);
         let mut results = Vec::new();
         scan_requires_filtered(input, &mask, &mut results);
