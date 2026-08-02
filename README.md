@@ -149,3 +149,15 @@ Built with Rust for maximum performance:
 - **vendor/cache support** — extracts gemspec metadata from packed `.gem` tarballs
 
 On github/github (~53K Ruby files): **~2.8s** (vs scc line counting at 1.85s).
+
+Run the reproducible benchmark suite with:
+
+```bash
+cargo build --release
+cargo bench -- --save-baseline main
+# After a change:
+cargo bench -- --baseline main
+```
+
+It covers cold and warm end-to-end runs, source-tree scaling,
+comment/heredoc-heavy Ruby, and ignore-heavy directory trees.
