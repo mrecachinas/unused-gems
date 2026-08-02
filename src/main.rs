@@ -31,7 +31,9 @@ struct Cli {
     #[arg(short, long, default_value = "text", value_parser = ["text", "json", "github"])]
     output: String,
 
-    /// Number of parallel scanning threads (default: available CPUs)
+    /// Number of parallel scanning threads. When set, this also overrides the
+    /// scanner's conservative walker thread cap (default 4) — useful for large
+    /// cold scans on many-core machines. Leave unset to keep the default cap.
     #[arg(short, long)]
     jobs: Option<usize>,
 
@@ -95,13 +97,18 @@ fn main() {
         std::process::exit(1);
     }
 
-    // Configure thread pool if --jobs specified
+    // Configure the rayon global pool when --jobs specified. This affects
+    // `par_iter`/`rayon::join` work throughout the pipeline. The walker's
+    // thread count is plumbed explicitly below via `scan_source_tree_with_threads`
+    // so an explicit `--jobs` actually raises the walker fan-out past the
+    // conservative default cap of 4.
     if let Some(jobs) = cli.jobs {
         rayon::ThreadPoolBuilder::new()
             .num_threads(jobs)
             .build_global()
             .ok();
     }
+    let walker_threads: Option<usize> = cli.jobs;
 
     let mut skip_dirs: Vec<&str> = scanner::default_skip_dirs();
     let extra_skip: Vec<String> = cli.skip_dirs.unwrap_or_default();
@@ -216,7 +223,14 @@ fn main() {
                             || introspect::build_vendor_cache_path_index(&dir),
                         )
                     },
-                    || scanner::scan_source_tree(&dir, &skip_dirs, cache_for_scan),
+                    || {
+                        scanner::scan_source_tree_with_threads(
+                            &dir,
+                            &skip_dirs,
+                            cache_for_scan,
+                            walker_threads,
+                        )
+                    },
                 )
             },
             || {
