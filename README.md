@@ -122,7 +122,9 @@ or unresolvable expressions produce a warning instead of being silently dropped.
 `gemspec` honors `path:`, `name:` and `development_group:`. It looks only at the
 immediate directory for `*.gemspec` (plus a bare `.gemspec`), matches `name:` against the
 parsed `spec.name` rather than the file name, selects deterministically, and warns when
-zero or multiple distinct gems are found. The gemspec's own `spec.name` is registered as
+zero gemspecs are found or when the candidates cover more than one `[spec.name,
+spec.version]` pair (matching Bundler's grouping — two gemspecs for the same gem at
+different versions stay ambiguous, while equal versions collapse to one candidate). The gemspec's own `spec.name` is registered as
 a default-group path source; its **development** dependencies are added to the configured
 development group, while runtime dependencies are left to Bundler's transitive resolution
 rather than being reported as top-level gems. Matching Bundler, an explicit Gemfile

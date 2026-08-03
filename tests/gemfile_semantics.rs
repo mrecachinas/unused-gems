@@ -289,3 +289,85 @@ fn gemfile_declaration_wins_over_gemspec_development_dependency() {
         );
     }
 }
+
+#[test]
+fn same_name_gemspecs_at_different_versions_are_ambiguous() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+
+    write(&root.join("Gemfile"), "gemspec\n");
+    write(
+        &root.join("b.gemspec"),
+        "Gem::Specification.new do |spec|\n  spec.name = 'same'\n  spec.version = '2.0.0'\n  spec.add_development_dependency 'from_b'\nend\n",
+    );
+    write(
+        &root.join("a.gemspec"),
+        "Gem::Specification.new do |spec|\n  spec.name = 'same'\n  spec.version = '1.0.0'\n  spec.add_development_dependency 'from_a'\nend\n",
+    );
+    write(&root.join("lib/same.rb"), "module Same; end\n");
+
+    let bin = env!("CARGO_BIN_EXE_unused-gems");
+    let output = Command::new(bin)
+        .arg("--output")
+        .arg("json")
+        .arg("--no-cache")
+        .arg(root)
+        .output()
+        .unwrap();
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("found multiple gemspecs")
+            && stderr.contains("same-1.0.0")
+            && stderr.contains("same-2.0.0"),
+        "expected an ambiguity warning naming both versions, got: {}",
+        stderr
+    );
+
+    // Deterministic fallback: the first candidate by file name.
+    let results = run_tool(root);
+    let names: Vec<&String> = results.keys().collect();
+    assert_eq!(
+        names,
+        vec!["from_a", "same"],
+        "unexpected gems: {:?}",
+        names
+    );
+}
+
+#[test]
+fn same_name_and_version_gemspecs_are_not_ambiguous() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+
+    write(&root.join("Gemfile"), "gemspec\n");
+    write(
+        &root.join("a.gemspec"),
+        "Gem::Specification.new do |spec|\n  spec.name = 'same'\n  spec.version = '1.0'\n  spec.add_development_dependency 'rspec'\nend\n",
+    );
+    write(
+        &root.join("b.gemspec"),
+        "Gem::Specification.new do |spec|\n  spec.name = 'same'\n  spec.version = '1.0.0'\nend\n",
+    );
+    write(&root.join("lib/same.rb"), "module Same; end\n");
+
+    let bin = env!("CARGO_BIN_EXE_unused-gems");
+    let output = Command::new(bin)
+        .arg("--output")
+        .arg("json")
+        .arg("--no-cache")
+        .arg(root)
+        .output()
+        .unwrap();
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("found multiple gemspecs"),
+        "equal versions must not be ambiguous, got: {}",
+        stderr
+    );
+
+    let results = run_tool(root);
+    let names: Vec<&String> = results.keys().collect();
+    assert_eq!(names, vec!["rspec", "same"], "unexpected gems: {:?}", names);
+}

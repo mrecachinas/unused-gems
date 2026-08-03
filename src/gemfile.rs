@@ -622,7 +622,42 @@ struct ParsedGemspec {
     path: PathBuf,
     /// `spec.name` when it is a literal, otherwise the file name stem.
     name: String,
+    /// `spec.version` when it is a literal, `None` when it is computed at runtime.
+    version: Option<String>,
     development_deps: Vec<String>,
+}
+
+impl ParsedGemspec {
+    /// Bundler groups gemspec candidates by `[spec.name, spec.version]`.
+    fn identity(&self) -> (String, Option<String>) {
+        (
+            self.name.clone(),
+            self.version.as_deref().map(canonical_gem_version),
+        )
+    }
+
+    fn label(&self) -> String {
+        format!(
+            "{}-{} ({})",
+            self.name,
+            self.version.as_deref().unwrap_or("unknown version"),
+            self.path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned()
+        )
+    }
+}
+
+/// Approximate `Gem::Version` equality: trailing zero segments are insignificant,
+/// so `1.0` and `1.0.0` are the same version.
+fn canonical_gem_version(version: &str) -> String {
+    let mut segments: Vec<&str> = version.trim().split('.').collect();
+    while segments.len() > 1 && *segments.last().unwrap() == "0" {
+        segments.pop();
+    }
+    segments.join(".")
 }
 
 /// List the gemspecs of a directory the way Bundler's `{,*}.gemspec` glob does:
@@ -689,6 +724,24 @@ fn select_gemspec(
             );
             return None;
         }
+        let mut identities: Vec<(String, Option<String>)> = Vec::new();
+        for p in &parsed {
+            let id = p.identity();
+            if !identities.contains(&id) {
+                identities.push(id);
+            }
+        }
+        if identities.len() > 1 {
+            let listed: Vec<String> = parsed.iter().map(ParsedGemspec::label).collect();
+            eprintln!(
+                "Warning: gemspec directive in {} found multiple versions of `{}` in {} ({}) — using {}",
+                gemfile_path.display(),
+                name,
+                spec_dir.display(),
+                listed.join(", "),
+                parsed[0].label()
+            );
+        }
         return parsed.into_iter().next();
     }
 
@@ -701,38 +754,24 @@ fn select_gemspec(
         return None;
     }
 
-    // Bundler groups candidates by gem name (and version): several files declaring
-    // the same gem are not ambiguous.
-    let distinct: Vec<&String> = {
-        let mut seen: Vec<&String> = Vec::new();
-        for p in &parsed {
-            if !seen.contains(&&p.name) {
-                seen.push(&p.name);
-            }
+    // Bundler groups candidates by [spec.name, spec.version]: several files declaring
+    // the same gem *and* version are one candidate, but the same gem at two different
+    // versions is ambiguous.
+    let mut identities: Vec<(String, Option<String>)> = Vec::new();
+    for p in &parsed {
+        let id = p.identity();
+        if !identities.contains(&id) {
+            identities.push(id);
         }
-        seen
-    };
-    if distinct.len() > 1 {
-        let listed: Vec<String> = parsed
-            .iter()
-            .map(|p| {
-                format!(
-                    "{} ({})",
-                    p.name,
-                    p.path
-                        .file_name()
-                        .unwrap_or_default()
-                        .to_string_lossy()
-                        .into_owned()
-                )
-            })
-            .collect();
+    }
+    if identities.len() > 1 {
+        let listed: Vec<String> = parsed.iter().map(ParsedGemspec::label).collect();
         eprintln!(
             "Warning: gemspec directive in {} found multiple gemspecs in {} ({}) — using {}. Pass `name:` to disambiguate.",
             gemfile_path.display(),
             spec_dir.display(),
             listed.join(", "),
-            parsed[0].name
+            parsed[0].label()
         );
     }
 
@@ -759,6 +798,7 @@ fn load_gemspec(spec_path: &Path, spec_dir: &Path) -> Option<ParsedGemspec> {
         spec_path: spec_path.to_path_buf(),
         receiver_names: HashSet::new(),
         spec_name: None,
+        spec_version: None,
         development_deps: Vec::new(),
     };
     visitor.visit(&parse_result.node());
@@ -768,6 +808,7 @@ fn load_gemspec(spec_path: &Path, spec_dir: &Path) -> Option<ParsedGemspec> {
         name: visitor
             .spec_name
             .unwrap_or_else(|| gemspec_stem(spec_path, spec_dir)),
+        version: visitor.spec_version,
         development_deps: visitor.development_deps,
     })
 }
@@ -836,6 +877,7 @@ struct GemspecVisitor<'s> {
     /// Local variable names bound to a `Gem::Specification` instance.
     receiver_names: HashSet<Vec<u8>>,
     spec_name: Option<String>,
+    spec_version: Option<String>,
     development_deps: Vec<String>,
 }
 
@@ -851,6 +893,16 @@ impl GemspecVisitor<'_> {
 /// True for `Gem::Specification.new` (and the rarer bare `Specification.new`).
 fn is_gem_specification_new(call: &ruby_prism::CallNode<'_>) -> bool {
     call.name().as_slice() == b"new" && receiver_is_const(call, b"Specification")
+}
+
+/// `Gem::Version.new("1.2.3")` → `1.2.3`.
+fn extract_gem_version_new(node: &Node<'_>, source: &[u8]) -> Option<String> {
+    let call = node.as_call_node()?;
+    if call.name().as_slice() != b"new" || !receiver_is_const(&call, b"Version") {
+        return None;
+    }
+    let first = call.arguments()?.arguments().iter().next()?;
+    extract_string_value(&first, source)
 }
 
 impl Visit<'_> for GemspecVisitor<'_> {
@@ -897,6 +949,15 @@ impl Visit<'_> for GemspecVisitor<'_> {
                             self.spec_path.display()
                         ),
                     }
+                }
+            }
+        } else if name_bytes == b"version=" && self.is_spec_receiver(node) {
+            // A computed version (e.g. `MyGem::VERSION`) stays `None`; two gemspecs are
+            // only collapsed when their declared versions are known to be equal.
+            if let Some(args) = node.arguments() {
+                if let Some(first) = args.arguments().iter().next() {
+                    self.spec_version = extract_string_value(&first, self.source)
+                        .or_else(|| extract_gem_version_new(&first, self.source));
                 }
             }
         } else if matches!(
@@ -1695,6 +1756,135 @@ mod tests {
         write_gemspec(&dir.path().join("foo.gemspec"), "  spec.name = 'other'\n");
         let gems = parse_gemfile(dir.path());
         assert_eq!(names(&gems), vec!["rails"]);
+    }
+
+    #[test]
+    fn canonical_gem_version_ignores_trailing_zero_segments() {
+        assert_eq!(canonical_gem_version("1.0.0"), "1");
+        assert_eq!(canonical_gem_version("1.0"), "1");
+        assert_eq!(canonical_gem_version("1.2.0"), "1.2");
+        assert_eq!(canonical_gem_version("1.2.3"), "1.2.3");
+        assert_eq!(canonical_gem_version("0"), "0");
+        assert_eq!(canonical_gem_version("0.0"), "0");
+        assert_eq!(canonical_gem_version(" 2.1 "), "2.1");
+        assert_eq!(canonical_gem_version("1.0.0.beta"), "1.0.0.beta");
+    }
+
+    fn identities_in(dir: &Path) -> Vec<(String, Option<String>)> {
+        gemspec_candidates(dir, &dir.join("Gemfile"))
+            .unwrap()
+            .iter()
+            .filter_map(|p| load_gemspec(p, dir))
+            .map(|p| p.identity())
+            .collect()
+    }
+
+    #[test]
+    fn gemspec_identity_groups_by_name_and_version() {
+        let dir = tempfile::tempdir().unwrap();
+        write_gemspec(
+            &dir.path().join("a.gemspec"),
+            "  spec.name = 'same'\n  spec.version = '1.0.0'\n",
+        );
+        write_gemspec(
+            &dir.path().join("b.gemspec"),
+            "  spec.name = 'same'\n  spec.version = '2.0.0'\n",
+        );
+        let ids = identities_in(dir.path());
+        assert_eq!(
+            ids,
+            vec![
+                ("same".to_string(), Some("1".to_string())),
+                ("same".to_string(), Some("2".to_string())),
+            ]
+        );
+    }
+
+    #[test]
+    fn gemspec_identity_treats_equivalent_versions_as_one() {
+        let dir = tempfile::tempdir().unwrap();
+        write_gemspec(
+            &dir.path().join("a.gemspec"),
+            "  spec.name = 'same'\n  spec.version = '1.0'\n",
+        );
+        write_gemspec(
+            &dir.path().join("b.gemspec"),
+            "  spec.name = 'same'\n  spec.version = '1.0.0'\n",
+        );
+        let ids = identities_in(dir.path());
+        assert_eq!(ids[0], ids[1]);
+    }
+
+    #[test]
+    fn gemspec_identity_parses_gem_version_new() {
+        let dir = tempfile::tempdir().unwrap();
+        write_gemspec(
+            &dir.path().join("a.gemspec"),
+            "  spec.name = 'same'\n  spec.version = Gem::Version.new('2.1')\n",
+        );
+        assert_eq!(
+            identities_in(dir.path()),
+            vec![("same".to_string(), Some("2.1".to_string()))]
+        );
+    }
+
+    #[test]
+    fn gemspec_identity_leaves_computed_version_unknown() {
+        let dir = tempfile::tempdir().unwrap();
+        write_gemspec(
+            &dir.path().join("a.gemspec"),
+            "  spec.name = 'same'\n  spec.version = MyGem::VERSION\n",
+        );
+        assert_eq!(identities_in(dir.path()), vec![("same".to_string(), None)]);
+    }
+
+    #[test]
+    fn gemspec_same_name_different_versions_selects_first_deterministically() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Gemfile"), "gemspec\n").unwrap();
+        write_gemspec(
+            &dir.path().join("b.gemspec"),
+            "  spec.name = 'same'\n  spec.version = '2.0.0'\n  spec.add_development_dependency 'from_b'\n",
+        );
+        write_gemspec(
+            &dir.path().join("a.gemspec"),
+            "  spec.name = 'same'\n  spec.version = '1.0.0'\n  spec.add_development_dependency 'from_a'\n",
+        );
+        // Ambiguous (same name, different versions) → warn and use the first sorted file.
+        let gems = parse_gemfile(dir.path());
+        assert_eq!(names(&gems), vec!["same", "from_a"]);
+    }
+
+    #[test]
+    fn gemspec_same_name_and_version_in_multiple_files_is_not_ambiguous() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Gemfile"), "gemspec\n").unwrap();
+        write_gemspec(
+            &dir.path().join("a.gemspec"),
+            "  spec.name = 'same'\n  spec.version = '1.0'\n  spec.add_development_dependency 'rspec'\n",
+        );
+        write_gemspec(
+            &dir.path().join("b.gemspec"),
+            "  spec.name = 'same'\n  spec.version = '1.0.0'\n",
+        );
+        let gems = parse_gemfile(dir.path());
+        assert_eq!(names(&gems), vec!["same", "rspec"]);
+    }
+
+    #[test]
+    fn gemspec_name_option_with_conflicting_versions_selects_first() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Gemfile"), "gemspec name: 'same'\n").unwrap();
+        write_gemspec(
+            &dir.path().join("b.gemspec"),
+            "  spec.name = 'same'\n  spec.version = '2.0.0'\n  spec.add_development_dependency 'from_b'\n",
+        );
+        write_gemspec(
+            &dir.path().join("a.gemspec"),
+            "  spec.name = 'same'\n  spec.version = '1.0.0'\n  spec.add_development_dependency 'from_a'\n",
+        );
+        let gems = parse_gemfile(dir.path());
+        assert_eq!(names(&gems), vec!["same", "from_a"]);
     }
 
     #[test]
