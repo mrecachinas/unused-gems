@@ -42,6 +42,7 @@ pub enum GemStatus {
     Used,
     Unused,
     BundlerRequired,
+    #[allow(dead_code)]
     RequireFalse,
     Ignored,
     PlatformExcluded,

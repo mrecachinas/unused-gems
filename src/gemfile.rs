@@ -133,6 +133,9 @@ impl<'s> GemfileVisitor<'s> {
                                 {
                                     require_paths.push(s);
                                 } else if let Some(arr) = assoc.value().as_array_node() {
+                                    if arr.elements().is_empty() {
+                                        require_false = true;
+                                    }
                                     for el in arr.elements().iter() {
                                         if let Some(s) = extract_string_value(&el, self.source) {
                                             require_paths.push(s);
@@ -195,11 +198,7 @@ impl<'s> GemfileVisitor<'s> {
             name,
             groups,
             platforms,
-            require_paths: if require_false {
-                Vec::new()
-            } else {
-                require_paths
-            },
+            require_paths,
             module_names: Vec::new(),
             require_false,
             source,
@@ -477,6 +476,13 @@ mod tests {
     #[test]
     fn gem_require_false() {
         let gems = parse_gems("gem 'bootsnap', require: false\n");
+        assert!(gems[0].require_false);
+        assert!(gems[0].require_paths.is_empty());
+    }
+
+    #[test]
+    fn gem_require_empty_array_disables_autorequire() {
+        let gems = parse_gems("gem 'bootsnap', require: []\n");
         assert!(gems[0].require_false);
         assert!(gems[0].require_paths.is_empty());
     }

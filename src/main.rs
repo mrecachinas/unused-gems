@@ -62,6 +62,10 @@ struct Cli {
     #[arg(long, value_delimiter = ',')]
     skip_dirs: Option<Vec<String>>,
 
+    /// Rails environment whose Gemfile group should be considered active
+    #[arg(long)]
+    rails_env: Option<String>,
+
     /// Disable file cache (always scan all files fresh)
     #[arg(long)]
     no_cache: bool,
@@ -114,7 +118,7 @@ fn main() {
     let mut skip_dirs: Vec<&str> = scanner::default_skip_dirs();
     let extra_skip: Vec<String> = cli.skip_dirs.unwrap_or_default();
     let extra_refs: Vec<&str> = extra_skip.iter().map(|s| s.as_str()).collect();
-    skip_dirs.extend(extra_refs);
+    skip_dirs.extend(extra_refs.iter().copied());
 
     let bench = std::env::var("BENCH").is_ok();
     macro_rules! timed {
@@ -225,9 +229,10 @@ fn main() {
                         )
                     },
                     || {
-                        scanner::scan_source_tree_with_threads(
+                        scanner::scan_source_tree_with_threads_and_explicit_skips(
                             &dir,
                             &skip_dirs,
+                            &extra_refs,
                             cache_for_scan,
                             walker_threads,
                         )
@@ -306,7 +311,11 @@ fn main() {
     // Synthesize active bundler groups when `Bundler.require(*Rails.groups)` (or equivalent)
     // is detected. See `synthesize_bundler_groups` for rationale.
     if scan_results.bundler_require_all {
-        synthesize_bundler_groups(&gems, &mut scan_results.bundler_groups);
+        synthesize_bundler_groups(
+            &gems,
+            cli.rails_env.as_deref(),
+            &mut scan_results.bundler_groups,
+        );
     }
 
     // 2b+3. Script scanning || resolve require paths (concurrent)
@@ -325,46 +334,43 @@ fn main() {
             },
             || {
                 gems.par_iter_mut().for_each(|gem| {
-                    if !gem.require_false {
-                        let mut declared = std::mem::take(&mut gem.require_paths);
-                        let heuristic = resolve_require_paths(gem, &gem_index);
-                        for p in heuristic {
-                            if !declared.contains(&p) {
-                                declared.push(p);
-                            }
+                    let mut declared = std::mem::take(&mut gem.require_paths);
+                    let heuristic = resolve_require_paths(gem, &gem_index);
+                    for p in heuristic {
+                        if !declared.contains(&p) {
+                            declared.push(p);
                         }
-                        // Lazy vendor fallback: extract metadata on demand
-                        if declared.len() <= 1 {
-                            if let Some(path) = vendor_path_index.get(&gem.name) {
-                                // Compute-outside-lock: check cache first; if miss, decompress
-                                // tarball outside the lock, then insert. Avoids serializing
-                                // every vendor extraction across all rayon workers.
-                                let cached = vendor_memo.lock().unwrap().get(path).cloned();
-                                let meta = match cached {
-                                    Some(m) => m,
-                                    None => {
-                                        let computed =
-                                            introspect::extract_vendor_gem_metadata(path)
-                                                .map(Arc::new);
-                                        vendor_memo
-                                            .lock()
-                                            .unwrap()
-                                            .entry(path.clone())
-                                            .or_insert(computed)
-                                            .clone()
-                                    }
-                                };
-                                if let Some(ref meta) = meta {
-                                    for rp in &meta.require_paths {
-                                        if rp != "lib" && !declared.contains(rp) {
-                                            declared.push(rp.clone());
-                                        }
+                    }
+                    // Lazy vendor fallback: extract metadata on demand
+                    if declared.len() <= 1 {
+                        if let Some(path) = vendor_path_index.get(&gem.name) {
+                            // Compute-outside-lock: check cache first; if miss, decompress
+                            // tarball outside the lock, then insert. Avoids serializing
+                            // every vendor extraction across all rayon workers.
+                            let cached = vendor_memo.lock().unwrap().get(path).cloned();
+                            let meta = match cached {
+                                Some(m) => m,
+                                None => {
+                                    let computed =
+                                        introspect::extract_vendor_gem_metadata(path).map(Arc::new);
+                                    vendor_memo
+                                        .lock()
+                                        .unwrap()
+                                        .entry(path.clone())
+                                        .or_insert(computed)
+                                        .clone()
+                                }
+                            };
+                            if let Some(ref meta) = meta {
+                                for rp in &meta.require_paths {
+                                    if rp != "lib" && !declared.contains(rp) {
+                                        declared.push(rp.clone());
                                     }
                                 }
                             }
                         }
-                        gem.require_paths = declared;
                     }
+                    gem.require_paths = declared;
                 })
             },
         )
@@ -612,6 +618,7 @@ fn resolve_require_paths(
     let mut paths = Vec::new();
     if gem.name.contains('-') {
         paths.push(gem.name.replace('-', "/"));
+        paths.push(gem.name.replace('-', "_"));
     }
     paths.push(gem.name.clone());
     // NOTE: we deliberately do NOT add the bare first segment as a require path
@@ -814,16 +821,97 @@ fn scan_storage_adapters(
         None => return std::collections::HashMap::new(),
     };
 
-    static SERVICE_RE: once_cell::sync::Lazy<regex::Regex> = once_cell::sync::Lazy::new(|| {
-        regex::Regex::new(r"(?m)^[ \t]*service:[ \t]*(\S+)").unwrap()
-    });
+    static SELECTED_SERVICE_RE: once_cell::sync::Lazy<regex::Regex> =
+        once_cell::sync::Lazy::new(|| {
+            regex::Regex::new(r"(?m)^[ \t]*config\.active_storage\.service\s*=\s*:(\w+)").unwrap()
+        });
+
+    let mut selected = HashSet::new();
+    let mut config_files = vec![dir.join("config").join("application.rb")];
+    let envs_dir = dir.join("config").join("environments");
+    if let Ok(entries) = std::fs::read_dir(envs_dir) {
+        config_files.extend(
+            entries
+                .flatten()
+                .map(|entry| entry.path())
+                .filter(|path| path.extension().is_some_and(|ext| ext == "rb")),
+        );
+    }
+    for file in config_files {
+        let Ok(config) = std::fs::read_to_string(file) else {
+            continue;
+        };
+        for cap in SELECTED_SERVICE_RE.captures_iter(&config) {
+            selected.insert(cap[1].to_string());
+        }
+    }
+    static SERVICE_SYMBOL_RE: once_cell::sync::Lazy<regex::Regex> =
+        once_cell::sync::Lazy::new(|| regex::Regex::new(r":(\w+)").unwrap());
+    let app_pattern = dir.join("app").join("**").join("*.rb");
+    if let Some(pattern) = app_pattern.to_str() {
+        if let Ok(paths) = glob::glob(pattern) {
+            for path in paths.flatten() {
+                let Ok(source) = std::fs::read_to_string(path) else {
+                    continue;
+                };
+                let lines: Vec<&str> = source.lines().collect();
+                for (index, line) in lines.iter().enumerate() {
+                    if !line.contains("has_one_attached") && !line.contains("has_many_attached") {
+                        continue;
+                    }
+                    let mut statement = line.to_string();
+                    for continuation in lines.iter().skip(index + 1).take(5) {
+                        let trimmed = continuation.trim_start();
+                        if continuation.len() == trimmed.len()
+                            || ["class ", "def ", "end", "has_one_", "has_many_", "module "]
+                                .iter()
+                                .any(|prefix| trimmed.starts_with(prefix))
+                        {
+                            break;
+                        }
+                        statement.push(' ');
+                        statement.push_str(trimmed);
+                    }
+                    let Some((_, service_expression)) = statement.split_once("service:") else {
+                        continue;
+                    };
+                    for cap in SERVICE_SYMBOL_RE.captures_iter(service_expression) {
+                        selected.insert(cap[1].to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    let mut services = std::collections::HashMap::new();
+    let mut current = None;
+    for line in content.lines() {
+        if !line.starts_with([' ', '\t']) {
+            current = line.trim().strip_suffix(':').map(|name| name.to_string());
+            continue;
+        }
+        let Some(service) = line.trim().strip_prefix("service:") else {
+            continue;
+        };
+        if let Some(name) = current.as_ref() {
+            services.insert(
+                name.clone(),
+                service
+                    .trim()
+                    .trim_matches(|c| c == '\'' || c == '"')
+                    .to_string(),
+            );
+        }
+    }
 
     let mut adapters = std::collections::HashMap::new();
-    for cap in SERVICE_RE.captures_iter(&content) {
-        let service = cap[1].trim_matches(|c| c == '\'' || c == '"');
+    for name in selected {
+        let Some(service) = services.get(&name) else {
+            continue;
+        };
         let gem_name = adapters::storage_gem(service, overrides);
         if let Some(gem) = gem_name {
-            adapters.insert(gem.to_string(), service.to_string());
+            adapters.insert(gem.to_string(), service.clone());
         }
     }
     adapters
@@ -834,8 +922,12 @@ fn scan_cache_config(
     dir: &std::path::Path,
     overrides: &adapters::AdapterOverrides,
 ) -> std::collections::HashMap<String, String> {
-    static CACHE_RE: once_cell::sync::Lazy<regex::Regex> =
-        once_cell::sync::Lazy::new(|| regex::Regex::new(r"cache_store\s*=\s*:(\w+)").unwrap());
+    static CACHE_RE: once_cell::sync::Lazy<regex::Regex> = once_cell::sync::Lazy::new(|| {
+        regex::Regex::new(
+            r"(?m)^[ \t]*(?:config|Rails\.application\.config)\.cache_store\s*=\s*:(\w+)",
+        )
+        .unwrap()
+    });
 
     let mut adapters = std::collections::HashMap::new();
     let mut files_to_check = vec![dir.join("config").join("application.rb")];
@@ -867,16 +959,37 @@ fn scan_cache_config(
     adapters
 }
 
-/// Populate `target` with every distinct group declared across `gems`, plus
-/// "default". This represents the safe upper bound for `Bundler.require(*Rails.groups)`,
-/// where Bundler auto-requires every gem in every group active for the current env.
-fn synthesize_bundler_groups(gems: &[types::GemEntry], target: &mut HashSet<String>) {
-    for gem in gems {
-        for g in &gem.groups {
-            target.insert(g.clone());
-        }
+/// `Rails.groups` always includes `default`, but its environment-specific
+/// groups cannot be inferred safely without executing the application.
+fn synthesize_bundler_groups(
+    _gems: &[types::GemEntry],
+    rails_env: Option<&str>,
+    target: &mut HashSet<String>,
+) {
+    const CONDITION_PREFIX: &str = "__rails_group_condition__:";
+    let conditions: Vec<String> = target
+        .iter()
+        .filter(|group| group.starts_with(CONDITION_PREFIX))
+        .cloned()
+        .collect();
+    for condition in &conditions {
+        target.remove(condition);
     }
     target.insert("default".to_string());
+    if let Some(env) = rails_env {
+        target.insert(env.to_string());
+        for condition in conditions {
+            let Some((group, environments)) = condition
+                .trim_start_matches(CONDITION_PREFIX)
+                .split_once(':')
+            else {
+                continue;
+            };
+            if environments.split(',').any(|candidate| candidate == env) {
+                target.insert(group.to_string());
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -897,7 +1010,7 @@ mod tests {
     }
 
     #[test]
-    fn synthesize_bundler_groups_adds_all_declared_groups() {
+    fn synthesize_bundler_groups_does_not_assume_environment_groups() {
         let gems = vec![
             gem("rails", &[]),
             gem("rspec-rails", &["test"]),
@@ -905,33 +1018,58 @@ mod tests {
             gem("newrelic", &["production", "staging"]),
         ];
         let mut groups = HashSet::new();
-        synthesize_bundler_groups(&gems, &mut groups);
+        synthesize_bundler_groups(&gems, None, &mut groups);
         assert!(groups.contains("default"));
-        assert!(groups.contains("development"));
-        assert!(groups.contains("test"));
-        assert!(groups.contains("production"));
-        assert!(groups.contains("staging"));
+        assert_eq!(groups.len(), 1);
     }
 
     #[test]
     fn synthesize_bundler_groups_always_includes_default() {
         let gems = vec![gem("rails", &[])];
         let mut groups = HashSet::new();
-        synthesize_bundler_groups(&gems, &mut groups);
+        synthesize_bundler_groups(&gems, None, &mut groups);
         assert!(groups.contains("default"));
         assert_eq!(groups.len(), 1);
     }
 
     #[test]
-    fn synthesize_bundler_groups_dedups() {
+    fn synthesize_bundler_groups_ignores_declared_groups() {
         let gems = vec![
             gem("a", &["test"]),
             gem("b", &["test"]),
             gem("c", &["test", "development"]),
         ];
         let mut groups = HashSet::new();
-        synthesize_bundler_groups(&gems, &mut groups);
-        assert_eq!(groups.len(), 3); // test + development + default
+        synthesize_bundler_groups(&gems, None, &mut groups);
+        assert_eq!(groups, HashSet::from(["default".to_string()]));
+    }
+
+    #[test]
+    fn synthesize_bundler_groups_includes_explicit_rails_environment() {
+        let gems = vec![gem("rails", &[])];
+        let mut groups = HashSet::new();
+        synthesize_bundler_groups(&gems, Some("test"), &mut groups);
+        assert_eq!(
+            groups,
+            HashSet::from(["default".to_string(), "test".to_string()])
+        );
+    }
+
+    #[test]
+    fn synthesize_bundler_groups_resolves_conditional_group() {
+        let gems = vec![gem("rails", &[])];
+        let mut groups = HashSet::from([String::from(
+            "__rails_group_condition__:assets:development,test",
+        )]);
+        synthesize_bundler_groups(&gems, Some("development"), &mut groups);
+        assert_eq!(
+            groups,
+            HashSet::from([
+                "default".to_string(),
+                "development".to_string(),
+                "assets".to_string()
+            ])
+        );
     }
 
     #[test]
@@ -977,6 +1115,15 @@ mod tests {
         let names = resolve_module_names(&g, &idx);
         assert!(names.iter().any(|n| n == "GraphQL"));
         assert!(names.iter().any(|n| n == "Graphql"));
+    }
+
+    #[test]
+    fn resolve_module_names_avoids_shared_extension_root() {
+        let g = gem("graphql-batch", &[]);
+        let idx = std::collections::HashMap::new();
+        let names = resolve_module_names(&g, &idx);
+        assert!(names.iter().any(|n| n == "GraphQL::Batch"));
+        assert!(!names.iter().any(|n| n == "GraphQL"));
     }
 
     #[test]
@@ -1054,9 +1201,79 @@ mod tests {
             "amazon:\n  service: S3\n  bucket: <%= ENV['BUCKET'] %>\n",
         )
         .unwrap();
+        let envs = cfg.join("environments");
+        std::fs::create_dir_all(&envs).unwrap();
+        std::fs::write(
+            envs.join("production.rb"),
+            "config.active_storage.service = :amazon\n",
+        )
+        .unwrap();
 
         let adapters = scan_storage_adapters(tmp.path(), &adapters::AdapterOverrides::default());
         assert_eq!(adapters.get("aws-sdk-s3").map(|s| s.as_str()), Some("S3"));
+    }
+
+    #[test]
+    fn scan_storage_adapters_includes_attachment_service() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = tmp.path().join("config");
+        let models = tmp.path().join("app").join("models");
+        std::fs::create_dir_all(&cfg).unwrap();
+        std::fs::create_dir_all(&models).unwrap();
+        std::fs::write(
+            cfg.join("storage.yml"),
+            "local:\n  service: Disk\namazon:\n  service: S3\n",
+        )
+        .unwrap();
+        std::fs::write(
+            models.join("user.rb"),
+            "class User\n  has_one_attached :avatar, service: :amazon\nend\n",
+        )
+        .unwrap();
+
+        let adapters = scan_storage_adapters(tmp.path(), &adapters::AdapterOverrides::default());
+        assert_eq!(adapters.get("aws-sdk-s3").map(String::as_str), Some("S3"));
+    }
+
+    #[test]
+    fn scan_storage_adapters_includes_dynamic_attachment_services() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = tmp.path().join("config");
+        let models = tmp.path().join("app").join("models");
+        std::fs::create_dir_all(&cfg).unwrap();
+        std::fs::create_dir_all(&models).unwrap();
+        std::fs::write(
+            cfg.join("storage.yml"),
+            "europe:\n  service: S3\nusa:\n  service: GCS\n",
+        )
+        .unwrap();
+        std::fs::write(
+            models.join("user.rb"),
+            "class User\n  has_one_attached :avatar,\n    service: ->(user) { user.eu? ? :europe : :usa }\nend\n",
+        )
+        .unwrap();
+
+        let adapters = scan_storage_adapters(tmp.path(), &adapters::AdapterOverrides::default());
+        assert_eq!(adapters.get("aws-sdk-s3").map(String::as_str), Some("S3"));
+        assert_eq!(
+            adapters.get("google-cloud-storage").map(String::as_str),
+            Some("GCS")
+        );
+    }
+
+    #[test]
+    fn scan_cache_config_ignores_commented_settings() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = tmp.path().join("config").join("environments");
+        std::fs::create_dir_all(&cfg).unwrap();
+        std::fs::write(
+            cfg.join("production.rb"),
+            "# config.cache_store = :mem_cache_store\n",
+        )
+        .unwrap();
+
+        let adapters = scan_cache_config(tmp.path(), &adapters::AdapterOverrides::default());
+        assert!(!adapters.contains_key("dalli"));
     }
 
     #[test]

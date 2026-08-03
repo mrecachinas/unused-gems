@@ -13,7 +13,9 @@ pub(crate) fn is_script_file(rel_path: &str, file_name: &str) -> bool {
     let rel_path = &rel_path.replace('\\', "/");
     // Exact top-level filenames
     match file_name {
-        "Makefile" | "makefile" | "GNUmakefile" | "Dockerfile" | "Procfile" => return true,
+        "Makefile" | "makefile" | "GNUmakefile" | "Rakefile" | "Dockerfile" | "Procfile" => {
+            return true
+        }
         "Jenkinsfile" => return true,
         "Earthfile" => return true,
         "Justfile" | "justfile" | ".justfile" => return true,
@@ -238,6 +240,104 @@ fn strip_comment_lines(content: &[u8]) -> Cow<'_, [u8]> {
     Cow::Owned(result)
 }
 
+fn command_slices<'a>(rel_path: &str, content: &'a [u8]) -> Vec<&'a [u8]> {
+    let normalized = rel_path.replace('\\', "/");
+    let file_name = normalized.rsplit('/').next().unwrap_or(&normalized);
+    let is_shell = normalized.starts_with("script/")
+        || normalized.starts_with("scripts/")
+        || normalized.starts_with("bin/")
+        || (!normalized.contains('/')
+            && (file_name.ends_with(".sh")
+                || file_name.ends_with(".bash")
+                || file_name.ends_with(".bats")));
+    let is_make = matches!(file_name, "Makefile" | "makefile" | "GNUmakefile");
+    let is_just = matches!(file_name, "Justfile" | "justfile" | ".justfile");
+    let is_rake = file_name == "Rakefile";
+    let is_procfile = file_name == "Procfile" || file_name.starts_with("Procfile.");
+    let is_docker = file_name == "Dockerfile"
+        || file_name.starts_with("Dockerfile.")
+        || file_name == "Earthfile";
+    let is_yaml = file_name.ends_with(".yml") || file_name.ends_with(".yaml");
+
+    let mut slices = Vec::new();
+    let mut yaml_block_indent = None;
+    for line in content.split(|b| *b == b'\n') {
+        let indent = line
+            .iter()
+            .position(|b| !b.is_ascii_whitespace())
+            .unwrap_or(line.len());
+        let trimmed = &line[indent..];
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        if is_yaml {
+            if let Some(block_indent) = yaml_block_indent {
+                if indent > block_indent {
+                    slices.push(trimmed.strip_prefix(b"- ").unwrap_or(trimmed));
+                    continue;
+                }
+                yaml_block_indent = None;
+            }
+        }
+
+        if is_shell || (is_make && line.first() == Some(&b'\t')) || (is_just && indent > 0) {
+            slices.push(trimmed);
+            continue;
+        }
+
+        let Ok(text) = std::str::from_utf8(trimmed) else {
+            continue;
+        };
+        if is_rake {
+            if let Some(command) = ["sh ", "system ", "system(", "exec ", "exec("]
+                .iter()
+                .find_map(|prefix| text.split_once(prefix).map(|(_, command)| command))
+            {
+                slices.push(command.trim_start().as_bytes());
+            }
+        } else if is_docker {
+            if let Some(command) = ["RUN ", "CMD ", "ENTRYPOINT "]
+                .iter()
+                .find_map(|prefix| text.strip_prefix(prefix))
+            {
+                slices.push(command.as_bytes());
+            }
+        } else if is_procfile {
+            if let Some((_, command)) = text.split_once(':') {
+                slices.push(command.trim_start().as_bytes());
+            }
+        } else if is_yaml {
+            let item = text.strip_prefix("- ").unwrap_or(text);
+            if let Some(command) = ["run:", "script:", "cmds:", "command:", "entrypoint:"]
+                .iter()
+                .find_map(|key| item.strip_prefix(key))
+            {
+                let command = command.trim_start();
+                let is_block = command
+                    .as_bytes()
+                    .split_first()
+                    .is_some_and(|(first, rest)| {
+                        (*first == b'|' || *first == b'>')
+                            && rest
+                                .iter()
+                                .all(|b| b.is_ascii_digit() || *b == b'+' || *b == b'-')
+                    });
+                if command.is_empty() || is_block {
+                    yaml_block_indent = Some(indent);
+                } else {
+                    slices.push(command.as_bytes());
+                }
+            }
+        } else if file_name.starts_with("Jenkinsfile.") || file_name == "Jenkinsfile" {
+            if let Some((_, command)) = text.split_once("sh ") {
+                slices.push(command.trim_start().as_bytes());
+            }
+        }
+    }
+    slices
+}
+
 /// Scan non-Ruby files (Makefile, Dockerfile, CI configs, scripts)
 /// for `bundle exec <gem>` invocations and bare gem CLI references.
 /// Uses pre-collected script files from the source tree walk (single-walk mode).
@@ -284,28 +384,30 @@ pub fn scan_scripts_for_gem_usage(
                 }
             }
 
-            // AhoCorasick: gem name byte match with manual word boundaries.
+            // AhoCorasick: gem name byte match in executable command contexts.
             // Treat `-` and `_` as part of the gem token so that "rack" inside
             // "rack-mini-profiler" does NOT count as a match for the "rack" gem.
             let mut seen = vec![false; num_patterns];
-            for mat in ac.find_overlapping_iter(stripped) {
-                let pid = mat.pattern().as_usize();
-                if seen[pid] {
-                    continue;
-                }
-                let start = mat.start();
-                let end = mat.end();
-                let before_ok = start == 0 || {
-                    let b = stripped[start - 1];
-                    !b.is_ascii_alphanumeric() && b != b'_' && b != b'-'
-                };
-                let after_ok = end >= stripped.len() || {
-                    let b = stripped[end];
-                    !b.is_ascii_alphanumeric() && b != b'_' && b != b'-'
-                };
-                if before_ok && after_ok {
-                    seen[pid] = true;
-                    refs.push((gem_names[pid].clone(), rel_path.clone()));
+            for command in command_slices(rel_path, stripped) {
+                for mat in ac.find_overlapping_iter(command) {
+                    let pid = mat.pattern().as_usize();
+                    if seen[pid] {
+                        continue;
+                    }
+                    let start = mat.start();
+                    let end = mat.end();
+                    let before_ok = start == 0 || {
+                        let b = command[start - 1];
+                        !b.is_ascii_alphanumeric() && b != b'_' && b != b'-'
+                    };
+                    let after_ok = end >= command.len() || {
+                        let b = command[end];
+                        !b.is_ascii_alphanumeric() && b != b'_' && b != b'-'
+                    };
+                    if before_ok && after_ok {
+                        seen[pid] = true;
+                        refs.push((gem_names[pid].clone(), rel_path.clone()));
+                    }
                 }
             }
 
@@ -337,6 +439,8 @@ fn build_exe_to_gem_map(
     static EXE_SINGLE_RE: once_cell::sync::Lazy<Regex> = once_cell::sync::Lazy::new(|| {
         Regex::new(r#"executables\s*(?:<<|=)\s*['"]([^'"]+)['"]"#).unwrap()
     });
+    static QUOTED_RE: once_cell::sync::Lazy<Regex> =
+        once_cell::sync::Lazy::new(|| Regex::new(r#"['"]([^'"]+)['"]"#).unwrap());
 
     // Collect gem names that have a gem_index entry, then read in parallel
     let gems_with_dirs: Vec<(&str, &std::path::PathBuf)> = gem_names
@@ -348,19 +452,34 @@ fn build_exe_to_gem_map(
         .par_iter()
         .flat_map(|(gem_name, gem_dir)| {
             let mut exes = Vec::new();
-            let rd = match std::fs::read_dir(gem_dir) {
-                Ok(rd) => rd,
-                Err(_) => return exes,
-            };
-            for entry in rd.flatten() {
-                let spec_path = entry.path();
-                if spec_path.extension().and_then(|s| s.to_str()) != Some("gemspec") {
-                    continue;
+            let mut spec_paths = Vec::new();
+            if let Ok(rd) = std::fs::read_dir(gem_dir) {
+                spec_paths.extend(rd.flatten().map(|entry| entry.path()).filter(|path| {
+                    path.extension().and_then(|ext| ext.to_str()) == Some("gemspec")
+                }));
+            }
+            if gem_dir
+                .parent()
+                .and_then(|path| path.file_name())
+                .is_some_and(|name| name == "gems")
+            {
+                if let (Some(root), Some(installed_name)) = (
+                    gem_dir.parent().and_then(|path| path.parent()),
+                    gem_dir.file_name(),
+                ) {
+                    let installed_spec = root
+                        .join("specifications")
+                        .join(format!("{}.gemspec", installed_name.to_string_lossy()));
+                    if installed_spec.is_file() {
+                        spec_paths.push(installed_spec);
+                    }
                 }
+            }
+            for spec_path in spec_paths {
                 if let Ok(content) = std::fs::read_to_string(&spec_path) {
                     if let Some(cap) = EXE_RE.captures(&content) {
-                        for exe in cap[1].split(',') {
-                            let exe = exe.trim().trim_matches(|c| c == '\'' || c == '"').trim();
+                        for exe_cap in QUOTED_RE.captures_iter(&cap[1]) {
+                            let exe = exe_cap[1].trim();
                             if !exe.is_empty() && exe != *gem_name {
                                 exes.push((exe.to_string(), gem_name.to_string()));
                             }
@@ -640,6 +759,69 @@ mod tests {
     }
 
     #[test]
+    fn script_scan_ignores_gem_name_in_yaml_prose() {
+        let script_files = vec![(
+            "docker-compose.yml".to_string(),
+            b"services:\n  web:\n    labels:\n      description: puma migration notes\n    command: ruby app.rb\n"
+                .to_vec(),
+        )];
+        let gem_names = vec!["puma".to_string()];
+        let gem_index = HashMap::new();
+        let results =
+            scan_scripts_for_gem_usage(Path::new("."), &gem_names, &gem_index, &script_files);
+        assert!(!results.contains_key("puma"));
+    }
+
+    #[test]
+    fn script_scan_matches_bare_command_in_yaml_block() {
+        let script_files = vec![(
+            ".github/workflows/ci.yml".to_string(),
+            b"steps:\n  - run: |\n      rubocop --parallel\n".to_vec(),
+        )];
+        let gem_names = vec!["rubocop".to_string()];
+        let gem_index = HashMap::new();
+        let results =
+            scan_scripts_for_gem_usage(Path::new("."), &gem_names, &gem_index, &script_files);
+        assert!(results.contains_key("rubocop"));
+    }
+
+    #[test]
+    fn script_scan_matches_justfile_space_indented_recipe() {
+        let script_files = vec![(
+            "Justfile".to_string(),
+            b"lint:\n  rubocop --parallel\n".to_vec(),
+        )];
+        let gem_names = vec!["rubocop".to_string()];
+        let results =
+            scan_scripts_for_gem_usage(Path::new("."), &gem_names, &HashMap::new(), &script_files);
+        assert!(results.contains_key("rubocop"));
+    }
+
+    #[test]
+    fn script_scan_matches_taskfile_cmds_block() {
+        let script_files = vec![(
+            "Taskfile.yml".to_string(),
+            b"tasks:\n  lint:\n    cmds:\n      - rubocop --parallel\n".to_vec(),
+        )];
+        let gem_names = vec!["rubocop".to_string()];
+        let results =
+            scan_scripts_for_gem_usage(Path::new("."), &gem_names, &HashMap::new(), &script_files);
+        assert!(results.contains_key("rubocop"));
+    }
+
+    #[test]
+    fn script_scan_matches_yaml_block_chomping_indicator() {
+        let script_files = vec![(
+            ".github/workflows/ci.yml".to_string(),
+            b"steps:\n  - run: |-\n      rubocop --parallel\n".to_vec(),
+        )];
+        let gem_names = vec!["rubocop".to_string()];
+        let results =
+            scan_scripts_for_gem_usage(Path::new("."), &gem_names, &HashMap::new(), &script_files);
+        assert!(results.contains_key("rubocop"));
+    }
+
+    #[test]
     fn build_exe_to_gem_map_basic() {
         let dir = tempfile::tempdir().unwrap();
         let gem_dir = dir.path().join("gems").join("rake-13.0.0");
@@ -676,6 +858,24 @@ mod tests {
         let gem_names = vec!["webpacker".to_string()];
         let map = build_exe_to_gem_map(&gem_names, &gem_index);
         assert_eq!(map.get("webpack"), Some(&"webpacker".to_string()));
+    }
+
+    #[test]
+    fn build_exe_to_gem_map_reads_installed_specifications() {
+        let dir = tempfile::tempdir().unwrap();
+        let gem_dir = dir.path().join("gems").join("reviewtool-core-1.0.0");
+        let specs_dir = dir.path().join("specifications");
+        std::fs::create_dir_all(&gem_dir).unwrap();
+        std::fs::create_dir_all(&specs_dir).unwrap();
+        std::fs::write(
+            specs_dir.join("reviewtool-core-1.0.0.gemspec"),
+            "s.executables = [\"reviewtool\".freeze]\n",
+        )
+        .unwrap();
+
+        let gem_index = HashMap::from([("reviewtool-core".to_string(), gem_dir)]);
+        let map = build_exe_to_gem_map(&["reviewtool-core".to_string()], &gem_index);
+        assert_eq!(map.get("reviewtool"), Some(&"reviewtool-core".to_string()));
     }
 
     #[test]
@@ -983,17 +1183,9 @@ mod tests {
 
     #[test]
     fn script_scan_rack_alone_still_matches() {
-        // Standalone "rack" reference still works
-        let script_files = vec![(
-            "config/puma.rb".to_string(),
-            b"# load rack middleware\nrequire 'rack'\nuse rack\n".to_vec(),
-        )];
+        let script_files = vec![("script/server".to_string(), b"rack\n".to_vec())];
         let gem_names = vec!["rack".to_string()];
         let gem_index = HashMap::new();
-        let script_files: Vec<(String, Vec<u8>)> = script_files.into_iter().collect();
-        // Use a path that is_script_file recognises so the scanner runs.
-        // Actually scan_scripts_for_gem_usage operates on whatever we hand it,
-        // independent of is_script_file.
         let results =
             scan_scripts_for_gem_usage(Path::new("."), &gem_names, &gem_index, &script_files);
         assert!(

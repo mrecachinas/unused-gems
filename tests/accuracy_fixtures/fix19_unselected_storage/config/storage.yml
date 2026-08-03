@@ -1,0 +1,5 @@
+local:
+  service: Disk
+
+amazon:
+  service: S3

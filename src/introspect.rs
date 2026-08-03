@@ -523,6 +523,7 @@ pub fn discover_gem_require_paths(
         if !dir.is_dir() {
             continue;
         }
+        let mut candidates = Vec::new();
         if let Ok(entries) = std::fs::read_dir(&dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
@@ -530,16 +531,38 @@ pub fn discover_gem_require_paths(
                     if let Some(ext) = path.extension() {
                         if ext == "rb" {
                             if let Some(stem) = path.file_stem() {
-                                paths.push(stem.to_string_lossy().to_string());
+                                candidates.push((stem.to_string_lossy().to_string(), true));
                             }
                         }
                     }
                 } else if path.is_dir() {
                     if let Some(name) = path.file_name() {
-                        paths.push(name.to_string_lossy().to_string());
+                        candidates.push((name.to_string_lossy().to_string(), false));
                     }
                 }
             }
+        }
+        if req_dir == "lib" {
+            let normalized = gem_name.replace('-', "_");
+            const AUXILIARY_DIRS: &[&str] =
+                &["assets", "generators", "rails", "tasks", "templates"];
+            let preferred: Vec<String> = candidates
+                .iter()
+                .filter(|(candidate, is_file)| {
+                    *is_file
+                        || candidate == gem_name
+                        || candidate == &normalized
+                        || !AUXILIARY_DIRS.contains(&candidate.as_str())
+                })
+                .map(|(candidate, _)| candidate.clone())
+                .collect();
+            if preferred.is_empty() {
+                paths.extend(candidates.into_iter().map(|(candidate, _)| candidate));
+            } else {
+                paths.extend(preferred);
+            }
+        } else {
+            paths.extend(candidates.into_iter().map(|(candidate, _)| candidate));
         }
     }
 
@@ -1164,6 +1187,34 @@ mod tests {
     fn discover_require_paths_missing_gem() {
         let index = HashMap::new();
         assert!(discover_gem_require_paths("nonexistent", &index).is_none());
+    }
+
+    #[test]
+    fn discover_require_paths_ignores_unrelated_lib_siblings() {
+        let dir = tempfile::tempdir().unwrap();
+        let gem_dir = dir.path().join("factory_bot_rails-1.0.0");
+        let lib_dir = gem_dir.join("lib");
+        std::fs::create_dir_all(lib_dir.join("rails")).unwrap();
+        std::fs::create_dir_all(lib_dir.join("generators")).unwrap();
+        std::fs::write(lib_dir.join("factory_bot_rails.rb"), "").unwrap();
+
+        let index = HashMap::from([("factory_bot_rails".to_string(), gem_dir)]);
+        let paths = discover_gem_require_paths("factory_bot_rails", &index).unwrap();
+        assert_eq!(paths, vec!["factory_bot_rails"]);
+    }
+
+    #[test]
+    fn discover_require_paths_preserves_public_directory_alias() {
+        let dir = tempfile::tempdir().unwrap();
+        let gem_dir = dir.path().join("puma-1.0.0");
+        let lib_dir = gem_dir.join("lib");
+        std::fs::create_dir_all(lib_dir.join("rack")).unwrap();
+        std::fs::write(lib_dir.join("puma.rb"), "").unwrap();
+
+        let index = HashMap::from([("puma".to_string(), gem_dir)]);
+        let paths = discover_gem_require_paths("puma", &index).unwrap();
+        assert!(paths.contains(&"puma".to_string()));
+        assert!(paths.contains(&"rack".to_string()));
     }
 
     // ── discover_gem_module_names ──

@@ -82,6 +82,9 @@ unused-gems --diff baseline.json /path/to/project
 # Skip additional directories
 unused-gems --skip-dirs tmp,cache /path/to/project
 
+# Treat the test group as active for Bundler.require(*Rails.groups)
+unused-gems --rails-env test /path/to/project
+
 # Scan a monorepo with multiple Gemfiles
 unused-gems --gemfile engines/a/Gemfile --gemfile engines/b/Gemfile /path/to/project
 ```
@@ -90,7 +93,7 @@ unused-gems --gemfile engines/a/Gemfile --gemfile engines/b/Gemfile /path/to/pro
 
 ```
 -o, --output <FORMAT>     Output format: text (default), json, github
--j, --jobs <N>            Number of parallel scanning threads (default: CPU count)
+-j, --jobs <N>            Number of parallel scanning threads (default walker cap: 4)
 -v, --verbose             Show file locations and require paths
 -q, --quiet               Suppress progress messages
     --no-cache            Disable file scan cache
@@ -98,6 +101,7 @@ unused-gems --gemfile engines/a/Gemfile --gemfile engines/b/Gemfile /path/to/pro
     --gemfile <PATH>      Gemfile path to analyze; repeat for monorepos
     --diff <BASELINE>     Compare against previous JSON output
     --skip-dirs <DIRS>    Additional directories to skip (comma-separated)
+    --rails-env <ENV>      Rails environment group considered active
 -h, --help                Print help
 ```
 

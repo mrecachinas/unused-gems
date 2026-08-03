@@ -33,6 +33,7 @@ static AUTOLOAD_FINDER: Lazy<memmem::Finder<'static>> =
 static GEM_DOT_FINDER: Lazy<memmem::Finder<'static>> = Lazy::new(|| memmem::Finder::new(b"Gem."));
 static BUNDLER_REQUIRE_FINDER: Lazy<memmem::Finder<'static>> =
     Lazy::new(|| memmem::Finder::new(b"Bundler.require"));
+const RAILS_GROUP_CONDITION_PREFIX: &str = "__rails_group_condition__:";
 
 /// What style of single-line comment marker the file uses.
 /// Drives `build_skip_mask` so that Slim/Haml comment lines are skipped
@@ -95,7 +96,7 @@ fn is_word_char(b: u8) -> bool {
 
 #[inline]
 fn skip_whitespace(bytes: &[u8], mut i: usize) -> usize {
-    while i < bytes.len() && (bytes[i] == b' ' || bytes[i] == b'\t') {
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
         i += 1;
     }
     i
@@ -781,7 +782,10 @@ fn scan_bundler_require(
             let r = r.strip_prefix(')').map(|s| s.trim()).unwrap_or(r);
             rest.starts_with('(') && r.is_empty()
         };
-        if rest.contains("Rails.groups") || rest.contains("Rails.env") {
+        if rest.contains("Rails.groups") {
+            push_rails_group_conditions(rest, bundler_groups);
+            *bundler_require_all = true;
+        } else if rest.contains("Rails.env") {
             *bundler_require_all = true;
         } else {
             if is_empty_call || rest_inner.starts_with('*') {
@@ -1048,7 +1052,10 @@ fn scan_bundler_require_filtered(
             rest.starts_with('(') && r.is_empty()
         };
 
-        if rest.contains("Rails.groups") || rest.contains("Rails.env") {
+        if rest.contains("Rails.groups") {
+            push_rails_group_conditions(rest, bundler_groups);
+            *bundler_require_all = true;
+        } else if rest.contains("Rails.env") {
             *bundler_require_all = true;
         } else {
             if is_empty_call || rest_inner.starts_with('*') {
@@ -1081,11 +1088,7 @@ fn push_rails_groups_for_splat_var(
     var: &str,
     bundler_groups: &mut Vec<String>,
 ) -> bool {
-    static GROUP_SYM_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r":(\w+)").unwrap());
-    static PERCENT_W_RE: Lazy<Regex> =
-        Lazy::new(|| Regex::new(r"%w[\[\(]\s*([^\]\)]*)[\]\)]").unwrap());
-
-    let mut aliases_unfiltered_rails_groups = false;
+    let mut aliases_rails_groups = false;
     for line in bytes.split(|&b| b == b'\n') {
         let Ok(line) = std::str::from_utf8(line) else {
             continue;
@@ -1093,22 +1096,54 @@ fn push_rails_groups_for_splat_var(
         if !line.contains(var) || !line.contains("Rails.groups") {
             continue;
         }
-        let before = bundler_groups.len();
-        for cap in GROUP_SYM_RE.captures_iter(line) {
-            bundler_groups.push(cap[1].to_string());
-        }
-        for cap in PERCENT_W_RE.captures_iter(line) {
-            for group in cap[1].split_whitespace() {
-                if !group.is_empty() {
-                    bundler_groups.push(group.to_string());
-                }
-            }
-        }
-        if bundler_groups.len() == before {
-            aliases_unfiltered_rails_groups = true;
-        }
+        aliases_rails_groups = true;
+        push_rails_group_conditions(line, bundler_groups);
     }
-    aliases_unfiltered_rails_groups
+    aliases_rails_groups
+}
+
+fn push_rails_group_conditions(source: &str, bundler_groups: &mut Vec<String>) {
+    static CONDITION_RE: Lazy<Regex> = Lazy::new(|| {
+        Regex::new(
+            r#"(?x)
+            (\w+)\s*:\s*
+            (?:
+                %w\[([^\]]*)\] |
+                %w\(([^)]*)\) |
+                %w\{([^}]*)\} |
+                %w<([^>]*)> |
+                \[([^\]]*)\]
+            )
+            "#,
+        )
+        .unwrap()
+    });
+    static ARRAY_ITEM_RE: Lazy<Regex> =
+        Lazy::new(|| Regex::new(r#":(\w+)|['"]([^'"]+)['"]"#).unwrap());
+    for cap in CONDITION_RE.captures_iter(source) {
+        let value = (2..=6).find_map(|index| cap.get(index)).map(|m| m.as_str());
+        let Some(value) = value else {
+            continue;
+        };
+        let environments = if cap.get(6).is_some() {
+            ARRAY_ITEM_RE
+                .captures_iter(value)
+                .filter_map(|item| item.get(1).or_else(|| item.get(2)))
+                .map(|item| item.as_str())
+                .collect::<Vec<_>>()
+                .join(",")
+        } else {
+            value
+                .split_whitespace()
+                .filter(|env| !env.is_empty())
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        bundler_groups.push(format!(
+            "{RAILS_GROUP_CONDITION_PREFIX}{}:{environments}",
+            &cap[1]
+        ));
+    }
 }
 
 /// Strip an inline `#` comment from `s`, respecting single- and double-quoted
@@ -1253,7 +1288,19 @@ pub fn scan_source_tree_with_threads(
     cache: Arc<crate::cache::FileCache>,
     threads: Option<usize>,
 ) -> (ScanResults, Vec<CacheUpdate>) {
+    scan_source_tree_with_threads_and_explicit_skips(dir, skip_dirs, &[], cache, threads)
+}
+
+pub fn scan_source_tree_with_threads_and_explicit_skips(
+    dir: &Path,
+    skip_dirs: &[&str],
+    explicit_skip_dirs: &[&str],
+    cache: Arc<crate::cache::FileCache>,
+    threads: Option<usize>,
+) -> (ScanResults, Vec<CacheUpdate>) {
     let skip_set: HashSet<String> = skip_dirs.iter().map(|s| s.to_string()).collect();
+    let explicit_skip_set: HashSet<String> =
+        explicit_skip_dirs.iter().map(|s| s.to_string()).collect();
     let dir_str = dir.to_string_lossy().to_string();
     let use_cache = cache.is_enabled();
 
@@ -1273,7 +1320,11 @@ pub fn scan_source_tree_with_threads(
         .filter_entry(move |entry| {
             if entry.file_type().is_some_and(|ft| ft.is_dir()) {
                 let name = entry.file_name().to_string_lossy();
-                if skip_set.contains(name.as_ref()) {
+                let is_builtin = DEFAULT_SKIP_DIRS.contains(&name.as_ref());
+                let skip_at_any_depth = explicit_skip_set.contains(name.as_ref())
+                    || !is_builtin
+                    || matches!(name.as_ref(), ".git" | ".bundle" | "node_modules");
+                if skip_set.contains(name.as_ref()) && (entry.depth() == 1 || skip_at_any_depth) {
                     return false;
                 }
             }
@@ -1360,19 +1411,24 @@ pub fn scan_source_tree_with_threads(
                         .map(|n| n.to_string_lossy())
                         .unwrap_or_default();
 
+                    let is_source = is_scannable(&path_str, path);
+                    let is_script = crate::scripts::is_script_file(&rel_path_cow, &file_name);
+
                     // Check if it's a scannable source file
-                    if is_scannable(&path_str, path) {
+                    if is_source {
                         // Use metadata from DirEntry (avoids redundant stat syscall)
                         let metadata = entry.metadata().ok();
+                        let cache_timestamp = metadata
+                            .as_ref()
+                            .map(crate::cache::cache_timestamp)
+                            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
                         // Fix #9: take() consumes the entry on a validated hit and we
                         // immediately reinsert it back into the cache map (without marking
                         // it dirty). This avoids cloning the entry's Vec<String> fields on
                         // the hot path while preserving the "no spurious updates" contract.
                         let cache_hit = if use_cache {
                             if let Some(ref md) = metadata {
-                                let mtime =
-                                    md.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-                                cache_shared.take(&rel_path_cow, mtime, md.len())
+                                cache_shared.take(&rel_path_cow, cache_timestamp, md.len(), path)
                             } else {
                                 None
                             }
@@ -1381,7 +1437,7 @@ pub fn scan_source_tree_with_threads(
                         };
 
                         if let Some(entry) = cache_hit {
-                            // Cache hit: reconstruct FileResult + modules without reading file.
+                            // Cache hit: reconstruct FileResult + modules without rescanning.
                             let rel: Arc<str> = Arc::from(rel_path_cow.as_ref());
                             // Clone modules so we can both (a) insert into local_modules and
                             // (b) reinsert the original entry back into the cache map.
@@ -1412,9 +1468,6 @@ pub fn scan_source_tree_with_threads(
                                 // Collect new modules added by this file for cache
                                 if use_cache {
                                     if let Some(ref md) = metadata {
-                                        let mtime = md
-                                            .modified()
-                                            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
                                         let rel_for_filter: Arc<str> =
                                             Arc::from(file_result.rel_path.as_str());
                                         let new_modules: Vec<String> = flush_buf
@@ -1425,7 +1478,7 @@ pub fn scan_source_tree_with_threads(
                                             .collect();
                                         flush_buf.cache_buf.push((
                                             file_result.rel_path.clone(),
-                                            mtime,
+                                            cache_timestamp,
                                             md.len(),
                                             file_result.requires.clone(),
                                             new_modules,
@@ -1443,7 +1496,7 @@ pub fn scan_source_tree_with_threads(
                     }
 
                     // Check if it's a script file (can be both — e.g. bin/setup is scannable + script)
-                    if crate::scripts::is_script_file(&rel_path_cow, &file_name) {
+                    if is_script {
                         if let Ok(content) = std::fs::read(path) {
                             flush_buf
                                 .script_buf
@@ -1619,10 +1672,18 @@ fn scan_file(
 ) -> Option<FileResult> {
     // Plain read() is faster than mmap for single sequential reads (no VMA/TLB overhead)
     let bytes = std::fs::read(path).ok()?;
+    scan_file_bytes(path, dir, &bytes, thread_modules)
+}
+
+fn scan_file_bytes(
+    path: &str,
+    dir: &str,
+    bytes: &[u8],
+    thread_modules: &mut HashMap<String, HashSet<Arc<str>>>,
+) -> Option<FileResult> {
     if bytes.is_empty() {
         return None;
     }
-    let bytes = bytes.as_slice();
 
     let rel_path = Path::new(path)
         .strip_prefix(dir)
@@ -2284,12 +2345,28 @@ mod tests {
         let result = scan_file(rb.to_str().unwrap(), &dir_str, &mut modules);
         assert!(result.is_some());
         let r = result.unwrap();
-        assert!(!r.bundler_require_all);
+        assert!(r.bundler_require_all);
         assert!(r.bundler_groups.contains(&"default".to_string()));
-        assert!(r.bundler_groups.contains(&"development".to_string()));
-        assert!(r.bundler_groups.contains(&"test".to_string()));
-        assert!(r.bundler_groups.contains(&"profile".to_string()));
+        assert!(r
+            .bundler_groups
+            .contains(&"__rails_group_condition__:assets:development,test,profile".to_string()));
         assert!(!r.bundler_groups.contains(&"migrations".to_string()));
+    }
+
+    #[test]
+    fn rails_group_conditions_support_symbol_arrays_and_percent_delimiters() {
+        let mut groups = Vec::new();
+        push_rails_group_conditions(
+            "Rails.groups assets: [:development, :test], metrics: %w{production staging}",
+            &mut groups,
+        );
+        assert_eq!(
+            groups,
+            vec![
+                "__rails_group_condition__:assets:development,test",
+                "__rails_group_condition__:metrics:production,staging"
+            ]
+        );
     }
 
     #[test]
@@ -2439,7 +2516,35 @@ mod tests {
         let cache = std::sync::Arc::new(crate::cache::FileCache::disabled());
         let (results, _) = scan_source_tree(dir.path(), &default_skip_dirs(), cache);
         assert!(results.requires.contains_key("visible"));
+        assert!(results.requires.contains_key("hidden"));
+    }
+
+    #[test]
+    fn explicit_skip_still_applies_to_nested_builtin_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let vendor = dir.path().join("engines/foo/vendor");
+        std::fs::create_dir_all(&vendor).unwrap();
+        std::fs::write(vendor.join("gem.rb"), "require 'hidden'\n").unwrap();
+        let cache = std::sync::Arc::new(crate::cache::FileCache::disabled());
+        let (results, _) = scan_source_tree_with_threads_and_explicit_skips(
+            dir.path(),
+            &default_skip_dirs(),
+            &["vendor"],
+            cache,
+            None,
+        );
         assert!(!results.requires.contains_key("hidden"));
+    }
+
+    #[test]
+    fn filtered_scanners_accept_multiline_calls() {
+        let input = b"require(\n  'json'\n)\nautoload(\n  :Thing,\n  'thing'\n)\nGem.bin_path(\n  'rake'\n)\n";
+        let mask = build_skip_mask(input, true, LineCommentKind::Hash);
+        let mut requires = Vec::new();
+        scan_requires_filtered(input, &mask, &mut requires);
+        scan_autoloads_filtered(input, &mask, &mut requires);
+        scan_gem_bin_filtered(input, &mask, &mut requires);
+        assert_eq!(requires, vec!["json", "thing", "rake"]);
     }
 
     #[test]
@@ -2476,6 +2581,36 @@ mod tests {
         let (results2, updates2) = scan_source_tree(dir.path(), &[], cache2);
         assert!(results2.requires.contains_key("cached_gem"));
         assert!(updates2.is_empty()); // all cache hits
+    }
+
+    #[test]
+    fn scan_source_tree_cache_rejects_same_metadata_different_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app.rb");
+        std::fs::write(&path, "require 'alpha'\n").unwrap();
+
+        let cache = std::sync::Arc::new(crate::cache::FileCache::load(dir.path()));
+        let (_, updates) = scan_source_tree(dir.path(), &[], cache);
+        let mut cache = crate::cache::FileCache::load(dir.path());
+        for (rp, mt, sz, reqs, mods, bg, ba) in updates {
+            cache.put(rp, mt, sz, &reqs, mods, &bg, ba);
+        }
+        cache.save();
+
+        let original_mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
+        std::fs::write(&path, "require 'bravo'\n").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(original_mtime))
+            .unwrap();
+
+        let cache = std::sync::Arc::new(crate::cache::FileCache::load(dir.path()));
+        let (results, updates) = scan_source_tree(dir.path(), &[], cache);
+        assert!(results.requires.contains_key("bravo"));
+        assert!(!results.requires.contains_key("alpha"));
+        assert_eq!(updates.len(), 1);
     }
 
     #[test]
