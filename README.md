@@ -78,6 +78,8 @@ unused-gems -o github /path/to/project
 unused-gems -o json /path/to/project > baseline.json
 # ... later ...
 unused-gems --diff baseline.json /path/to/project
+# Fail only when a gem becomes unused or a newly added gem is unused
+unused-gems --diff baseline.json --fail-on new /path/to/project
 
 # Skip additional directories
 unused-gems --skip-dirs tmp,cache /path/to/project

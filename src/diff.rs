@@ -142,6 +142,10 @@ fn print_diff_from_content(
     }
 
     newly_unused.len()
+        + added
+            .iter()
+            .filter(|(_, status)| *status == "unused")
+            .count()
 }
 
 #[cfg(test)]
@@ -215,6 +219,18 @@ mod tests {
         .collect();
         let baseline = r#"[{"name":"rails","status":"used"}]"#;
         assert_eq!(print_diff_from_content(&results, baseline), 0);
+    }
+
+    #[test]
+    fn added_unused_gem_is_newly_unused() {
+        let results: HashMap<String, GemResult> = [
+            make_result("rails", GemStatus::Used),
+            make_result("puma", GemStatus::Unused),
+        ]
+        .into_iter()
+        .collect();
+        let baseline = r#"[{"name":"rails","status":"used"}]"#;
+        assert_eq!(print_diff_from_content(&results, baseline), 1);
     }
 
     #[test]
