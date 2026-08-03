@@ -879,6 +879,36 @@ mod tests {
     }
 
     #[test]
+    fn executable_map_uses_locked_installed_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let gems_dir = dir.path().join("gems");
+        for (version, executable) in [("1.0.0", "locked-runner"), ("2.0.0", "wrong-runner")] {
+            let gem_dir = gems_dir.join(format!("runner-{version}"));
+            std::fs::create_dir_all(&gem_dir).unwrap();
+            std::fs::write(
+                gem_dir.join("runner.gemspec"),
+                format!("s.executables = ['{executable}']\n"),
+            )
+            .unwrap();
+        }
+        std::fs::write(
+            dir.path().join("Gemfile.lock"),
+            "GEM\n  specs:\n    runner (1.0.0)\n\nPLATFORMS\n  ruby\n",
+        )
+        .unwrap();
+        let lockfile = crate::lockfile::parse_gemfile_lock(dir.path());
+        let gem_index = crate::introspect::build_gem_index_for_lock(
+            &[dir.path().to_path_buf()],
+            &lockfile,
+            Some("ruby"),
+        );
+
+        let map = build_exe_to_gem_map(&["runner".to_string()], &gem_index);
+        assert_eq!(map.get("locked-runner"), Some(&"runner".to_string()));
+        assert!(!map.contains_key("wrong-runner"));
+    }
+
+    #[test]
     fn strip_comments_empty_input() {
         let stripped = strip_comment_lines(b"");
         assert!(stripped.is_empty());

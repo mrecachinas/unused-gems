@@ -204,7 +204,7 @@ fn main() {
         eprintln!("Found {} gem(s) in Gemfile", gems.len());
     }
 
-    // 2. Concurrent init: (index + scan) || (lock + db_adapters + cable + storage + cache_cfg + ignore)
+    // 2. Concurrent init: (index + scan) || (db_adapters + cable + storage + cache_cfg)
     let gem_names: Vec<String> = gems.iter().map(|g| g.name.clone()).collect();
     let cache_for_scan = Arc::clone(&file_cache);
     let ignore_file_ref = cli.ignore_file.as_deref();
@@ -213,9 +213,18 @@ fn main() {
         crate::ignore::load_ignore_file(&dir, ignore_file_ref)
     );
     let adapter_overrides = &ignore_config.adapter_overrides;
+    let lockfile = timed!(
+        "parse_gemfile_lock",
+        if explicit_gemfiles {
+            lockfile::parse_gemfile_locks(&dir, &gemfile_paths)
+        } else {
+            lockfile::parse_gemfile_lock(&dir)
+        }
+    );
+    let current_gem_platform = platforms::current_gem_platform();
     let (
         ((mut gem_index, vendor_path_index), (mut scan_results, cache_updates)),
-        (lock_deps, (db_adapters, (cable_adapters, (storage_adapters, cache_config_adapters)))),
+        (db_adapters, (cable_adapters, (storage_adapters, cache_config_adapters))),
     ) = timed!(
         "concurrent_init",
         rayon::join(
@@ -224,8 +233,20 @@ fn main() {
                     || {
                         let gp = introspect::find_gem_paths(&dir);
                         rayon::join(
-                            || introspect::build_gem_index(&gp),
-                            || introspect::build_vendor_cache_path_index(&dir),
+                            || {
+                                introspect::build_gem_index_for_lock(
+                                    &gp,
+                                    &lockfile,
+                                    current_gem_platform,
+                                )
+                            },
+                            || {
+                                introspect::build_vendor_cache_path_index_for_lock(
+                                    &dir,
+                                    &lockfile,
+                                    current_gem_platform,
+                                )
+                            },
                         )
                     },
                     || {
@@ -243,44 +264,30 @@ fn main() {
                 rayon::join(
                     || {
                         timed!(
-                            "parse_gemfile_lock",
-                            if explicit_gemfiles {
-                                lockfile::parse_gemfile_locks(&dir, &gemfile_paths)
-                            } else {
-                                lockfile::parse_gemfile_lock(&dir)
-                            }
+                            "scan_db_adapters",
+                            scan_database_adapters(&dir, adapter_overrides)
                         )
                     },
                     || {
                         rayon::join(
                             || {
                                 timed!(
-                                    "scan_db_adapters",
-                                    scan_database_adapters(&dir, adapter_overrides)
+                                    "scan_cable_adapters",
+                                    scan_cable_adapters(&dir, adapter_overrides)
                                 )
                             },
                             || {
                                 rayon::join(
                                     || {
                                         timed!(
-                                            "scan_cable_adapters",
-                                            scan_cable_adapters(&dir, adapter_overrides)
+                                            "scan_storage_adapters",
+                                            scan_storage_adapters(&dir, adapter_overrides)
                                         )
                                     },
                                     || {
-                                        rayon::join(
-                                            || {
-                                                timed!(
-                                                    "scan_storage_adapters",
-                                                    scan_storage_adapters(&dir, adapter_overrides)
-                                                )
-                                            },
-                                            || {
-                                                timed!(
-                                                    "scan_cache_config",
-                                                    scan_cache_config(&dir, adapter_overrides)
-                                                )
-                                            },
+                                        timed!(
+                                            "scan_cache_config",
+                                            scan_cache_config(&dir, adapter_overrides)
                                         )
                                     },
                                 )
@@ -342,7 +349,7 @@ fn main() {
                         }
                     }
                     // Lazy vendor fallback: extract metadata on demand
-                    if declared.len() <= 1 {
+                    if declared.len() <= 1 && gem.source.is_none() {
                         if let Some(path) = vendor_path_index.get(&gem.name) {
                             // Compute-outside-lock: check cache first; if miss, decompress
                             // tarball outside the lock, then insert. Avoids serializing
@@ -533,15 +540,15 @@ fn main() {
     let unused_count = if cli.sarif {
         timed!(
             "output_sarif",
-            output::print_results_sarif(&results, &dir, &lock_deps)
+            output::print_results_sarif(&results, &dir, lockfile.dependencies())
         )
     } else {
         timed!(
             "output",
             match cli.output.as_str() {
-                "json" => output::print_results_json(&results, &lock_deps),
-                "github" => output::print_results_github(&results, &dir, &lock_deps),
-                _ => output::print_results_text(&results, cli.verbose, &lock_deps),
+                "json" => output::print_results_json(&results, lockfile.dependencies()),
+                "github" => output::print_results_github(&results, &dir, lockfile.dependencies()),
+                _ => output::print_results_text(&results, cli.verbose, lockfile.dependencies(),),
             }
         )
     };
@@ -1295,11 +1302,17 @@ mod tests {
     }
 
     #[test]
-    fn current_platform_set_includes_ruby_and_mri() {
-        let p = platforms::current_platform_set();
-        assert!(p.contains("ruby"));
-        assert!(p.contains("mri"));
-        assert!(p.contains("mri_31"));
-        assert!(p.contains("mri_40"));
+    fn current_platform_set_does_not_include_invalid_os_tokens() {
+        let platforms = platforms::current_platform_set();
+        assert!(!platforms.contains("darwin"));
+        assert!(!platforms.contains("linux"));
+        assert!(!platforms.contains("java"));
+        assert!(
+            platforms
+                .iter()
+                .filter(|platform| platform.starts_with("mri_"))
+                .count()
+                <= 1
+        );
     }
 }
