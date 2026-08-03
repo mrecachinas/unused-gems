@@ -43,6 +43,12 @@ impl Lockfile {
             .unwrap_or_default()
     }
 
+    pub fn has_platform_specific_registry_artifacts(&self) -> bool {
+        self.artifacts.values().flatten().any(|artifact| {
+            artifact.source == LockedSource::Registry && artifact.platform.is_some()
+        })
+    }
+
     pub fn preferred_registry_full_names(
         &self,
         gem_name: &str,
@@ -415,6 +421,24 @@ PLATFORMS
                 "nokogiri-1.18.9".to_string()
             ]
         );
+    }
+
+    #[test]
+    fn detects_when_runtime_platform_is_needed() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Gemfile.lock"),
+            "GEM\n  specs:\n    nokogiri (1.18.9-arm64-darwin)\n\nPLATFORMS\n  arm64-darwin-25\n",
+        )
+        .unwrap();
+        assert!(parse_gemfile_lock(dir.path()).has_platform_specific_registry_artifacts());
+
+        std::fs::write(
+            dir.path().join("Gemfile.lock"),
+            "GEM\n  specs:\n    rake (13.2.1)\n\nPLATFORMS\n  ruby\n",
+        )
+        .unwrap();
+        assert!(!parse_gemfile_lock(dir.path()).has_platform_specific_registry_artifacts());
     }
 
     #[test]

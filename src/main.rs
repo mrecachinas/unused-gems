@@ -221,8 +221,12 @@ fn main() {
             lockfile::parse_gemfile_lock(&dir)
         }
     );
-    let runtime_platform = platforms::resolve_current_runtime(&dir);
-    let current_gem_platform = runtime_platform.gem_platform();
+    let needs_runtime_platform = gems.iter().any(|gem| !gem.platforms.is_empty())
+        || lockfile.has_platform_specific_registry_artifacts();
+    let runtime_platform = needs_runtime_platform.then(|| platforms::resolve_current_runtime(&dir));
+    let current_gem_platform = runtime_platform
+        .as_ref()
+        .and_then(platforms::RuntimePlatform::gem_platform);
     let (
         ((mut gem_index, vendor_path_index), (mut scan_results, cache_updates)),
         (db_adapters, (cable_adapters, (storage_adapters, cache_config_adapters))),
@@ -461,7 +465,7 @@ fn main() {
     }
 
     // 7. Apply platform filter
-    {
+    if let Some(runtime_platform) = runtime_platform.as_ref() {
         let current_platforms = runtime_platform.dsl_tokens();
         for result in results.values_mut() {
             if !result.gem.platforms.is_empty()
