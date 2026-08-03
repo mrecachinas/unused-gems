@@ -88,6 +88,23 @@ end
     }
 }
 
+fn malformed_percent_corpus(files: usize, literals_per_file: usize) -> Corpus {
+    let dir = TempDir::new().unwrap();
+    let mut body = String::with_capacity(literals_per_file * 16 + 128);
+    for _ in 0..literals_per_file {
+        body.push_str("x = %W[a#{b\n");
+    }
+    body.push_str(
+        "valid = %W[\n#{ValidInterpolation}\n]\nrequire \"real_dependency\"\nRealModule.call\n",
+    );
+    let bytes = write_files(&dir.path().join("app/services"), files, &body);
+    Corpus {
+        _dir: dir,
+        files: files as u64,
+        bytes,
+    }
+}
+
 fn gitignored_generated_corpus(visible_files: usize, generated_files: usize) -> Corpus {
     let dir = TempDir::new().unwrap();
     fs::create_dir(dir.path().join(".git")).unwrap();
@@ -124,6 +141,18 @@ fn bench_source_tree(c: &mut Criterion) {
     let corpus = comment_heavy_corpus(1_000);
     group.throughput(Throughput::Bytes(corpus.bytes));
     group.bench_function("comment_heredoc_1000", |b| {
+        b.iter(|| {
+            scanner::scan_source_tree(
+                corpus.path(),
+                &scanner::default_skip_dirs(),
+                Arc::new(cache::FileCache::disabled()),
+            )
+        });
+    });
+
+    let corpus = malformed_percent_corpus(10, 1_000);
+    group.throughput(Throughput::Bytes(corpus.bytes));
+    group.bench_function("malformed_percent_10000", |b| {
         b.iter(|| {
             scanner::scan_source_tree(
                 corpus.path(),

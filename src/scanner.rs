@@ -333,15 +333,16 @@ fn set_mask(mask: &mut [u8], start: usize, end: usize, value: bool) {
     mask[start..end].fill(u8::from(value));
 }
 
-type PercentEndCache = HashMap<usize, Option<usize>>;
+type PercentEndCache = HashMap<(usize, bool), Option<usize>>;
+type InterpolationEndCache = HashMap<usize, Option<usize>>;
 
 #[cfg(test)]
-type PercentScanSteps = usize;
+type LexicalScanSteps = usize;
 #[cfg(not(test))]
-type PercentScanSteps = ();
+type LexicalScanSteps = ();
 
 #[inline]
-fn count_percent_scan_step(steps: &mut PercentScanSteps) {
+fn count_lexical_scan_step(steps: &mut LexicalScanSteps) {
     #[cfg(test)]
     {
         *steps += 1;
@@ -361,22 +362,37 @@ fn is_percent_literal_type(byte: u8) -> bool {
 }
 
 #[inline]
-fn is_percent_literal_open(bytes: &[u8], open_pos: usize) -> bool {
-    open_pos >= 2
+fn percent_literal_regex_semantics(bytes: &[u8], open_pos: usize) -> Option<bool> {
+    (open_pos >= 2
         && bytes[open_pos - 2] == b'%'
         && is_percent_literal_type(bytes[open_pos - 1])
-        && (open_pos == 2 || !is_word_char(bytes[open_pos - 3]))
+        && (open_pos == 2 || !is_word_char(bytes[open_pos - 3])))
+    .then(|| bytes[open_pos - 1] == b'r')
 }
 
-fn find_interpolation_end(bytes: &[u8], mut i: usize, end: usize) -> Option<usize> {
-    let mut depth = 1usize;
+fn find_interpolation_end_cached(
+    bytes: &[u8],
+    content_start: usize,
+    end: usize,
+    interpolation_ends: &mut InterpolationEndCache,
+    lexical_steps: &mut LexicalScanSteps,
+) -> Option<usize> {
+    if let Some(cached) = interpolation_ends.get(&content_start) {
+        return *cached;
+    }
+
+    let mut stack = Vec::with_capacity(8);
+    stack.push(Some(content_start));
+    let mut i = content_start;
     while i < end {
+        count_lexical_scan_step(lexical_steps);
         match bytes[i] {
             b'\\' => i = (i + 2).min(end),
             b'\'' | b'"' => {
                 let quote = bytes[i];
                 i += 1;
                 while i < end {
+                    count_lexical_scan_step(lexical_steps);
                     if bytes[i] == b'\\' {
                         i = (i + 2).min(end);
                     } else if bytes[i] == quote {
@@ -387,13 +403,22 @@ fn find_interpolation_end(bytes: &[u8], mut i: usize, end: usize) -> Option<usiz
                     }
                 }
             }
+            b'#' if i + 1 < end && bytes[i + 1] == b'{' => {
+                stack.push(Some(i + 2));
+                i += 2;
+            }
             b'{' => {
-                depth += 1;
+                stack.push(None);
                 i += 1;
             }
             b'}' => {
-                depth -= 1;
-                if depth == 0 {
+                if let Some(interpolation_start) = stack.pop().flatten() {
+                    if interpolation_start != content_start {
+                        interpolation_ends.insert(interpolation_start, Some(i));
+                    }
+                }
+                if stack.is_empty() {
+                    interpolation_ends.insert(content_start, Some(i));
                     return Some(i);
                 }
                 i += 1;
@@ -401,7 +426,26 @@ fn find_interpolation_end(bytes: &[u8], mut i: usize, end: usize) -> Option<usiz
             _ => i += 1,
         }
     }
+
+    for interpolation_start in stack.into_iter().flatten() {
+        interpolation_ends.insert(interpolation_start, None);
+    }
     None
+}
+
+fn find_interpolation_end(bytes: &[u8], content_start: usize, end: usize) -> Option<usize> {
+    let mut interpolation_ends = InterpolationEndCache::new();
+    #[cfg(test)]
+    let mut lexical_steps = 0;
+    #[cfg(not(test))]
+    let mut lexical_steps = ();
+    find_interpolation_end_cached(
+        bytes,
+        content_start,
+        end,
+        &mut interpolation_ends,
+        &mut lexical_steps,
+    )
 }
 
 fn expose_interpolations(
@@ -410,7 +454,8 @@ fn expose_interpolations(
     start: usize,
     end: usize,
     percent_ends: &mut PercentEndCache,
-    percent_steps: &mut PercentScanSteps,
+    interpolation_ends: &mut InterpolationEndCache,
+    lexical_steps: &mut LexicalScanSteps,
 ) {
     let mut i = start;
     while i + 1 < end {
@@ -419,9 +464,19 @@ fn expose_interpolations(
             continue;
         }
         if bytes[i] == b'#' && bytes[i + 1] == b'{' {
-            if let Some(close) = find_interpolation_end(bytes, i + 2, end) {
+            if let Some(close) =
+                find_interpolation_end_cached(bytes, i + 2, end, interpolation_ends, lexical_steps)
+            {
                 set_mask(mask, i + 2, close, false);
-                mask_ruby_range_cached(bytes, mask, i + 2, close, percent_ends, percent_steps);
+                mask_ruby_range_cached(
+                    bytes,
+                    mask,
+                    i + 2,
+                    close,
+                    percent_ends,
+                    interpolation_ends,
+                    lexical_steps,
+                );
                 i = close + 1;
                 continue;
             }
@@ -723,9 +778,11 @@ fn find_percent_literal_end(
     close: u8,
     regex: bool,
     percent_ends: &mut PercentEndCache,
-    percent_steps: &mut PercentScanSteps,
+    interpolation_ends: &mut InterpolationEndCache,
+    lexical_steps: &mut LexicalScanSteps,
 ) -> Option<usize> {
-    if let Some(cached) = percent_ends.get(&open_pos) {
+    let cache_key = (open_pos, regex);
+    if let Some(cached) = percent_ends.get(&cache_key) {
         return *cached;
     }
 
@@ -733,13 +790,19 @@ fn find_percent_literal_end(
         let mut i = content_start;
         let mut in_class = false;
         while i < end {
-            count_percent_scan_step(percent_steps);
+            count_lexical_scan_step(lexical_steps);
             if bytes[i] == b'\\' {
                 i = (i + 2).min(end);
                 continue;
             }
             if i + 1 < end && bytes[i] == b'#' && bytes[i + 1] == b'{' {
-                if let Some(interpolation_end) = find_interpolation_end(bytes, i + 2, end) {
+                if let Some(interpolation_end) = find_interpolation_end_cached(
+                    bytes,
+                    i + 2,
+                    end,
+                    interpolation_ends,
+                    lexical_steps,
+                ) {
                     i = interpolation_end + 1;
                     continue;
                 }
@@ -760,7 +823,7 @@ fn find_percent_literal_end(
             }
             i += 1;
         }
-        percent_ends.insert(open_pos, None);
+        percent_ends.insert(cache_key, None);
         return None;
     }
 
@@ -769,13 +832,15 @@ fn find_percent_literal_end(
     let mut i = content_start;
     let mut in_class = false;
     while i < end {
-        count_percent_scan_step(percent_steps);
+        count_lexical_scan_step(lexical_steps);
         if bytes[i] == b'\\' {
             i = (i + 2).min(end);
             continue;
         }
         if i + 1 < end && bytes[i] == b'#' && bytes[i + 1] == b'{' {
-            if let Some(interpolation_end) = find_interpolation_end(bytes, i + 2, end) {
+            if let Some(interpolation_end) =
+                find_interpolation_end_cached(bytes, i + 2, end, interpolation_ends, lexical_steps)
+            {
                 i = interpolation_end + 1;
                 continue;
             }
@@ -792,11 +857,12 @@ fn find_percent_literal_end(
             }
         }
         if bytes[i] == open {
-            stack.push((i, is_percent_literal_open(bytes, i)));
+            let same_semantics = percent_literal_regex_semantics(bytes, i) == Some(regex);
+            stack.push((i, same_semantics));
         } else if bytes[i] == close {
             if let Some((matched_open, is_percent_open)) = stack.pop() {
                 if is_percent_open && matched_open != open_pos {
-                    percent_ends.insert(matched_open, Some(i));
+                    percent_ends.insert((matched_open, regex), Some(i));
                 }
                 if stack.is_empty() {
                     return Some(i);
@@ -808,7 +874,7 @@ fn find_percent_literal_end(
 
     for (unmatched_open, is_percent_open) in stack {
         if is_percent_open {
-            percent_ends.insert(unmatched_open, None);
+            percent_ends.insert((unmatched_open, regex), None);
         }
     }
     None
@@ -875,17 +941,19 @@ fn parse_heredoc(bytes: &[u8], abs: usize, end: usize) -> Option<(usize, usize, 
 
 fn mask_ruby_range(bytes: &[u8], mask: &mut [u8], start: usize, end: usize) {
     let mut percent_ends = PercentEndCache::new();
+    let mut interpolation_ends = InterpolationEndCache::new();
     #[cfg(test)]
-    let mut percent_steps = 0;
+    let mut lexical_steps = 0;
     #[cfg(not(test))]
-    let mut percent_steps = ();
+    let mut lexical_steps = ();
     mask_ruby_range_cached(
         bytes,
         mask,
         start,
         end,
         &mut percent_ends,
-        &mut percent_steps,
+        &mut interpolation_ends,
+        &mut lexical_steps,
     );
 }
 
@@ -895,7 +963,8 @@ fn mask_ruby_range_cached(
     start: usize,
     end: usize,
     percent_ends: &mut PercentEndCache,
-    percent_steps: &mut PercentScanSteps,
+    interpolation_ends: &mut InterpolationEndCache,
+    lexical_steps: &mut LexicalScanSteps,
 ) {
     let mut i = start;
     while i < end {
@@ -945,9 +1014,15 @@ fn mask_ruby_range_cached(
                         && bytes[close] == b'#'
                         && bytes[close + 1] == b'{'
                     {
-                        close = find_interpolation_end(bytes, close + 2, end)
-                            .map(|interpolation_end| interpolation_end + 1)
-                            .unwrap_or(end);
+                        close = find_interpolation_end_cached(
+                            bytes,
+                            close + 2,
+                            end,
+                            interpolation_ends,
+                            lexical_steps,
+                        )
+                        .map(|interpolation_end| interpolation_end + 1)
+                        .unwrap_or(end);
                     } else if bytes[close] == quote {
                         found_close = true;
                         break;
@@ -970,7 +1045,8 @@ fn mask_ruby_range_cached(
                         content_start,
                         literal_end,
                         percent_ends,
-                        percent_steps,
+                        interpolation_ends,
+                        lexical_steps,
                     );
                 }
                 i = if found_close { close + 1 } else { literal_end };
@@ -1002,7 +1078,8 @@ fn mask_ruby_range_cached(
                     close,
                     bytes[i + 1] == b'r',
                     percent_ends,
-                    percent_steps,
+                    interpolation_ends,
+                    lexical_steps,
                 ) {
                     set_mask(mask, content_start, literal_end, true);
                     if matches!(bytes[i + 1], b'Q' | b'r' | b'W' | b'I' | b'x') {
@@ -1012,7 +1089,8 @@ fn mask_ruby_range_cached(
                             content_start,
                             literal_end,
                             percent_ends,
-                            percent_steps,
+                            interpolation_ends,
+                            lexical_steps,
                         );
                     }
                     i = literal_end + 1;
@@ -1033,7 +1111,8 @@ fn mask_ruby_range_cached(
                         i + 1,
                         regex_end,
                         percent_ends,
-                        percent_steps,
+                        interpolation_ends,
+                        lexical_steps,
                     );
                     i = regex_end + 1;
                 } else {
@@ -1055,7 +1134,8 @@ fn mask_ruby_range_cached(
                             body_start,
                             heredoc_end,
                             percent_ends,
-                            percent_steps,
+                            interpolation_ends,
+                            lexical_steps,
                         );
                     }
                 }
@@ -1144,19 +1224,21 @@ fn build_skip_mask(bytes: &[u8], is_ruby: bool, line_kind: LineCommentKind) -> V
 }
 
 #[cfg(test)]
-fn build_ruby_skip_mask_with_percent_steps(bytes: &[u8]) -> (Vec<u8>, usize) {
+fn build_ruby_skip_mask_with_lexical_steps(bytes: &[u8]) -> (Vec<u8>, usize) {
     let mut mask = vec![0; bytes.len()];
     let mut percent_ends = PercentEndCache::new();
-    let mut percent_steps = 0;
+    let mut interpolation_ends = InterpolationEndCache::new();
+    let mut lexical_steps = 0;
     mask_ruby_range_cached(
         bytes,
         &mut mask,
         0,
         bytes.len(),
         &mut percent_ends,
-        &mut percent_steps,
+        &mut interpolation_ends,
+        &mut lexical_steps,
     );
-    (mask, percent_steps)
+    (mask, lexical_steps)
 }
 
 fn build_skip_mask_for_template(
@@ -2835,7 +2917,7 @@ AfterPercentLiterals.call
             input.extend_from_slice(
                 b"valid = %W[\nStaticValidPercent\n#{ValidPercentInterpolation}\n]\nrequire 'after_adversarial_percent'\n",
             );
-            let (mask, steps) = build_ruby_skip_mask_with_percent_steps(&input);
+            let (mask, steps) = build_ruby_skip_mask_with_lexical_steps(&input);
 
             let mut requires = Vec::new();
             scan_requires_filtered(&input, &mask, &mut requires);
@@ -2862,6 +2944,82 @@ AfterPercentLiterals.call
             large.len()
         );
         assert!(small_steps <= small.len() * 2);
+    }
+
+    #[test]
+    fn percent_cache_does_not_share_regex_failure_with_words_literal() {
+        let input = br#"broken = %r{
+words = %w{[
+FakeWordsModule
+require 'fake_words'
+}
+require 'real_words'
+"#;
+        let mask = build_skip_mask(input, true, LineCommentKind::Hash);
+        let mut requires = Vec::new();
+        scan_requires_filtered(input, &mask, &mut requires);
+        assert_eq!(requires, vec!["real_words"]);
+
+        let mut modules = HashMap::new();
+        let path: Arc<str> = Arc::from("test.rb");
+        scan_modules_filtered_into(input, &mask, &mut modules, &path);
+        assert!(!modules.contains_key("FakeWordsModule"));
+    }
+
+    #[test]
+    fn percent_cache_does_not_share_plain_match_with_regex_literal() {
+        let input = br#"broken = %q{{
+pattern = %r{[}] FakeRegexModule require 'fake_regex' }
+require 'real_regex'
+"#;
+        let mask = build_skip_mask(input, true, LineCommentKind::Hash);
+        let mut requires = Vec::new();
+        scan_requires_filtered(input, &mask, &mut requires);
+        assert_eq!(requires, vec!["real_regex"]);
+
+        let mut modules = HashMap::new();
+        let path: Arc<str> = Arc::from("test.rb");
+        scan_modules_filtered_into(input, &mask, &mut modules, &path);
+        assert!(!modules.contains_key("FakeRegexModule"));
+    }
+
+    #[test]
+    fn repeated_malformed_percent_interpolations_scan_linearly() {
+        fn build_case(lines: usize) -> (Vec<u8>, usize) {
+            let mut input = Vec::with_capacity(lines * 16 + 128);
+            for _ in 0..lines {
+                input.extend_from_slice(b"x = %W[a#{b\n");
+            }
+            input.extend_from_slice(
+                b"valid = %W[\nStaticInterpolationText\n#{ValidLaterInterpolation}\n]\nrequire 'after_malformed_interpolation'\n",
+            );
+            let (mask, steps) = build_ruby_skip_mask_with_lexical_steps(&input);
+
+            let mut requires = Vec::new();
+            scan_requires_filtered(&input, &mask, &mut requires);
+            assert_eq!(requires, vec!["after_malformed_interpolation"]);
+
+            let mut modules = HashMap::new();
+            let path: Arc<str> = Arc::from("test.rb");
+            scan_modules_filtered_into(&input, &mask, &mut modules, &path);
+            assert!(!modules.contains_key("StaticInterpolationText"));
+            assert!(modules.contains_key("ValidLaterInterpolation"));
+            (input, steps)
+        }
+
+        let (small, small_steps) = build_case(512);
+        let (large, large_steps) = build_case(1_024);
+        assert!(
+            large_steps <= small_steps * 3,
+            "doubling malformed interpolations must remain linear: {small_steps} -> {large_steps}"
+        );
+        assert!(
+            large_steps <= large.len() * 4,
+            "all delimiter and interpolation work must stay proportional: {} steps for {} bytes",
+            large_steps,
+            large.len()
+        );
+        assert!(small_steps <= small.len() * 4);
     }
 
     #[test]
