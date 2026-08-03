@@ -142,8 +142,9 @@ fn gemspec_directive_end_to_end() {
         &root.join("Gemfile"),
         "source 'https://rubygems.org'\ngemspec path: 'engines/core', name: 'core', development_group: :dev\n",
     );
+    // File name deliberately differs from spec.name: `name:` matches spec.name.
     write(
-        &root.join("engines/core/core.gemspec"),
+        &root.join("engines/core/project.gemspec"),
         r#"Gem::Specification.new do |spec|
   spec.name = 'core'
   spec.add_dependency 'runtime_only_dep'
@@ -168,7 +169,7 @@ end
     // Development dependencies land in the configured development group.
     assert_eq!(groups_of(&results, "rspec"), vec!["dev"]);
     // Runtime dependencies of the gemspec are not top-level Gemfile gems, and the
-    // decoy gemspec is never read.
+    // decoy gemspec contributes nothing.
     let names: Vec<&String> = results.keys().collect();
     assert_eq!(names, vec!["core", "rspec"], "unexpected gems: {:?}", names);
 }
@@ -237,4 +238,54 @@ gem 'rails'
 
     let results = run_tool(root);
     assert_eq!(status_of(&results, "rails"), "used");
+}
+
+#[test]
+fn repeated_eval_gemfile_contributes_each_context() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+
+    write(
+        &root.join("Gemfile"),
+        r#"eval_gemfile 'shared.gemfile'
+group :test do
+  eval_gemfile File.join(__dir__, '/shared.gemfile')
+end
+"#,
+    );
+    write(&root.join("shared.gemfile"), "gem 'shared_gem'\n");
+    write(&root.join("app.rb"), "# nothing required\n");
+
+    let results = run_tool(root);
+
+    // Evaluated twice (plain + inside `group :test`); both contexts survive, and
+    // File.join must not restart the path at the leading '/' of the 2nd component.
+    assert_eq!(groups_of(&results, "shared_gem"), vec!["default", "test"]);
+    assert_eq!(results.keys().count(), 1);
+}
+
+#[test]
+fn gemfile_declaration_wins_over_gemspec_development_dependency() {
+    for (label, gemfile) in [
+        ("gemfile first", "gem 'rspec', group: :test\ngemspec\n"),
+        ("gemspec first", "gemspec\ngem 'rspec', group: :test\n"),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(&root.join("Gemfile"), gemfile);
+        write(
+            &root.join("my_gem.gemspec"),
+            "Gem::Specification.new do |spec|\n  spec.name = 'my_gem'\n  spec.add_development_dependency 'rspec'\nend\n",
+        );
+        write(&root.join("lib/my_gem.rb"), "module MyGem; end\n");
+        write(&root.join("spec/a_spec.rb"), "require 'rspec'\n");
+
+        let results = run_tool(root);
+        assert_eq!(
+            groups_of(&results, "rspec"),
+            vec!["test"],
+            "{}: Gemfile declaration must win over the gemspec development dependency",
+            label
+        );
+    }
 }

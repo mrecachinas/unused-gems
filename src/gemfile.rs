@@ -25,7 +25,8 @@ pub fn parse_gemfiles(dir: &Path, gemfile_paths: &[PathBuf]) -> Vec<GemEntry> {
     let mut ctx = ParseCtx {
         root: lexical_normalize(dir),
         gems: Vec::new(),
-        visited: HashSet::new(),
+        active: Vec::new(),
+        evaluations: 0,
     };
 
     for path in gemfile_paths {
@@ -40,15 +41,28 @@ pub fn parse_gemfiles(dir: &Path, gemfile_paths: &[PathBuf]) -> Vec<GemEntry> {
     merge_duplicate_gems(ctx.gems)
 }
 
+/// Upper bound on evaluated Gemfiles, guarding against pathological
+/// `eval_gemfile` graphs (a deep diamond can otherwise expand exponentially).
+const MAX_GEMFILE_EVALUATIONS: usize = 1024;
+
 /// Shared state threaded through nested `eval_gemfile` evaluation.
 struct ParseCtx {
     /// Approximation of Bundler's working directory, used for `File.expand_path`
     /// calls that have no explicit base.
     root: PathBuf,
-    gems: Vec<GemEntry>,
-    /// Canonicalized paths of already-evaluated Gemfiles, used to break cycles and
-    /// to dedupe symlink/`..` aliases of the same file.
-    visited: HashSet<PathBuf>,
+    gems: Vec<PendingGem>,
+    /// Canonicalized paths of the Gemfiles currently being evaluated. Only the
+    /// active recursion stack is tracked, so the same Gemfile evaluated again
+    /// under a different group/platform context still contributes its context.
+    active: Vec<PathBuf>,
+    evaluations: usize,
+}
+
+/// A gem declaration plus the provenance Bundler needs to resolve duplicates.
+struct PendingGem {
+    entry: GemEntry,
+    /// True when the entry came from a gemspec's `add_development_dependency`.
+    gemspec_dev_dep: bool,
 }
 
 fn eval_gemfile_file(ctx: &mut ParseCtx, path: &Path, groups: &[String], platforms: &[String]) {
@@ -56,9 +70,24 @@ fn eval_gemfile_file(ctx: &mut ParseCtx, path: &Path, groups: &[String], platfor
     if !path.is_file() {
         return;
     }
-    if !ctx.visited.insert(dedupe_key(&path)) {
+
+    let key = dedupe_key(&path);
+    if ctx.active.contains(&key) {
+        eprintln!(
+            "Warning: eval_gemfile cycle detected at {} — skipping re-evaluation",
+            path.display()
+        );
         return;
     }
+    if ctx.evaluations >= MAX_GEMFILE_EVALUATIONS {
+        eprintln!(
+            "Warning: eval_gemfile limit of {} files reached — skipping {}",
+            MAX_GEMFILE_EVALUATIONS,
+            path.display()
+        );
+        return;
+    }
+    ctx.evaluations += 1;
 
     let source = match std::fs::read(&path) {
         Ok(s) => s,
@@ -82,7 +111,9 @@ fn eval_gemfile_file(ctx: &mut ParseCtx, path: &Path, groups: &[String], platfor
         current_groups: groups.to_vec(),
         current_platforms: platforms.to_vec(),
     };
+    visitor.ctx.active.push(key);
     visitor.visit(&parse_result.node());
+    visitor.ctx.active.pop();
 }
 
 struct GemfileVisitor<'a, 's> {
@@ -193,14 +224,17 @@ impl GemfileVisitor<'_, '_> {
             groups.push("default".to_string());
         }
 
-        self.ctx.gems.push(GemEntry {
-            name,
-            groups,
-            platforms,
-            require_paths,
-            module_names: Vec::new(),
-            require_false,
-            source,
+        self.ctx.gems.push(PendingGem {
+            entry: GemEntry {
+                name,
+                groups,
+                platforms,
+                require_paths,
+                module_names: Vec::new(),
+                require_false,
+                source,
+            },
+            gemspec_dev_dep: false,
         });
     }
 
@@ -340,8 +374,8 @@ impl GemfileVisitor<'_, '_> {
             None => self.base_dir.clone(),
         });
 
-        let spec_path = match select_gemspec(&spec_dir, name.as_deref(), &self.gemfile_path) {
-            Some(p) => p,
+        let spec = match select_gemspec(&spec_dir, name.as_deref(), &self.gemfile_path) {
+            Some(s) => s,
             None => return,
         };
 
@@ -358,9 +392,9 @@ impl GemfileVisitor<'_, '_> {
             dev_groups.push(development_group);
         }
 
-        parse_gemspec_into(
+        register_gemspec(
             self.ctx,
-            &spec_path,
+            spec,
             &spec_dir,
             &self_groups,
             &dev_groups,
@@ -498,25 +532,38 @@ fn eval_path_expr(
             }
         }
         b"join" => {
-            let mut iter = args.iter();
-            let first = eval_path_expr(iter.next()?, gemfile_path, root, source)?;
-            let mut joined = match &first {
-                PathExpr::Abs(p) => p.clone(),
-                PathExpr::Rel(r) => PathBuf::from(r),
-            };
-            for arg in iter {
-                match eval_path_expr(arg, gemfile_path, root, source)? {
-                    PathExpr::Abs(p) => joined.push(p),
-                    PathExpr::Rel(r) => joined.push(r),
-                }
+            if args.is_empty() {
+                return None;
             }
-            Some(match first {
-                PathExpr::Abs(_) => PathExpr::Abs(joined),
-                PathExpr::Rel(_) => PathExpr::Rel(joined.to_string_lossy().to_string()),
-            })
+            let mut parts: Vec<String> = Vec::with_capacity(args.len());
+            for arg in &args {
+                parts.push(match eval_path_expr(arg, gemfile_path, root, source)? {
+                    PathExpr::Abs(p) => p.to_string_lossy().to_string(),
+                    PathExpr::Rel(r) => r,
+                });
+            }
+            Some(PathExpr::from_string(ruby_file_join(&parts)))
         }
         _ => None,
     }
+}
+
+/// Ruby's `File.join`: components are concatenated with a single `/`, and a leading
+/// separator on a non-first component does *not* restart the path
+/// (`File.join('a', '/b', 'c') == "a/b/c"`).
+fn ruby_file_join(parts: &[String]) -> String {
+    let mut out = String::new();
+    for (i, part) in parts.iter().enumerate() {
+        if i == 0 {
+            out.push_str(part);
+            continue;
+        }
+        let trimmed = out.trim_end_matches('/').len();
+        out.truncate(trimmed);
+        out.push('/');
+        out.push_str(part.trim_start_matches('/'));
+    }
+    out
 }
 
 fn gemfile_dir(gemfile_path: &Path) -> PathBuf {
@@ -570,10 +617,17 @@ fn dedupe_key(path: &Path) -> PathBuf {
 
 // --- gemspec handling ---
 
-/// Find the gemspec a `gemspec` directive refers to, mirroring Bundler's
-/// `{,*}.gemspec` glob over the immediate directory (no recursion).
-fn select_gemspec(spec_dir: &Path, name: Option<&str>, gemfile_path: &Path) -> Option<PathBuf> {
-    let mut candidates: Vec<PathBuf> = Vec::new();
+/// A statically parsed `.gemspec`.
+struct ParsedGemspec {
+    path: PathBuf,
+    /// `spec.name` when it is a literal, otherwise the file name stem.
+    name: String,
+    development_deps: Vec<String>,
+}
+
+/// List the gemspecs of a directory the way Bundler's `{,*}.gemspec` glob does:
+/// immediate entries only, no recursion, deterministic order.
+fn gemspec_candidates(spec_dir: &Path, gemfile_path: &Path) -> Option<Vec<PathBuf>> {
     let entries = match std::fs::read_dir(spec_dir) {
         Ok(e) => e,
         Err(e) => {
@@ -586,6 +640,8 @@ fn select_gemspec(spec_dir: &Path, name: Option<&str>, gemfile_path: &Path) -> O
             return None;
         }
     };
+
+    let mut candidates: Vec<PathBuf> = Vec::new();
     for entry in entries.flatten() {
         let file_name = entry.file_name();
         let file_name = file_name.to_string_lossy();
@@ -599,65 +655,92 @@ fn select_gemspec(spec_dir: &Path, name: Option<&str>, gemfile_path: &Path) -> O
     }
     // Deterministic ordering regardless of readdir order.
     candidates.sort();
+    Some(candidates)
+}
+
+/// Resolve the gemspec a `gemspec` directive refers to. Like Bundler, `name:` is
+/// matched against the *parsed* `spec.name`, not the gemspec's file name, and
+/// gemspecs declaring the same name are not treated as ambiguous.
+fn select_gemspec(
+    spec_dir: &Path,
+    name: Option<&str>,
+    gemfile_path: &Path,
+) -> Option<ParsedGemspec> {
+    let candidates = gemspec_candidates(spec_dir, gemfile_path)?;
+    let mut parsed: Vec<ParsedGemspec> = candidates
+        .iter()
+        .filter_map(|p| load_gemspec(p, spec_dir))
+        .collect();
 
     if let Some(name) = name {
-        let wanted = format!("{}.gemspec", name);
-        let filtered: Vec<PathBuf> = candidates
-            .iter()
-            .filter(|p| p.file_name().map(|f| f == wanted.as_str()).unwrap_or(false))
-            .cloned()
-            .collect();
-        if filtered.is_empty() {
+        let available: Vec<String> = parsed.iter().map(|p| p.name.clone()).collect();
+        parsed.retain(|p| p.name == name);
+        if parsed.is_empty() {
             eprintln!(
-                "Warning: gemspec directive in {} requested `{}` but {} was not found in {}",
+                "Warning: gemspec directive in {} requested name `{}` but {} declares {} — ignored",
                 gemfile_path.display(),
                 name,
-                wanted,
-                spec_dir.display()
+                spec_dir.display(),
+                if available.is_empty() {
+                    "no gemspecs".to_string()
+                } else {
+                    format!("[{}]", available.join(", "))
+                }
             );
             return None;
         }
-        return filtered.into_iter().next();
+        return parsed.into_iter().next();
     }
 
-    match candidates.len() {
-        0 => {
-            eprintln!(
-                "Warning: gemspec directive in {} found no gemspec in {}",
-                gemfile_path.display(),
-                spec_dir.display()
-            );
-            None
-        }
-        1 => candidates.into_iter().next(),
-        _ => {
-            let names: Vec<String> = candidates
-                .iter()
-                .map(|p| p.file_name().unwrap_or_default().to_string_lossy().into())
-                .collect();
-            eprintln!(
-                "Warning: gemspec directive in {} found multiple gemspecs in {} ({}) — using {}. Pass `name:` to disambiguate.",
-                gemfile_path.display(),
-                spec_dir.display(),
-                names.join(", "),
-                names[0]
-            );
-            candidates.into_iter().next()
-        }
+    if parsed.is_empty() {
+        eprintln!(
+            "Warning: gemspec directive in {} found no gemspec in {}",
+            gemfile_path.display(),
+            spec_dir.display()
+        );
+        return None;
     }
+
+    // Bundler groups candidates by gem name (and version): several files declaring
+    // the same gem are not ambiguous.
+    let distinct: Vec<&String> = {
+        let mut seen: Vec<&String> = Vec::new();
+        for p in &parsed {
+            if !seen.contains(&&p.name) {
+                seen.push(&p.name);
+            }
+        }
+        seen
+    };
+    if distinct.len() > 1 {
+        let listed: Vec<String> = parsed
+            .iter()
+            .map(|p| {
+                format!(
+                    "{} ({})",
+                    p.name,
+                    p.path
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .into_owned()
+                )
+            })
+            .collect();
+        eprintln!(
+            "Warning: gemspec directive in {} found multiple gemspecs in {} ({}) — using {}. Pass `name:` to disambiguate.",
+            gemfile_path.display(),
+            spec_dir.display(),
+            listed.join(", "),
+            parsed[0].name
+        );
+    }
+
+    parsed.into_iter().next()
 }
 
-/// Parse a `.gemspec` and register the entries Bundler would add for it: the gem
-/// itself (as a path source) plus its development dependencies. Runtime dependencies
-/// are resolved transitively by Bundler and are intentionally not top-level gems.
-fn parse_gemspec_into(
-    ctx: &mut ParseCtx,
-    spec_path: &Path,
-    spec_dir: &Path,
-    self_groups: &[String],
-    dev_groups: &[String],
-    platforms: &[String],
-) {
+/// Statically parse a `.gemspec` for its name and development dependencies.
+fn load_gemspec(spec_path: &Path, spec_dir: &Path) -> Option<ParsedGemspec> {
     let source = match std::fs::read(spec_path) {
         Ok(s) => s,
         Err(e) => {
@@ -666,7 +749,7 @@ fn parse_gemspec_into(
                 spec_path.display(),
                 e
             );
-            return;
+            return None;
         }
     };
 
@@ -680,29 +763,53 @@ fn parse_gemspec_into(
     };
     visitor.visit(&parse_result.node());
 
-    let spec_name = visitor
-        .spec_name
-        .unwrap_or_else(|| gemspec_stem(spec_path, spec_dir));
+    Some(ParsedGemspec {
+        path: spec_path.to_path_buf(),
+        name: visitor
+            .spec_name
+            .unwrap_or_else(|| gemspec_stem(spec_path, spec_dir)),
+        development_deps: visitor.development_deps,
+    })
+}
 
-    ctx.gems.push(GemEntry {
-        name: spec_name,
-        groups: self_groups.to_vec(),
-        platforms: platforms.to_vec(),
-        require_paths: Vec::new(),
-        module_names: Vec::new(),
-        require_false: false,
-        source: Some(crate::types::GemSource::Path(spec_dir.to_path_buf())),
-    });
+/// Register the entries Bundler would add for a gemspec: the gem itself (as a path
+/// source) plus its development dependencies. Runtime dependencies are resolved
+/// transitively by Bundler and are intentionally not top-level gems.
+fn register_gemspec(
+    ctx: &mut ParseCtx,
+    spec: ParsedGemspec,
+    spec_dir: &Path,
+    self_groups: &[String],
+    dev_groups: &[String],
+    platforms: &[String],
+) {
+    debug_assert!(spec.path.is_file());
 
-    for dep in visitor.development_deps {
-        ctx.gems.push(GemEntry {
-            name: dep,
-            groups: dev_groups.to_vec(),
+    ctx.gems.push(PendingGem {
+        entry: GemEntry {
+            name: spec.name,
+            groups: self_groups.to_vec(),
             platforms: platforms.to_vec(),
             require_paths: Vec::new(),
             module_names: Vec::new(),
             require_false: false,
-            source: None,
+            source: Some(crate::types::GemSource::Path(spec_dir.to_path_buf())),
+        },
+        gemspec_dev_dep: false,
+    });
+
+    for dep in spec.development_deps {
+        ctx.gems.push(PendingGem {
+            entry: GemEntry {
+                name: dep,
+                groups: dev_groups.to_vec(),
+                platforms: platforms.to_vec(),
+                require_paths: Vec::new(),
+                module_names: Vec::new(),
+                require_false: false,
+                source: None,
+            },
+            gemspec_dev_dep: true,
         });
     }
 }
@@ -823,49 +930,70 @@ impl Visit<'_> for GemspecVisitor<'_> {
     }
 }
 
-/// Merge duplicate gem entries by name, combining groups, platforms, require_paths,
-/// and require_false. Preserves the position of the first occurrence.
-fn merge_duplicate_gems(gems: Vec<GemEntry>) -> Vec<GemEntry> {
+/// Merge duplicate gem declarations by name.
+///
+/// Bundler always prefers an explicit Gemfile declaration over a duplicate coming
+/// from a gemspec's development dependencies (in either declaration order); two
+/// Gemfile declarations, or two gemspec development dependencies, are unioned.
+/// The position of the first occurrence is preserved.
+fn merge_duplicate_gems(gems: Vec<PendingGem>) -> Vec<GemEntry> {
     let mut seen: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-    let mut result: Vec<GemEntry> = Vec::new();
+    let mut result: Vec<PendingGem> = Vec::new();
 
-    for gem in gems {
-        if let Some(&idx) = seen.get(&gem.name) {
-            let existing = &mut result[idx];
-            // groups: set union preserving order
-            for g in &gem.groups {
-                if !existing.groups.contains(g) {
-                    existing.groups.push(g.clone());
-                }
+    for pending in gems {
+        let idx = match seen.get(&pending.entry.name) {
+            Some(&idx) => idx,
+            None => {
+                seen.insert(pending.entry.name.clone(), result.len());
+                result.push(pending);
+                continue;
             }
-            // platforms: empty on either side means "all platforms" → result should be empty
-            if existing.platforms.is_empty() || gem.platforms.is_empty() {
-                existing.platforms.clear();
-            } else {
-                for p in &gem.platforms {
-                    if !existing.platforms.contains(p) {
-                        existing.platforms.push(p.clone());
-                    }
-                }
+        };
+
+        let existing = &mut result[idx];
+        match (existing.gemspec_dev_dep, pending.gemspec_dev_dep) {
+            // A later Gemfile declaration replaces the gemspec development dependency.
+            (true, false) => {
+                *existing = pending;
+                continue;
             }
-            // require_paths: union preserving order
-            for rp in &gem.require_paths {
-                if !existing.require_paths.contains(rp) {
-                    existing.require_paths.push(rp.clone());
-                }
+            // An explicit Gemfile declaration already won; drop the gemspec dev dep.
+            (false, true) => continue,
+            _ => {}
+        }
+
+        let gem = pending.entry;
+        let existing = &mut existing.entry;
+        // groups: set union preserving order
+        for g in &gem.groups {
+            if !existing.groups.contains(g) {
+                existing.groups.push(g.clone());
             }
-            // require_false: logical OR
-            existing.require_false = existing.require_false || gem.require_false;
-            if existing.source.is_none() {
-                existing.source = gem.source;
-            }
+        }
+        // platforms: empty on either side means "all platforms" → result should be empty
+        if existing.platforms.is_empty() || gem.platforms.is_empty() {
+            existing.platforms.clear();
         } else {
-            seen.insert(gem.name.clone(), result.len());
-            result.push(gem);
+            for p in &gem.platforms {
+                if !existing.platforms.contains(p) {
+                    existing.platforms.push(p.clone());
+                }
+            }
+        }
+        // require_paths: union preserving order
+        for rp in &gem.require_paths {
+            if !existing.require_paths.contains(rp) {
+                existing.require_paths.push(rp.clone());
+            }
+        }
+        // require_false: logical OR
+        existing.require_false = existing.require_false || gem.require_false;
+        if existing.source.is_none() {
+            existing.source = gem.source;
         }
     }
 
-    result
+    result.into_iter().map(|p| p.entry).collect()
 }
 
 // --- Helper functions for extracting values from Prism AST nodes ---
@@ -1302,7 +1430,7 @@ mod tests {
     }
 
     #[test]
-    fn eval_gemfile_dedupes_path_aliases() {
+    fn eval_gemfile_path_aliases_merge_into_one_entry() {
         let dir = tempfile::tempdir().unwrap();
         let shared = dir.path().join("shared");
         std::fs::create_dir_all(&shared).unwrap();
@@ -1318,7 +1446,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn eval_gemfile_dedupes_symlink_aliases() {
+    fn eval_gemfile_symlink_aliases_merge_into_one_entry() {
         let dir = tempfile::tempdir().unwrap();
         let real = dir.path().join("real");
         std::fs::create_dir_all(&real).unwrap();
@@ -1331,6 +1459,49 @@ mod tests {
         .unwrap();
         let gems = parse_gemfile(dir.path());
         assert_eq!(names(&gems), vec!["puma"]);
+    }
+
+    #[test]
+    fn repeated_eval_gemfile_merges_each_group_context() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Gemfile"),
+            "eval_gemfile 'shared.gemfile'\ngroup :test do\n  eval_gemfile 'shared.gemfile'\nend\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("shared.gemfile"), "gem 'puma'\n").unwrap();
+        let gems = parse_gemfile(dir.path());
+        assert_eq!(names(&gems), vec!["puma"]);
+        // The second evaluation must still contribute its enclosing group.
+        assert_eq!(find_gem(&gems, "puma").groups, vec!["default", "test"]);
+    }
+
+    #[test]
+    fn repeated_eval_gemfile_merges_each_platform_context() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Gemfile"),
+            "platforms :jruby do\n  eval_gemfile 'shared.gemfile'\nend\nplatforms :mingw do\n  eval_gemfile 'shared.gemfile'\nend\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("shared.gemfile"), "gem 'puma'\n").unwrap();
+        let gems = parse_gemfile(dir.path());
+        assert_eq!(find_gem(&gems, "puma").platforms, vec!["jruby", "mingw"]);
+    }
+
+    #[test]
+    fn repeated_eval_gemfile_via_aliases_merges_contexts() {
+        let dir = tempfile::tempdir().unwrap();
+        let shared = dir.path().join("shared");
+        std::fs::create_dir_all(&shared).unwrap();
+        std::fs::write(
+            dir.path().join("Gemfile"),
+            "eval_gemfile 'shared/Gemfile'\ngroup :test do\n  eval_gemfile './shared/../shared/Gemfile'\nend\n",
+        )
+        .unwrap();
+        std::fs::write(shared.join("Gemfile"), "gem 'puma'\n").unwrap();
+        let gems = parse_gemfile(dir.path());
+        assert_eq!(find_gem(&gems, "puma").groups, vec!["default", "test"]);
     }
 
     #[test]
@@ -1362,6 +1533,39 @@ mod tests {
     fn eval_gemfile_without_arguments_is_warned_not_fatal() {
         let gems = parse_gems("eval_gemfile\ngem 'rails'\n");
         assert_eq!(names(&gems), vec!["rails"]);
+    }
+
+    #[test]
+    fn ruby_file_join_matches_ruby_semantics() {
+        // Ruby: File.join('a', '/b', 'c') == "a/b/c"
+        assert_eq!(
+            ruby_file_join(&["a".into(), "/b".into(), "c".into()]),
+            "a/b/c"
+        );
+        assert_eq!(ruby_file_join(&["/a".into(), "b".into()]), "/a/b");
+        assert_eq!(ruby_file_join(&["a/".into(), "/b".into()]), "a/b");
+        assert_eq!(ruby_file_join(&["/".into(), "a".into()]), "/a");
+        assert_eq!(ruby_file_join(&["a".into(), "".into()]), "a/");
+        assert_eq!(ruby_file_join(&["a".into()]), "a");
+        assert_eq!(
+            ruby_file_join(&["a//".into(), "//b".into(), "c".into()]),
+            "a/b/c"
+        );
+    }
+
+    #[test]
+    fn eval_gemfile_file_join_does_not_restart_on_absolute_component() {
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(
+            dir.path().join("Gemfile"),
+            "eval_gemfile File.join(__dir__, '/sub', 'Gemfile')\n",
+        )
+        .unwrap();
+        std::fs::write(sub.join("Gemfile"), "gem 'puma'\n").unwrap();
+        let gems = parse_gemfile(dir.path());
+        assert_eq!(names(&gems), vec!["puma"]);
     }
 
     #[test]
@@ -1463,6 +1667,47 @@ mod tests {
         );
         let gems = parse_gemfile(dir.path());
         assert_eq!(names(&gems), vec!["beta", "beta_dev"]);
+    }
+
+    #[test]
+    fn gemspec_name_option_matches_parsed_spec_name_not_file_name() {
+        // Bundler filters candidates on the parsed spec.name, so a `project.gemspec`
+        // declaring `foo` must satisfy `gemspec name: 'foo'`.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Gemfile"), "gemspec name: 'foo'\n").unwrap();
+        write_gemspec(
+            &dir.path().join("project.gemspec"),
+            "  spec.name = 'foo'\n  spec.add_development_dependency 'rspec'\n",
+        );
+        let gems = parse_gemfile(dir.path());
+        assert_eq!(names(&gems), vec!["foo", "rspec"]);
+    }
+
+    #[test]
+    fn gemspec_name_option_ignores_file_name_only_match() {
+        // `foo.gemspec` that actually declares `other` must not satisfy `name: 'foo'`.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Gemfile"),
+            "gemspec name: 'foo'\ngem 'rails'\n",
+        )
+        .unwrap();
+        write_gemspec(&dir.path().join("foo.gemspec"), "  spec.name = 'other'\n");
+        let gems = parse_gemfile(dir.path());
+        assert_eq!(names(&gems), vec!["rails"]);
+    }
+
+    #[test]
+    fn gemspec_same_name_in_multiple_files_is_not_ambiguous() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Gemfile"), "gemspec\n").unwrap();
+        write_gemspec(
+            &dir.path().join("a.gemspec"),
+            "  spec.name = 'same'\n  spec.add_development_dependency 'rspec'\n",
+        );
+        write_gemspec(&dir.path().join("b.gemspec"), "  spec.name = 'same'\n");
+        let gems = parse_gemfile(dir.path());
+        assert_eq!(names(&gems), vec!["same", "rspec"]);
     }
 
     #[test]
@@ -1594,7 +1839,8 @@ spec.add_development_dependency 'rspec'
     }
 
     #[test]
-    fn gemspec_development_dependency_merges_with_gemfile_groups() {
+    fn gemfile_declaration_wins_over_gemspec_dev_dep_when_declared_first() {
+        // Bundler: "Always prefer the dependency from the Gemfile".
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join("Gemfile"),
@@ -1607,7 +1853,49 @@ spec.add_development_dependency 'rspec'
         );
         let gems = parse_gemfile(dir.path());
         assert_eq!(gems.iter().filter(|g| g.name == "rspec").count(), 1);
-        assert_eq!(find_gem(&gems, "rspec").groups, vec!["test", "development"]);
+        assert_eq!(find_gem(&gems, "rspec").groups, vec!["test"]);
+    }
+
+    #[test]
+    fn gemfile_declaration_wins_over_gemspec_dev_dep_when_declared_last() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Gemfile"),
+            "gemspec\ngem 'rspec', group: :test, require: false\n",
+        )
+        .unwrap();
+        write_gemspec(
+            &dir.path().join("foo.gemspec"),
+            "  spec.name = 'my_gem'\n  spec.add_development_dependency 'rspec'\n",
+        );
+        let gems = parse_gemfile(dir.path());
+        assert_eq!(gems.iter().filter(|g| g.name == "rspec").count(), 1);
+        let rspec = find_gem(&gems, "rspec");
+        assert_eq!(rspec.groups, vec!["test"]);
+        assert!(rspec.require_false);
+    }
+
+    #[test]
+    fn duplicate_gemspec_dev_deps_still_union_groups() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = dir.path().join("engine");
+        std::fs::create_dir_all(&engine).unwrap();
+        std::fs::write(
+            dir.path().join("Gemfile"),
+            "gemspec\ngemspec path: 'engine', development_group: :dev\n",
+        )
+        .unwrap();
+        write_gemspec(
+            &dir.path().join("foo.gemspec"),
+            "  spec.name = 'my_gem'\n  spec.add_development_dependency 'rspec'\n",
+        );
+        write_gemspec(
+            &engine.join("engine.gemspec"),
+            "  spec.name = 'engine'\n  spec.add_development_dependency 'rspec'\n",
+        );
+        let gems = parse_gemfile(dir.path());
+        assert_eq!(gems.iter().filter(|g| g.name == "rspec").count(), 1);
+        assert_eq!(find_gem(&gems, "rspec").groups, vec!["development", "dev"]);
     }
 
     #[test]

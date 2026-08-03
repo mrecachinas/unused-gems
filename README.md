@@ -113,17 +113,21 @@ unused-gems --gemfile engines/a/Gemfile --gemfile engines/b/Gemfile /path/to/pro
 order and inherit the enclosing `group`/`platforms` context. Relative paths resolve
 against the Gemfile that declared them, and `File.expand_path`, `File.join`,
 `File.dirname`, `__FILE__` and `__dir__` are evaluated with Ruby semantics (note that
-`File.expand_path(p, __FILE__)` treats the Gemfile path itself as the base directory).
-Paths are normalized so symlink and `..` aliases of the same file are evaluated once,
-and cycles terminate. Unsupported or unresolvable expressions produce a warning instead
-of being silently dropped.
+`File.expand_path(p, __FILE__)` treats the Gemfile path itself as the base directory,
+and `File.join('a', '/b')` is `a/b`). A Gemfile evaluated more than once contributes its
+declarations under each context — including through symlink or `..` aliases of the same
+file — while cycles are broken by tracking only the active evaluation stack. Unsupported
+or unresolvable expressions produce a warning instead of being silently dropped.
 
 `gemspec` honors `path:`, `name:` and `development_group:`. It looks only at the
-immediate directory for `*.gemspec` (plus a bare `.gemspec`), selects deterministically,
-and warns when zero or multiple candidates are found. The gemspec's own `spec.name` is
-registered as a default-group path source; its **development** dependencies are added to
-the configured development group, while runtime dependencies are left to Bundler's
-transitive resolution rather than being reported as top-level gems.
+immediate directory for `*.gemspec` (plus a bare `.gemspec`), matches `name:` against the
+parsed `spec.name` rather than the file name, selects deterministically, and warns when
+zero or multiple distinct gems are found. The gemspec's own `spec.name` is registered as
+a default-group path source; its **development** dependencies are added to the configured
+development group, while runtime dependencies are left to Bundler's transitive resolution
+rather than being reported as top-level gems. Matching Bundler, an explicit Gemfile
+declaration always wins over a duplicate gemspec development dependency, in either
+declaration order.
 
 ## Architecture
 
