@@ -4,7 +4,7 @@ High-performance scanner for unused gems in Ruby projects, built in Rust with [r
 
 ## Features
 
-- **Gemfile parsing** via ruby-prism AST — handles `gem`, `group`, `require:`, `path:`, `git:`, `gemspec` directives
+- **Gemfile parsing** via ruby-prism AST — handles `gem`, `group`, `platforms`, `require:`, `path:`, `git:`, `eval_gemfile` and `gemspec` directives
 - **Parallel source scanning** with rayon — scans Ruby/ERB/HAML/YAML files concurrently
 - **Gem introspection** — discovers actual require paths and module names from installed gems
 - **Script/CI detection** — finds gem usage in Makefiles, Dockerfiles, CI configs
@@ -106,6 +106,24 @@ unused-gems --gemfile engines/a/Gemfile --gemfile engines/b/Gemfile /path/to/pro
     --rails-env <ENV>      Rails environment group considered active
 -h, --help                Print help
 ```
+
+## Gemfile semantics
+
+`eval_gemfile` is evaluated inline at its declaration site, so gems appear in source
+order and inherit the enclosing `group`/`platforms` context. Relative paths resolve
+against the Gemfile that declared them, and `File.expand_path`, `File.join`,
+`File.dirname`, `__FILE__` and `__dir__` are evaluated with Ruby semantics (note that
+`File.expand_path(p, __FILE__)` treats the Gemfile path itself as the base directory).
+Paths are normalized so symlink and `..` aliases of the same file are evaluated once,
+and cycles terminate. Unsupported or unresolvable expressions produce a warning instead
+of being silently dropped.
+
+`gemspec` honors `path:`, `name:` and `development_group:`. It looks only at the
+immediate directory for `*.gemspec` (plus a bare `.gemspec`), selects deterministically,
+and warns when zero or multiple candidates are found. The gemspec's own `spec.name` is
+registered as a default-group path source; its **development** dependencies are added to
+the configured development group, while runtime dependencies are left to Bundler's
+transitive resolution rather than being reported as top-level gems.
 
 ## Architecture
 
