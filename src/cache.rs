@@ -1,11 +1,11 @@
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Mutex;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Serialize};
 
-const CACHE_VERSION: u32 = 5; // bumped: refined Bundler.require splat semantics
+const CACHE_VERSION: u32 = 7; // bumped: lexical masking changes source findings
 const CACHE_FILE: &str = ".unused_gems_cache";
 
 #[derive(Serialize, Deserialize)]
@@ -13,6 +13,8 @@ pub(crate) struct CacheEntry {
     mtime_secs: u64,
     mtime_nanos: u32,
     size: u64,
+    #[cfg(not(unix))]
+    content_fingerprint: u64,
     pub(crate) requires: Vec<String>,
     pub(crate) modules: Vec<String>,
     pub(crate) bundler_groups: Vec<String>,
@@ -85,6 +87,8 @@ impl FileCache {
                 mtime_secs: entry.mtime_secs,
                 mtime_nanos: entry.mtime_nanos,
                 size: entry.size,
+                #[cfg(not(unix))]
+                content_fingerprint: entry.content_fingerprint,
                 requires: entry.requires.clone(),
                 modules: entry.modules.clone(),
                 bundler_groups: entry.bundler_groups.clone(),
@@ -98,7 +102,13 @@ impl FileCache {
     /// Consume the cache entry on hit (removes from internal map, returns owned CacheEntry).
     /// This avoids cloning the inner Vec<String>s on the hot path.
     /// If validation fails, the entry is left in place.
-    pub fn take(&self, rel_path: &str, mtime: SystemTime, size: u64) -> Option<CacheEntry> {
+    pub fn take(
+        &self,
+        rel_path: &str,
+        mtime: SystemTime,
+        size: u64,
+        _path: &Path,
+    ) -> Option<CacheEntry> {
         let mut entries = self.entries.lock().unwrap();
         // Validate before removing
         let entry = entries.get(rel_path)?;
@@ -107,6 +117,10 @@ impl FileCache {
         let mtime_nanos = duration.subsec_nanos();
         if entry.mtime_secs != mtime_secs || entry.mtime_nanos != mtime_nanos || entry.size != size
         {
+            return None;
+        }
+        #[cfg(not(unix))]
+        if entry.content_fingerprint != content_fingerprint(_path) {
             return None;
         }
         entries.remove(rel_path)
@@ -131,6 +145,12 @@ impl FileCache {
         bundler_groups: &[String],
         bundler_require_all: bool,
     ) {
+        #[cfg(not(unix))]
+        let content_fingerprint = self
+            .cache_path
+            .parent()
+            .map(|root| content_fingerprint(&root.join(&rel_path)))
+            .unwrap_or_default();
         let duration = mtime
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap_or_default();
@@ -142,6 +162,8 @@ impl FileCache {
                 mtime_secs,
                 mtime_nanos,
                 size,
+                #[cfg(not(unix))]
+                content_fingerprint,
                 requires: requires.to_vec(),
                 modules,
                 bundler_groups: bundler_groups.to_vec(),
@@ -171,6 +193,35 @@ impl FileCache {
     pub fn is_enabled(&self) -> bool {
         !self.cache_path.as_os_str().is_empty()
     }
+}
+
+pub(crate) fn cache_timestamp(metadata: &std::fs::Metadata) -> SystemTime {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        let secs = metadata.ctime().max(0) as u64;
+        let nanos = metadata.ctime_nsec().clamp(0, 999_999_999) as u32;
+        SystemTime::UNIX_EPOCH + Duration::new(secs, nanos)
+    }
+
+    #[cfg(not(unix))]
+    {
+        metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH)
+    }
+}
+
+#[cfg(not(unix))]
+fn content_fingerprint(path: &Path) -> u64 {
+    const OFFSET: u64 = 0xcbf29ce484222325;
+    const PRIME: u64 = 0x100000001b3;
+    std::fs::read(path)
+        .map(|bytes| {
+            bytes.iter().fold(OFFSET, |hash, byte| {
+                (hash ^ u64::from(*byte)).wrapping_mul(PRIME)
+            })
+        })
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -289,6 +340,8 @@ mod tests {
                         mtime_secs: 1000000,
                         mtime_nanos: 0,
                         size: 10,
+                        #[cfg(not(unix))]
+                        content_fingerprint: 0,
                         requires: vec!["old".to_string()],
                         modules: vec![],
                         bundler_groups: vec![],

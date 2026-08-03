@@ -1,0 +1,5 @@
+source "https://rubygems.org"
+
+group :migrations do
+  gem "dead-migration-gem"
+end

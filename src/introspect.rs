@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use once_cell::sync::Lazy;
 use regex::Regex;
 
+use crate::lockfile::Lockfile;
 use crate::types::{GemEntry, GemSource};
 
 static MODULE_DECL_RE: Lazy<Regex> =
@@ -98,12 +99,9 @@ pub fn find_gem_paths(project_dir: &Path) -> Vec<PathBuf> {
         }
     }
 
-    // 2. GEM_PATH env (colon-separated) — often set by rbenv/rvm init scripts
+    // 2. GEM_PATH env — often set by rbenv/rvm init scripts
     if let Ok(gem_path) = std::env::var("GEM_PATH") {
-        let paths: Vec<PathBuf> = gem_path
-            .split(':')
-            .filter(|s| !s.is_empty())
-            .map(PathBuf::from)
+        let paths: Vec<PathBuf> = std::env::split_paths(&gem_path)
             .filter(|p| p.is_dir())
             .collect();
         if !paths.is_empty() {
@@ -355,9 +353,19 @@ fn select_rvm_gemset(gems_dir: &Path, project_dir: &Path) -> Option<PathBuf> {
     candidates.into_iter().next().map(|(p, _)| p)
 }
 
-/// Pre-build an index of gem_name -> gem_dir for fast lookups.
+/// Pre-build an index of gem_name -> gem_dir for fast lookups, using the
+/// latest installed version when no lockfile selection is requested.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn build_gem_index(gem_paths: &[PathBuf]) -> HashMap<String, PathBuf> {
-    let mut index = HashMap::new();
+    build_gem_index_for_lock(gem_paths, &Lockfile::default(), None)
+}
+
+pub fn build_gem_index_for_lock(
+    gem_paths: &[PathBuf],
+    lockfile: &Lockfile,
+    current_platform: Option<&str>,
+) -> HashMap<String, PathBuf> {
+    let mut candidates: HashMap<String, Vec<PathBuf>> = HashMap::new();
     for base in gem_paths {
         let gems_dir = base.join("gems");
         if !gems_dir.is_dir() {
@@ -381,24 +389,10 @@ pub fn build_gem_index(gem_paths: &[PathBuf]) -> HashMap<String, PathBuf> {
                         && version_part.starts_with(|c: char| c.is_ascii_digit())
                         && version_part.contains('.')
                     {
-                        index
+                        candidates
                             .entry(gem_name.to_string())
-                            .and_modify(|existing: &mut PathBuf| {
-                                let existing_name = existing
-                                    .file_name()
-                                    .unwrap_or_default()
-                                    .to_string_lossy()
-                                    .to_string();
-                                // Re-extract version from existing using same approach
-                                let existing_ver =
-                                    extract_gem_version(&existing_name).unwrap_or_default();
-                                if compare_gem_versions(version_part, &existing_ver)
-                                    == std::cmp::Ordering::Greater
-                                {
-                                    *existing = entry.path();
-                                }
-                            })
-                            .or_insert_with(|| entry.path());
+                            .or_default()
+                            .push(entry.path());
                         parsed = true;
                         break;
                     }
@@ -410,30 +404,59 @@ pub fn build_gem_index(gem_paths: &[PathBuf]) -> HashMap<String, PathBuf> {
                         let gem_name = &name[..idx];
                         let version_part = &name[idx + 1..];
                         if version_part.starts_with(|c: char| c.is_ascii_digit()) {
-                            index
+                            candidates
                                 .entry(gem_name.to_string())
-                                .and_modify(|existing: &mut PathBuf| {
-                                    let existing_name = existing
-                                        .file_name()
-                                        .unwrap_or_default()
-                                        .to_string_lossy()
-                                        .to_string();
-                                    let existing_ver =
-                                        extract_gem_version(&existing_name).unwrap_or_default();
-                                    if compare_gem_versions(version_part, &existing_ver)
-                                        == std::cmp::Ordering::Greater
-                                    {
-                                        *existing = entry.path();
-                                    }
-                                })
-                                .or_insert_with(|| entry.path());
+                                .or_default()
+                                .push(entry.path());
                         }
                     }
                 }
             }
         }
     }
-    index
+
+    candidates
+        .into_iter()
+        .filter_map(|(gem_name, paths)| {
+            select_gem_artifact(&gem_name, paths, lockfile, current_platform)
+                .map(|path| (gem_name, path))
+        })
+        .collect()
+}
+
+fn select_gem_artifact(
+    gem_name: &str,
+    mut candidates: Vec<PathBuf>,
+    lockfile: &Lockfile,
+    current_platform: Option<&str>,
+) -> Option<PathBuf> {
+    candidates.sort();
+    for full_name in lockfile.preferred_registry_full_names(gem_name, current_platform) {
+        if let Some(path) = candidates
+            .iter()
+            .find(|path| candidate_full_name(path).as_deref() == Some(full_name.as_str()))
+        {
+            return Some(path.clone());
+        }
+    }
+
+    candidates.into_iter().max_by(|a, b| {
+        let a_name = candidate_full_name(a).unwrap_or_default();
+        let b_name = candidate_full_name(b).unwrap_or_default();
+        let a_version = extract_gem_version(&a_name).unwrap_or_default();
+        let b_version = extract_gem_version(&b_name).unwrap_or_default();
+        compare_gem_versions(&a_version, &b_version).then_with(|| a.cmp(b))
+    })
+}
+
+fn candidate_full_name(path: &Path) -> Option<String> {
+    if path.extension().and_then(|extension| extension.to_str()) == Some("gem") {
+        path.file_stem()
+            .map(|name| name.to_string_lossy().to_string())
+    } else {
+        path.file_name()
+            .map(|name| name.to_string_lossy().to_string())
+    }
 }
 
 pub fn index_declared_gem_sources(
@@ -496,7 +519,13 @@ fn find_local_git_checkout(project_dir: &Path, gem_name: &str) -> Option<PathBuf
             .join(format!("{}-*", gem_name))
             .display()
             .to_string();
-        for path in glob::glob(&pattern).into_iter().flatten().flatten() {
+        let mut paths: Vec<PathBuf> = glob::glob(&pattern)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .collect();
+        paths.sort();
+        for path in paths {
             if looks_like_gem_source(&path) {
                 return Some(path);
             }
@@ -523,6 +552,7 @@ pub fn discover_gem_require_paths(
         if !dir.is_dir() {
             continue;
         }
+        let mut candidates = Vec::new();
         if let Ok(entries) = std::fs::read_dir(&dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
@@ -530,16 +560,38 @@ pub fn discover_gem_require_paths(
                     if let Some(ext) = path.extension() {
                         if ext == "rb" {
                             if let Some(stem) = path.file_stem() {
-                                paths.push(stem.to_string_lossy().to_string());
+                                candidates.push((stem.to_string_lossy().to_string(), true));
                             }
                         }
                     }
                 } else if path.is_dir() {
                     if let Some(name) = path.file_name() {
-                        paths.push(name.to_string_lossy().to_string());
+                        candidates.push((name.to_string_lossy().to_string(), false));
                     }
                 }
             }
+        }
+        if req_dir == "lib" {
+            let normalized = gem_name.replace('-', "_");
+            const AUXILIARY_DIRS: &[&str] =
+                &["assets", "generators", "rails", "tasks", "templates"];
+            let preferred: Vec<String> = candidates
+                .iter()
+                .filter(|(candidate, is_file)| {
+                    *is_file
+                        || candidate == gem_name
+                        || candidate == &normalized
+                        || !AUXILIARY_DIRS.contains(&candidate.as_str())
+                })
+                .map(|(candidate, _)| candidate.clone())
+                .collect();
+            if preferred.is_empty() {
+                paths.extend(candidates.into_iter().map(|(candidate, _)| candidate));
+            } else {
+                paths.extend(preferred);
+            }
+        } else {
+            paths.extend(candidates.into_iter().map(|(candidate, _)| candidate));
         }
     }
 
@@ -774,15 +826,24 @@ fn parse_gem_metadata_yaml(yaml: &str) -> Option<GemMetadata> {
 }
 
 /// Lightweight directory scan of `vendor/cache/*.gem`.
-/// Returns gem_name → PathBuf mapping, keeping the latest version per gem name.
+/// Returns gem_name → PathBuf mapping, keeping the latest version per gem name
+/// when no lockfile selection is requested.
 /// Does NOT open any tarballs — only inspects filenames.
 pub fn build_vendor_cache_path_index(project_dir: &Path) -> HashMap<String, PathBuf> {
+    build_vendor_cache_path_index_for_lock(project_dir, &Lockfile::default(), None)
+}
+
+pub fn build_vendor_cache_path_index_for_lock(
+    project_dir: &Path,
+    lockfile: &Lockfile,
+    current_platform: Option<&str>,
+) -> HashMap<String, PathBuf> {
     let cache_dir = project_dir.join("vendor").join("cache");
     if !cache_dir.is_dir() {
         return HashMap::new();
     }
 
-    let mut best: HashMap<String, (String, PathBuf)> = HashMap::new();
+    let mut candidates: HashMap<String, Vec<PathBuf>> = HashMap::new();
     let entries = match std::fs::read_dir(&cache_dir) {
         Ok(rd) => rd,
         Err(_) => return HashMap::new(),
@@ -800,20 +861,15 @@ pub fn build_vendor_cache_path_index(project_dir: &Path) -> HashMap<String, Path
             Some(n) => n,
             None => continue,
         };
-        let version = extract_gem_version(&filename).unwrap_or_default();
-        match best.entry(gem_name) {
-            std::collections::hash_map::Entry::Vacant(e) => {
-                e.insert((version, path));
-            }
-            std::collections::hash_map::Entry::Occupied(mut e) => {
-                if compare_gem_versions(&version, &e.get().0) == std::cmp::Ordering::Greater {
-                    e.insert((version, path));
-                }
-            }
-        }
+        candidates.entry(gem_name).or_default().push(path);
     }
-    best.into_iter()
-        .map(|(name, (_, path))| (name, path))
+
+    candidates
+        .into_iter()
+        .filter_map(|(gem_name, paths)| {
+            select_gem_artifact(&gem_name, paths, lockfile, current_platform)
+                .map(|path| (gem_name, path))
+        })
         .collect()
 }
 
@@ -1073,6 +1129,57 @@ mod tests {
     }
 
     #[test]
+    fn build_gem_index_picks_locked_version_instead_of_latest() {
+        let dir = tempfile::tempdir().unwrap();
+        let gems_dir = dir.path().join("gems");
+        std::fs::create_dir_all(gems_dir.join("versioned-1.0.0")).unwrap();
+        std::fs::create_dir_all(gems_dir.join("versioned-2.0.0")).unwrap();
+        std::fs::write(
+            dir.path().join("Gemfile.lock"),
+            "GEM\n  specs:\n    versioned (1.0.0)\n\nPLATFORMS\n  ruby\n",
+        )
+        .unwrap();
+        let lockfile = crate::lockfile::parse_gemfile_lock(dir.path());
+
+        let index = build_gem_index_for_lock(&[dir.path().to_path_buf()], &lockfile, Some("ruby"));
+        assert_eq!(index["versioned"], gems_dir.join("versioned-1.0.0"));
+    }
+
+    #[test]
+    fn build_gem_index_prefers_normalized_locked_native_then_ruby_artifact() {
+        let dir = tempfile::tempdir().unwrap();
+        let gems_dir = dir.path().join("gems");
+        std::fs::create_dir_all(gems_dir.join("native-1.0.0")).unwrap();
+        std::fs::create_dir_all(gems_dir.join("native-1.0.0-arm64-darwin")).unwrap();
+        std::fs::write(
+            dir.path().join("Gemfile.lock"),
+            "\
+GEM
+  specs:
+    native (1.0.0)
+    native (1.0.0-arm64-darwin)
+
+PLATFORMS
+  arm64-darwin-25
+  ruby
+",
+        )
+        .unwrap();
+        let lockfile = crate::lockfile::parse_gemfile_lock(dir.path());
+
+        let native = build_gem_index_for_lock(
+            &[dir.path().to_path_buf()],
+            &lockfile,
+            Some("arm64-darwin-25"),
+        );
+        assert_eq!(native["native"], gems_dir.join("native-1.0.0-arm64-darwin"));
+
+        let ruby =
+            build_gem_index_for_lock(&[dir.path().to_path_buf()], &lockfile, Some("x86_64-linux"));
+        assert_eq!(ruby["native"], gems_dir.join("native-1.0.0"));
+    }
+
+    #[test]
     fn build_gem_index_platform_suffix() {
         let dir = tempfile::tempdir().unwrap();
         let gems_dir = dir.path().join("gems");
@@ -1139,6 +1246,31 @@ mod tests {
         assert_eq!(index.get("custom_gem"), Some(&checkout));
     }
 
+    #[test]
+    fn index_declared_git_gem_sources_is_deterministic() {
+        let dir = tempfile::tempdir().unwrap();
+        let checkout_root = dir.path().join("vendor/bundle/ruby/3.4.0/bundler/gems");
+        let first = checkout_root.join("custom_gem-aaa");
+        let second = checkout_root.join("custom_gem-zzz");
+        std::fs::create_dir_all(first.join("lib")).unwrap();
+        std::fs::create_dir_all(second.join("lib")).unwrap();
+        let gems = vec![GemEntry {
+            name: "custom_gem".to_string(),
+            groups: vec!["default".to_string()],
+            platforms: Vec::new(),
+            require_paths: Vec::new(),
+            module_names: Vec::new(),
+            require_false: false,
+            source: Some(GemSource::Git(
+                "https://example.test/custom_gem.git".to_string(),
+            )),
+        }];
+
+        let mut index = HashMap::new();
+        index_declared_gem_sources(dir.path(), &gems, &mut index);
+        assert_eq!(index.get("custom_gem"), Some(&first));
+    }
+
     // ── discover_gem_require_paths ──
 
     #[test]
@@ -1164,6 +1296,34 @@ mod tests {
     fn discover_require_paths_missing_gem() {
         let index = HashMap::new();
         assert!(discover_gem_require_paths("nonexistent", &index).is_none());
+    }
+
+    #[test]
+    fn discover_require_paths_ignores_unrelated_lib_siblings() {
+        let dir = tempfile::tempdir().unwrap();
+        let gem_dir = dir.path().join("factory_bot_rails-1.0.0");
+        let lib_dir = gem_dir.join("lib");
+        std::fs::create_dir_all(lib_dir.join("rails")).unwrap();
+        std::fs::create_dir_all(lib_dir.join("generators")).unwrap();
+        std::fs::write(lib_dir.join("factory_bot_rails.rb"), "").unwrap();
+
+        let index = HashMap::from([("factory_bot_rails".to_string(), gem_dir)]);
+        let paths = discover_gem_require_paths("factory_bot_rails", &index).unwrap();
+        assert_eq!(paths, vec!["factory_bot_rails"]);
+    }
+
+    #[test]
+    fn discover_require_paths_preserves_public_directory_alias() {
+        let dir = tempfile::tempdir().unwrap();
+        let gem_dir = dir.path().join("puma-1.0.0");
+        let lib_dir = gem_dir.join("lib");
+        std::fs::create_dir_all(lib_dir.join("rack")).unwrap();
+        std::fs::write(lib_dir.join("puma.rb"), "").unwrap();
+
+        let index = HashMap::from([("puma".to_string(), gem_dir)]);
+        let paths = discover_gem_require_paths("puma", &index).unwrap();
+        assert!(paths.contains(&"puma".to_string()));
+        assert!(paths.contains(&"rack".to_string()));
     }
 
     // ── discover_gem_module_names ──
@@ -1856,6 +2016,38 @@ mod tests {
             cache_dir.join("aws-sdk-s3-1.143.0.gem")
         );
         assert!(!index.contains_key("README"));
+    }
+
+    #[test]
+    fn vendor_path_index_picks_normalized_locked_native_artifact() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache_dir = dir.path().join("vendor").join("cache");
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        std::fs::write(cache_dir.join("native-1.0.0.gem"), b"").unwrap();
+        std::fs::write(cache_dir.join("native-1.0.0-arm64-darwin.gem"), b"").unwrap();
+        std::fs::write(cache_dir.join("native-2.0.0.gem"), b"").unwrap();
+        std::fs::write(
+            dir.path().join("Gemfile.lock"),
+            "\
+GEM
+  specs:
+    native (1.0.0)
+    native (1.0.0-arm64-darwin)
+
+PLATFORMS
+  arm64-darwin-25
+  ruby
+",
+        )
+        .unwrap();
+        let lockfile = crate::lockfile::parse_gemfile_lock(dir.path());
+
+        let index =
+            build_vendor_cache_path_index_for_lock(dir.path(), &lockfile, Some("arm64-darwin-25"));
+        assert_eq!(
+            index["native"],
+            cache_dir.join("native-1.0.0-arm64-darwin.gem")
+        );
     }
 
     #[test]

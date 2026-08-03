@@ -88,17 +88,34 @@ end
     }
 }
 
-fn ignore_heavy_corpus(visible_files: usize, ignored_files: usize) -> Corpus {
+fn malformed_percent_corpus(files: usize, literals_per_file: usize) -> Corpus {
+    let dir = TempDir::new().unwrap();
+    let mut body = String::with_capacity(literals_per_file * 16 + 128);
+    for _ in 0..literals_per_file {
+        body.push_str("x = %W[a#{b\n");
+    }
+    body.push_str(
+        "valid = %W[\n#{ValidInterpolation}\n]\nrequire \"real_dependency\"\nRealModule.call\n",
+    );
+    let bytes = write_files(&dir.path().join("app/services"), files, &body);
+    Corpus {
+        _dir: dir,
+        files: files as u64,
+        bytes,
+    }
+}
+
+fn gitignored_generated_corpus(visible_files: usize, generated_files: usize) -> Corpus {
     let dir = TempDir::new().unwrap();
     fs::create_dir(dir.path().join(".git")).unwrap();
     fs::write(dir.path().join(".gitignore"), "generated/\n").unwrap();
     let body = "require \"rack\"\nmodule Visible\nend\n";
     let visible_bytes = write_files(&dir.path().join("app"), visible_files, body);
-    let ignored_bytes = write_files(&dir.path().join("generated"), ignored_files, body);
+    let generated_bytes = write_files(&dir.path().join("generated"), generated_files, body);
     Corpus {
         _dir: dir,
-        files: (visible_files + ignored_files) as u64,
-        bytes: visible_bytes + ignored_bytes,
+        files: (visible_files + generated_files) as u64,
+        bytes: visible_bytes + generated_bytes,
     }
 }
 
@@ -133,9 +150,21 @@ fn bench_source_tree(c: &mut Criterion) {
         });
     });
 
-    let corpus = ignore_heavy_corpus(250, 4_000);
+    let corpus = malformed_percent_corpus(10, 1_000);
+    group.throughput(Throughput::Bytes(corpus.bytes));
+    group.bench_function("malformed_percent_10000", |b| {
+        b.iter(|| {
+            scanner::scan_source_tree(
+                corpus.path(),
+                &scanner::default_skip_dirs(),
+                Arc::new(cache::FileCache::disabled()),
+            )
+        });
+    });
+
+    let corpus = gitignored_generated_corpus(250, 4_000);
     group.throughput(Throughput::Elements(corpus.files));
-    group.bench_function("gitignore_250_of_4250", |b| {
+    group.bench_function("gitignored_generated_4250", |b| {
         b.iter(|| {
             scanner::scan_source_tree(
                 corpus.path(),

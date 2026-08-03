@@ -14,6 +14,7 @@ use std::process::Command;
 enum Label {
     Used,
     Unused,
+    PlatformExcluded,
 }
 
 impl Label {
@@ -21,6 +22,7 @@ impl Label {
         match s.trim() {
             "used" => Some(Self::Used),
             "unused" => Some(Self::Unused),
+            "platform_excluded" => Some(Self::PlatformExcluded),
             _ => None,
         }
     }
@@ -97,7 +99,7 @@ fn parse_expected(path: &Path) -> BTreeMap<String, Label> {
             .unwrap_or_else(|| panic!("{}:{}: expected `name: label`", path.display(), lineno + 1));
         let label = Label::parse(v).unwrap_or_else(|| {
             panic!(
-                "{}:{}: unknown label '{}', expected 'used' or 'unused'",
+                "{}:{}: unknown label '{}', expected 'used', 'unused', or 'platform_excluded'",
                 path.display(),
                 lineno + 1,
                 v.trim()
@@ -135,11 +137,10 @@ fn run_tool(fixture: &Path) -> serde_json::Value {
 }
 
 fn predict_from_status(status: &str) -> Label {
-    // Anything other than "unused" counts as a positive usage signal.
-    if status == "unused" {
-        Label::Unused
-    } else {
-        Label::Used
+    match status {
+        "unused" => Label::Unused,
+        "platform_excluded" => Label::PlatformExcluded,
+        _ => Label::Used,
     }
 }
 
@@ -187,6 +188,10 @@ fn evaluate_fixture(fixture: &Path) -> FixtureReport {
                 conf.fn_ += 1;
                 mismatches.push(format!("  FN: {gem} — labelled unused, tool said used"));
             }
+            (Label::PlatformExcluded, Label::PlatformExcluded) => {}
+            _ => mismatches.push(format!(
+                "  status mismatch: {gem} — expected {exp:?}, predicted {pred:?}"
+            )),
         }
     }
 
@@ -293,6 +298,10 @@ fn accuracy_corpus() {
         total.fn_, 0,
         "false negatives detected on bundled corpus (see lines marked 'FN:' above)"
     );
+    assert!(
+        reports.iter().all(|report| report.mismatches.is_empty()),
+        "status mismatches detected on bundled corpus"
+    );
 }
 
 #[test]
@@ -338,4 +347,116 @@ fn explicit_gemfiles_merge_monorepo_declarations() {
     };
     assert_ne!(status("puma"), "unused");
     assert_eq!(status("unused-gem"), "unused");
+}
+
+#[test]
+fn locked_versions_prevent_require_and_module_false_positives_and_negatives() {
+    let dir = tempfile::tempdir().unwrap();
+    let project = dir.path().join("project");
+    let gem_home = dir.path().join("gem-home");
+    let gems_dir = gem_home.join("gems");
+    std::fs::create_dir_all(&project).unwrap();
+
+    let gems = [
+        ("require-fp", "1.0.0", "legacy_entry.rb", ""),
+        ("require-fp", "2.0.0", "new_entry.rb", ""),
+        ("require-fn", "1.0.0", "require_fn.rb", ""),
+        ("require-fn", "2.0.0", "collision.rb", ""),
+        (
+            "module-fp",
+            "1.0.0",
+            "module_fp.rb",
+            "module LockedModule\nend\n",
+        ),
+        (
+            "module-fp",
+            "2.0.0",
+            "module_fp.rb",
+            "module WrongModule\nend\n",
+        ),
+        (
+            "module-fn",
+            "1.0.0",
+            "module_fn.rb",
+            "module LegitModule\nend\n",
+        ),
+        (
+            "module-fn",
+            "2.0.0",
+            "module_fn.rb",
+            "module CollisionModule\nend\n",
+        ),
+    ];
+    for (name, version, entrypoint, content) in gems {
+        let lib = gems_dir.join(format!("{name}-{version}")).join("lib");
+        std::fs::create_dir_all(&lib).unwrap();
+        std::fs::write(lib.join(entrypoint), content).unwrap();
+    }
+
+    std::fs::write(
+        project.join("Gemfile"),
+        "\
+gem 'require-fp'
+gem 'require-fn'
+gem 'module-fp'
+gem 'module-fn'
+",
+    )
+    .unwrap();
+    std::fs::write(
+        project.join("Gemfile.lock"),
+        "\
+GEM
+  specs:
+    module-fn (1.0.0)
+    module-fp (1.0.0)
+    require-fn (1.0.0)
+    require-fp (1.0.0)
+
+PLATFORMS
+  ruby
+",
+    )
+    .unwrap();
+    std::fs::write(
+        project.join("app.rb"),
+        "\
+require 'legacy_entry'
+require 'collision'
+LockedModule.call
+CollisionModule.call
+",
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_unused-gems"))
+        .args(["--output", "json", "--no-cache"])
+        .arg(&project)
+        .env("GEM_PATH", &gem_home)
+        .env(
+            "UNUSED_GEMS_RUBY_RUNTIME",
+            "ruby|x86_64-linux|3.4.0|x86_64-linux",
+        )
+        .output()
+        .expect("run unused-gems");
+    assert!(
+        matches!(output.status.code(), Some(0 | 1)),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("parse unused-gems JSON output");
+    let results = json["results"].as_array().expect("results array");
+    let status = |name: &str| {
+        results
+            .iter()
+            .find(|entry| entry["name"].as_str() == Some(name))
+            .and_then(|entry| entry["status"].as_str())
+            .unwrap_or_else(|| panic!("missing result for {name}"))
+    };
+
+    assert_eq!(status("require-fp"), "used");
+    assert_eq!(status("require-fn"), "unused");
+    assert_eq!(status("module-fp"), "used");
+    assert_eq!(status("module-fn"), "unused");
 }

@@ -11,6 +11,7 @@ type ModuleEntry<'a> = (String, String, &'a HashSet<String>);
 struct MatchIndexes<'a> {
     requires: &'a HashMap<String, HashSet<String>>,
     prefix_map: HashMap<&'a str, Vec<(&'a str, &'a HashSet<String>)>>,
+    declared_require_paths: HashSet<String>,
     /// Modules keyed by the lowercased top "::" segment of the module name.
     modules_by_top: HashMap<String, Vec<ModuleEntry<'a>>>,
     bundler_groups: &'a HashSet<String>,
@@ -18,7 +19,7 @@ struct MatchIndexes<'a> {
 }
 
 impl<'a> MatchIndexes<'a> {
-    fn build(scan_results: &'a ScanResults) -> Self {
+    fn build(gems: &[GemEntry], scan_results: &'a ScanResults) -> Self {
         let requires = &scan_results.requires;
 
         let mut prefix_map: HashMap<&str, Vec<(&str, &HashSet<String>)>> = HashMap::new();
@@ -47,6 +48,10 @@ impl<'a> MatchIndexes<'a> {
         MatchIndexes {
             requires,
             prefix_map,
+            declared_require_paths: gems
+                .iter()
+                .flat_map(|gem| gem.require_paths.iter().cloned())
+                .collect(),
             modules_by_top,
             bundler_groups: &scan_results.bundler_groups,
             bundler_require_all: scan_results.bundler_require_all,
@@ -97,6 +102,9 @@ fn build_gem_result(gem_entry: &GemEntry, meta: &GemMeta, indexes: &MatchIndexes
             let prefix = format!("{}/", req_path);
             for (req_name, files) in entries {
                 if req_name.starts_with(&prefix) {
+                    if *req_name != req_path && indexes.declared_require_paths.contains(*req_name) {
+                        continue;
+                    }
                     for f in *files {
                         evidence.push(Evidence::Require {
                             path: req_name.to_string(),
@@ -167,9 +175,7 @@ fn build_gem_result(gem_entry: &GemEntry, meta: &GemMeta, indexes: &MatchIndexes
 
     let status = if !found_files.is_empty() {
         GemStatus::Used
-    } else if gem_entry.require_false {
-        GemStatus::RequireFalse
-    } else if is_bundler_required {
+    } else if is_bundler_required && !gem_entry.require_false {
         evidence.push(Evidence::BundlerRequire);
         GemStatus::BundlerRequired
     } else {
@@ -197,7 +203,7 @@ pub fn match_gem_subset(
     indices: &[usize],
     scan_results: &ScanResults,
 ) -> HashMap<String, GemResult> {
-    let indexes = MatchIndexes::build(scan_results);
+    let indexes = MatchIndexes::build(gems, scan_results);
 
     // Precompute per-gem lowercased forms once (avoids repeated allocations
     // inside the parallel match loop and per inner pattern iteration).
@@ -284,6 +290,18 @@ mod tests {
         let scan = scan(&[("active_support/core_ext", "app.rb")], &[]);
         let results = match_gem_usage(&gems, &scan);
         assert_eq!(results["activesupport"].status, GemStatus::Used);
+    }
+
+    #[test]
+    fn exact_require_owner_wins_over_parent_prefix() {
+        let gems = vec![
+            gem("base", &["foo"], &[]),
+            gem("extension", &["foo/bar"], &[]),
+        ];
+        let scan = scan(&[("foo/bar", "app.rb")], &[]);
+        let results = match_gem_usage(&gems, &scan);
+        assert_eq!(results["base"].status, GemStatus::Unused);
+        assert_eq!(results["extension"].status, GemStatus::Used);
     }
 
     #[test]
@@ -389,7 +407,7 @@ mod tests {
         entry.require_false = true;
         let gems = vec![entry];
         let results = match_gem_usage(&gems, &scan(&[], &[]));
-        assert_eq!(results["bootsnap"].status, GemStatus::RequireFalse);
+        assert_eq!(results["bootsnap"].status, GemStatus::Unused);
     }
 
     #[test]

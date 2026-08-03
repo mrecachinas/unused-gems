@@ -11,7 +11,9 @@ fn create_project(files: usize, gems: usize) -> TempDir {
     let mut lock_specs = String::new();
 
     for i in 0..gems {
-        gemfile.push_str(&format!("gem \"bench-gem-{i}\"\n"));
+        gemfile.push_str(&format!(
+            "gem \"bench-gem-{i}\", require: \"bench_gem_{i}\"\n"
+        ));
         lock_specs.push_str(&format!("    bench-gem-{i} (1.0.0)\n"));
     }
 

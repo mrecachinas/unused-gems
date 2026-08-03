@@ -4,7 +4,7 @@ High-performance scanner for unused gems in Ruby projects, built in Rust with [r
 
 ## Features
 
-- **Gemfile parsing** via ruby-prism AST — handles `gem`, `group`, `require:`, `path:`, `git:`, `gemspec` directives
+- **Gemfile parsing** via ruby-prism AST — handles `gem`, `group`, `platforms`, `require:`, `path:`, `git:`, `eval_gemfile` and `gemspec` directives
 - **Parallel source scanning** with rayon — scans Ruby/ERB/HAML/YAML files concurrently
 - **Gem introspection** — discovers actual require paths and module names from installed gems
 - **Script/CI detection** — finds gem usage in Makefiles, Dockerfiles, CI configs
@@ -78,9 +78,14 @@ unused-gems -o github /path/to/project
 unused-gems -o json /path/to/project > baseline.json
 # ... later ...
 unused-gems --diff baseline.json /path/to/project
+# Fail only when a gem becomes unused or a newly added gem is unused
+unused-gems --diff baseline.json --fail-on new /path/to/project
 
 # Skip additional directories
 unused-gems --skip-dirs tmp,cache /path/to/project
+
+# Treat the test group as active for Bundler.require(*Rails.groups)
+unused-gems --rails-env test /path/to/project
 
 # Scan a monorepo with multiple Gemfiles
 unused-gems --gemfile engines/a/Gemfile --gemfile engines/b/Gemfile /path/to/project
@@ -90,7 +95,7 @@ unused-gems --gemfile engines/a/Gemfile --gemfile engines/b/Gemfile /path/to/pro
 
 ```
 -o, --output <FORMAT>     Output format: text (default), json, github
--j, --jobs <N>            Number of parallel scanning threads (default: CPU count)
+-j, --jobs <N>            Number of parallel scanning threads (default walker cap: 4)
 -v, --verbose             Show file locations and require paths
 -q, --quiet               Suppress progress messages
     --no-cache            Disable file scan cache
@@ -98,8 +103,33 @@ unused-gems --gemfile engines/a/Gemfile --gemfile engines/b/Gemfile /path/to/pro
     --gemfile <PATH>      Gemfile path to analyze; repeat for monorepos
     --diff <BASELINE>     Compare against previous JSON output
     --skip-dirs <DIRS>    Additional directories to skip (comma-separated)
+    --rails-env <ENV>      Rails environment group considered active
 -h, --help                Print help
 ```
+
+## Gemfile semantics
+
+`eval_gemfile` is evaluated inline at its declaration site, so gems appear in source
+order and inherit the enclosing `group`/`platforms` context. Relative paths resolve
+against the Gemfile that declared them, and `File.expand_path`, `File.join`,
+`File.dirname`, `__FILE__` and `__dir__` are evaluated with Ruby semantics (note that
+`File.expand_path(p, __FILE__)` treats the Gemfile path itself as the base directory,
+and `File.join('a', '/b')` is `a/b`). A Gemfile evaluated more than once contributes its
+declarations under each context — including through symlink or `..` aliases of the same
+file — while cycles are broken by tracking only the active evaluation stack. Unsupported
+or unresolvable expressions produce a warning instead of being silently dropped.
+
+`gemspec` honors `path:`, `name:` and `development_group:`. It looks only at the
+immediate directory for `*.gemspec` (plus a bare `.gemspec`), matches `name:` against the
+parsed `spec.name` rather than the file name, selects deterministically, and warns when
+zero gemspecs are found or when the candidates cover more than one `[spec.name,
+spec.version]` pair (matching Bundler's grouping — two gemspecs for the same gem at
+different versions stay ambiguous, while equal versions collapse to one candidate). The gemspec's own `spec.name` is registered as
+a default-group path source; its **development** dependencies are added to the configured
+development group, while runtime dependencies are left to Bundler's transitive resolution
+rather than being reported as top-level gems. Matching Bundler, an explicit Gemfile
+declaration always wins over a duplicate gemspec development dependency, in either
+declaration order.
 
 ## Architecture
 
@@ -143,7 +173,7 @@ Adapter entries map the value used in Rails config to the gem that provides it.
 Built with Rust for maximum performance:
 - **ruby-prism** for accurate Gemfile AST parsing (same parser as CRuby 3.3+)
 - **Hand-rolled byte scanners** with SIMD-accelerated `memchr` — no per-file regex overhead
-- **Parallel file walking** via `ignore` crate (respects `.gitignore`)
+- **Parallel file walking** via `ignore` crate (scans generated sources even when gitignored)
 - **Bincode file cache** — unchanged files skip scanning on repeat runs
 - **Zero-alloc hot path** — extension checks, comment detection all avoid heap allocation
 - **vendor/cache support** — extracts gemspec metadata from packed `.gem` tarballs
@@ -160,4 +190,4 @@ cargo bench -- --baseline main
 ```
 
 It covers cold and warm end-to-end runs, source-tree scaling,
-comment/heredoc-heavy Ruby, and ignore-heavy directory trees.
+comment/heredoc-heavy Ruby, and gitignored generated-source trees.
