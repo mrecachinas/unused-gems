@@ -99,12 +99,9 @@ pub fn find_gem_paths(project_dir: &Path) -> Vec<PathBuf> {
         }
     }
 
-    // 2. GEM_PATH env (colon-separated) — often set by rbenv/rvm init scripts
+    // 2. GEM_PATH env — often set by rbenv/rvm init scripts
     if let Ok(gem_path) = std::env::var("GEM_PATH") {
-        let paths: Vec<PathBuf> = gem_path
-            .split(':')
-            .filter(|s| !s.is_empty())
-            .map(PathBuf::from)
+        let paths: Vec<PathBuf> = std::env::split_paths(&gem_path)
             .filter(|p| p.is_dir())
             .collect();
         if !paths.is_empty() {
