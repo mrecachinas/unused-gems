@@ -5,7 +5,7 @@ use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Serialize};
 
-const CACHE_VERSION: u32 = 6; // bumped: use filesystem change time for cache identity
+const CACHE_VERSION: u32 = 7; // bumped: lexical masking changes source findings
 const CACHE_FILE: &str = ".unused_gems_cache";
 
 #[derive(Serialize, Deserialize)]

@@ -22,9 +22,7 @@ static INHERIT_GEM_KEY_RE: Lazy<BytesRegex> =
     Lazy::new(|| BytesRegex::new(r"(?m)^\s+([\w-]+):").unwrap());
 
 // Precompiled byte finders (avoid re-building per call)
-static NEWLINE_BEGIN_FINDER: Lazy<memmem::Finder<'static>> =
-    Lazy::new(|| memmem::Finder::new(b"\n=begin"));
-static BEGIN_FINDER: Lazy<memmem::Finder<'static>> = Lazy::new(|| memmem::Finder::new(b"=begin"));
+#[cfg(test)]
 static HEREDOC_FINDER: Lazy<memmem::Finder<'static>> = Lazy::new(|| memmem::Finder::new(b"<<"));
 static REQUIRE_FINDER: Lazy<memmem::Finder<'static>> =
     Lazy::new(|| memmem::Finder::new(b"require"));
@@ -46,6 +44,14 @@ enum LineCommentKind {
     Slash,
     /// `-#` — Haml line comments.
     DashHash,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum TemplateKind {
+    None,
+    Erb,
+    Haml,
+    Slim,
 }
 
 #[cfg(test)]
@@ -162,9 +168,11 @@ fn has_inline_comment_before(bytes: &[u8], from: usize, pos: usize) -> bool {
 
 /// Precompute byte ranges covered by =begin/=end block comments and heredocs.
 /// Returns sorted Vec of (start, end) byte offsets.
+#[cfg(test)]
 fn build_block_comment_ranges(bytes: &[u8]) -> Vec<(usize, usize)> {
-    // Short-circuit: if neither =begin nor << appear, no block ranges possible
-    if BEGIN_FINDER.find(bytes).is_none() && memmem::find(bytes, b"<<").is_none() {
+    // This helper is retained for focused range tests. The production mask is
+    // built by the lexical pass below so quoted/commented openers are ignored.
+    if memmem::find(bytes, b"=begin").is_none() && memmem::find(bytes, b"<<").is_none() {
         return Vec::new();
     }
 
@@ -188,8 +196,8 @@ fn build_block_comment_ranges(bytes: &[u8]) -> Vec<(usize, usize)> {
             return vec![(0, bytes.len())];
         }
     }
-    while let Some(idx) = NEWLINE_BEGIN_FINDER.find(&bytes[pos..]) {
-        let abs = pos + idx + 1; // skip the \n, point at =begin
+    while let Some(idx) = memmem::find(&bytes[pos..], b"\n=begin") {
+        let abs = pos + idx + 1;
         let after_begin = abs + 6;
         // Check it's a full line (next char is whitespace or newline)
         if after_begin < bytes.len()
@@ -267,11 +275,6 @@ fn build_block_comment_ranges(bytes: &[u8]) -> Vec<(usize, usize)> {
                 continue;
             }
         }
-        // Delimiter must be at least 2 chars to avoid false matches
-        if delim.len() < 2 {
-            pos = abs + 1;
-            continue;
-        }
         // Find the start of heredoc content (next line)
         while i < bytes.len() && bytes[i] != b'\n' {
             i += 1;
@@ -322,55 +325,471 @@ fn build_block_comment_ranges(bytes: &[u8]) -> Vec<(usize, usize)> {
     ranges
 }
 
-fn mask_percent_q_strings(bytes: &[u8], mask: &mut [bool]) {
-    let mut i = 0;
-    while i + 2 < bytes.len() {
-        if mask[i]
-            || bytes[i] != b'%'
-            || (bytes[i + 1] != b'q' && bytes[i + 1] != b'Q')
-            || (i > 0 && is_word_char(bytes[i - 1]))
-        {
-            i += 1;
+#[inline]
+fn set_mask(mask: &mut [bool], start: usize, end: usize, value: bool) {
+    let end = end.min(mask.len());
+    for byte in mask.iter_mut().take(end).skip(start) {
+        *byte = value;
+    }
+}
+
+fn find_interpolation_end(bytes: &[u8], mut i: usize, end: usize) -> Option<usize> {
+    let mut depth = 1usize;
+    while i < end {
+        match bytes[i] {
+            b'\\' => i = (i + 2).min(end),
+            b'\'' | b'"' => {
+                let quote = bytes[i];
+                i += 1;
+                while i < end {
+                    if bytes[i] == b'\\' {
+                        i = (i + 2).min(end);
+                    } else if bytes[i] == quote {
+                        i += 1;
+                        break;
+                    } else {
+                        i += 1;
+                    }
+                }
+            }
+            b'{' => {
+                depth += 1;
+                i += 1;
+            }
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+    None
+}
+
+fn expose_interpolations(bytes: &[u8], mask: &mut [bool], start: usize, end: usize) {
+    let mut i = start;
+    while i + 1 < end {
+        if bytes[i] == b'\\' {
+            i = (i + 2).min(end);
             continue;
         }
+        if bytes[i] == b'#' && bytes[i + 1] == b'{' {
+            if let Some(close) = find_interpolation_end(bytes, i + 2, end) {
+                set_mask(mask, i + 2, close, false);
+                mask_ruby_range(bytes, mask, i + 2, close);
+                i = close + 1;
+                continue;
+            }
+        }
+        i += 1;
+    }
+}
 
-        let (open, close) = match bytes[i + 2] {
-            b'{' => (b'{', b'}'),
-            b'(' => (b'(', b')'),
-            b'[' => (b'[', b']'),
-            b'<' => (b'<', b'>'),
-            _ => {
+fn apply_template_mask(bytes: &[u8], mask: &mut [bool], kind: TemplateKind) {
+    match kind {
+        TemplateKind::None => {}
+        TemplateKind::Erb => {
+            mask.fill(true);
+            let mut pos = 0;
+            while let Some(idx) = memmem::find(&bytes[pos..], b"<%") {
+                let open = pos + idx;
+                if bytes.get(open + 2) == Some(&b'%') {
+                    pos = open + 3;
+                    continue;
+                }
+                let Some(close_rel) = memmem::find(&bytes[open + 2..], b"%>") else {
+                    break;
+                };
+                let close = open + 2 + close_rel;
+                let mut code_start = open + 2;
+                if bytes.get(code_start) == Some(&b'#') {
+                    pos = close + 2;
+                    continue;
+                }
+                if matches!(bytes.get(code_start), Some(b'=') | Some(b'-')) {
+                    code_start += 1;
+                }
+                set_mask(mask, code_start, close, false);
+                pos = close + 2;
+            }
+        }
+        TemplateKind::Haml | TemplateKind::Slim => {
+            mask.fill(true);
+            let mut line_start = 0;
+            while line_start < bytes.len() {
+                let eol = memchr::memchr(b'\n', &bytes[line_start..])
+                    .map(|n| line_start + n)
+                    .unwrap_or(bytes.len());
+                let mut ws = line_start;
+                while ws < eol && matches!(bytes[ws], b' ' | b'\t') {
+                    ws += 1;
+                }
+                let is_haml_comment = kind == TemplateKind::Haml
+                    && ws + 1 < eol
+                    && bytes[ws] == b'-'
+                    && bytes[ws + 1] == b'#';
+                let is_slim_comment = kind == TemplateKind::Slim && ws < eol && bytes[ws] == b'/';
+                if !is_haml_comment && !is_slim_comment {
+                    let executable = match kind {
+                        TemplateKind::Haml => ws < eol && matches!(bytes[ws], b'=' | b'-' | b'~'),
+                        TemplateKind::Slim => ws < eol && matches!(bytes[ws], b'=' | b'-'),
+                        _ => false,
+                    };
+                    if executable {
+                        set_mask(mask, ws + 1, eol, false);
+                    }
+                    let mut i = line_start;
+                    while i + 1 < eol {
+                        if bytes[i] == b'\\' {
+                            i = (i + 2).min(eol);
+                            continue;
+                        }
+                        if bytes[i] == b'#' && bytes[i + 1] == b'{' {
+                            if let Some(close) = find_interpolation_end(bytes, i + 2, eol) {
+                                set_mask(mask, i + 2, close, false);
+                                i = close + 1;
+                                continue;
+                            }
+                        }
+                        i += 1;
+                    }
+                }
+                line_start = if eol < bytes.len() { eol + 1 } else { eol };
+            }
+        }
+    }
+}
+
+fn previous_significant(bytes: &[u8], mask: &[bool], start: usize, mut i: usize) -> Option<usize> {
+    while i > start {
+        i -= 1;
+        if mask[i] {
+            return None;
+        }
+        if bytes[i] == b'\n' {
+            return None;
+        }
+        if !bytes[i].is_ascii_whitespace() {
+            return Some(i);
+        }
+    }
+    None
+}
+
+fn is_regex_start(bytes: &[u8], mask: &[bool], start: usize, i: usize) -> bool {
+    let Some(prev) = previous_significant(bytes, mask, start, i) else {
+        return true;
+    };
+    if matches!(
+        bytes[prev],
+        b'=' | b'('
+            | b'['
+            | b'{'
+            | b','
+            | b';'
+            | b':'
+            | b'!'
+            | b'?'
+            | b'~'
+            | b'&'
+            | b'|'
+            | b'+'
+            | b'-'
+            | b'*'
+            | b'%'
+            | b'^'
+            | b'<'
+            | b'>'
+    ) {
+        return true;
+    }
+    if !is_word_char(bytes[prev]) {
+        return false;
+    }
+    let mut word_start = prev;
+    while word_start > start && is_word_char(bytes[word_start - 1]) {
+        word_start -= 1;
+    }
+    if matches!(
+        &bytes[word_start..=prev],
+        b"if"
+            | b"unless"
+            | b"while"
+            | b"until"
+            | b"when"
+            | b"return"
+            | b"yield"
+            | b"and"
+            | b"or"
+            | b"not"
+            | b"then"
+            | b"do"
+            | b"case"
+    ) {
+        return true;
+    }
+    prev + 1 < i
+        && i + 1 < bytes.len()
+        && bytes[prev].is_ascii_lowercase()
+        && !bytes[i + 1].is_ascii_whitespace()
+}
+
+fn find_delimited_end(
+    bytes: &[u8],
+    mut i: usize,
+    end: usize,
+    open: u8,
+    close: u8,
+    regex: bool,
+) -> Option<usize> {
+    let mut depth = 1usize;
+    let mut in_class = false;
+    while i < end {
+        if bytes[i] == b'\\' {
+            i = (i + 2).min(end);
+            continue;
+        }
+        if i + 1 < end && bytes[i] == b'#' && bytes[i + 1] == b'{' {
+            if let Some(interpolation_end) = find_interpolation_end(bytes, i + 2, end) {
+                i = interpolation_end + 1;
+                continue;
+            }
+        }
+        if regex {
+            if bytes[i] == b'[' {
+                in_class = true;
+            } else if bytes[i] == b']' {
+                in_class = false;
+            }
+            if in_class {
                 i += 1;
                 continue;
             }
-        };
+        }
+        if open != close && bytes[i] == open {
+            depth += 1;
+        } else if bytes[i] == close {
+            depth -= 1;
+            if depth == 0 {
+                return Some(i);
+            }
+        }
+        i += 1;
+    }
+    None
+}
 
-        let content_start = i + 3;
-        let mut depth = 1usize;
-        let mut k = content_start;
-        while k < bytes.len() {
-            if bytes[k] == b'\\' {
-                k = (k + 2).min(bytes.len());
+fn parse_heredoc(bytes: &[u8], abs: usize, end: usize) -> Option<(usize, usize, bool)> {
+    if abs > 0
+        && !matches!(
+            bytes[abs - 1],
+            b' ' | b'\t' | b'\n' | b'\r' | b'=' | b'(' | b',' | b'[' | b'{' | b';'
+        )
+    {
+        return None;
+    }
+    let mut i = abs + 2;
+    if i < end && matches!(bytes[i], b'~' | b'-') {
+        i += 1;
+    }
+    let quote = if i < end && matches!(bytes[i], b'\'' | b'"') {
+        let quote = bytes[i];
+        i += 1;
+        Some(quote)
+    } else {
+        None
+    };
+    let delim_start = i;
+    while i < end && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+        i += 1;
+    }
+    if i == delim_start {
+        return None;
+    }
+    let delim_end = i;
+    if let Some(quote) = quote {
+        if bytes.get(i) != Some(&quote) {
+            return None;
+        }
+        i += 1;
+    }
+    let line_end = memchr::memchr(b'\n', &bytes[i..end]).map(|n| i + n)?;
+    let body_start = line_end + 1;
+    let delim = &bytes[delim_start..delim_end];
+    let mut line_start = body_start;
+    while line_start < end {
+        let eol = memchr::memchr(b'\n', &bytes[line_start..end])
+            .map(|n| line_start + n)
+            .unwrap_or(end);
+        let mut content = line_start;
+        while content < eol && matches!(bytes[content], b' ' | b'\t') {
+            content += 1;
+        }
+        if content + delim.len() == eol && &bytes[content..eol] == delim {
+            return Some((delim_end, eol, quote != Some(b'\'')));
+        }
+        line_start = if eol < end { eol + 1 } else { eol };
+    }
+    None
+}
+
+fn mask_ruby_range(bytes: &[u8], mask: &mut [bool], start: usize, end: usize) {
+    let mut i = start;
+    while i < end {
+        if mask[i] {
+            i += 1;
+            continue;
+        }
+        let line_start = i == 0 || bytes[i - 1] == b'\n';
+        if line_start && bytes[i..end].starts_with(b"=begin") {
+            let after = i + 6;
+            if after == end || bytes[after].is_ascii_whitespace() {
+                let block_end = memmem::find(&bytes[after..end], b"\n=end")
+                    .map(|n| {
+                        let end_marker = after + n + 5;
+                        memchr::memchr(b'\n', &bytes[end_marker..end])
+                            .map(|tail| end_marker + tail)
+                            .unwrap_or(end)
+                    })
+                    .unwrap_or(end);
+                set_mask(mask, i, block_end, true);
+                i = block_end;
                 continue;
             }
-            if bytes[k] == open {
-                depth += 1;
-            } else if bytes[k] == close {
-                depth -= 1;
-                if depth == 0 {
-                    for b in mask.iter_mut().take(k).skip(content_start) {
-                        *b = true;
+        }
+        match bytes[i] {
+            b'#' => {
+                let eol = memchr::memchr(b'\n', &bytes[i..end])
+                    .map(|n| i + n)
+                    .unwrap_or(end);
+                set_mask(mask, i, eol, true);
+                i = eol;
+            }
+            b'\'' | b'"' => {
+                let quote = bytes[i];
+                let content_start = i + 1;
+                let mut close = content_start;
+                while close < end {
+                    if bytes[close] == b'\\' {
+                        close = (close + 2).min(end);
+                    } else if quote == b'"'
+                        && close + 1 < end
+                        && bytes[close] == b'#'
+                        && bytes[close + 1] == b'{'
+                    {
+                        close = find_interpolation_end(bytes, close + 2, end)
+                            .map(|interpolation_end| interpolation_end + 1)
+                            .unwrap_or(end);
+                    } else if bytes[close] == quote {
+                        break;
+                    } else {
+                        close += 1;
                     }
-                    i = k + 1;
-                    break;
+                }
+                set_mask(mask, content_start, close, true);
+                if quote == b'"' {
+                    expose_interpolations(bytes, mask, content_start, close);
+                }
+                i = if close < end { close + 1 } else { end };
+            }
+            b'%' if i + 2 < end
+                && matches!(bytes[i + 1], b'q' | b'Q' | b'r')
+                && (i == start || mask[i - 1] || !is_word_char(bytes[i - 1])) =>
+            {
+                let (open, close) = match bytes[i + 2] {
+                    b'{' => (b'{', b'}'),
+                    b'(' => (b'(', b')'),
+                    b'[' => (b'[', b']'),
+                    b'<' => (b'<', b'>'),
+                    delim if !delim.is_ascii_alphanumeric() && !delim.is_ascii_whitespace() => {
+                        (delim, delim)
+                    }
+                    _ => {
+                        i += 1;
+                        continue;
+                    }
+                };
+                let content_start = i + 3;
+                if let Some(literal_end) =
+                    find_delimited_end(bytes, content_start, end, open, close, bytes[i + 1] == b'r')
+                {
+                    set_mask(mask, content_start, literal_end, true);
+                    if bytes[i + 1] != b'q' {
+                        expose_interpolations(bytes, mask, content_start, literal_end);
+                    }
+                    i = literal_end + 1;
+                } else {
+                    set_mask(mask, content_start, end, true);
+                    i = end;
                 }
             }
-            k += 1;
+            b'/' if is_regex_start(bytes, mask, start, i) => {
+                if let Some(regex_end) = find_delimited_end(bytes, i + 1, end, b'/', b'/', true) {
+                    set_mask(mask, i + 1, regex_end, true);
+                    expose_interpolations(bytes, mask, i + 1, regex_end);
+                    i = regex_end + 1;
+                } else {
+                    i += 1;
+                }
+            }
+            b'<' if i + 1 < end && bytes[i + 1] == b'<' => {
+                if let Some((delim_end, heredoc_end, interpolated)) = parse_heredoc(bytes, i, end) {
+                    let line_end = memchr::memchr(b'\n', &bytes[delim_end..end])
+                        .map(|n| delim_end + n)
+                        .unwrap_or(end);
+                    let body_start = (line_end + 1).min(end);
+                    set_mask(mask, i + 2, delim_end, true);
+                    set_mask(mask, body_start, heredoc_end, true);
+                    if interpolated {
+                        expose_interpolations(bytes, mask, body_start, heredoc_end);
+                    }
+                }
+                i += 2;
+            }
+            _ => i += 1,
         }
+    }
+}
 
-        if depth != 0 {
-            i += 1;
+fn mask_non_ruby(bytes: &[u8], mask: &mut [bool], line_kind: LineCommentKind) {
+    let mut line_start = 0;
+    while line_start < bytes.len() {
+        let eol = memchr::memchr(b'\n', &bytes[line_start..])
+            .map(|n| line_start + n)
+            .unwrap_or(bytes.len());
+        let mut ws = line_start;
+        while ws < eol && matches!(bytes[ws], b' ' | b'\t') {
+            ws += 1;
         }
+        let comment = match line_kind {
+            LineCommentKind::Hash => ws < eol && bytes[ws] == b'#',
+            LineCommentKind::Slash => ws < eol && bytes[ws] == b'/',
+            LineCommentKind::DashHash => ws + 1 < eol && bytes[ws] == b'-' && bytes[ws + 1] == b'#',
+        };
+        if comment {
+            set_mask(mask, ws, eol, true);
+        } else if line_kind == LineCommentKind::Hash {
+            let mut i = line_start;
+            while i < eol {
+                if matches!(bytes[i], b'\'' | b'"') {
+                    let quote = bytes[i];
+                    let start = i + 1;
+                    i = start;
+                    while i < eol && bytes[i] != quote {
+                        i += if bytes[i] == b'\\' { 2 } else { 1 };
+                    }
+                    set_mask(mask, start, i.min(eol), true);
+                } else if bytes[i] == b'#' {
+                    set_mask(mask, i, eol, true);
+                    break;
+                }
+                i += 1;
+            }
+        }
+        line_start = if eol < bytes.len() { eol + 1 } else { eol };
     }
 }
 
@@ -388,7 +807,7 @@ fn is_commented(bytes: &[u8], pos: usize, block_ranges: &[(usize, usize)]) -> bo
     is_line_comment(bytes, pos) || is_in_block_comment(pos, block_ranges)
 }
 
-/// Build a unified per-byte "skip mask" in a single linear pass.
+/// Build a unified per-byte skip mask for tests and non-template callers.
 ///
 /// `mask[i] == true` means position `i` should be ignored by all token-level
 /// scanners. The mask covers:
@@ -407,99 +826,24 @@ fn is_commented(bytes: &[u8], pos: usize, block_ranges: &[(usize, usize)]) -> bo
 /// String literal interiors are masked regardless of `line_kind` so that fix
 /// #3 (`raise "Please require 'oauth2'"` not detected as a require) holds for
 /// both Ruby and the templating dialects.
+#[cfg(test)]
 fn build_skip_mask(bytes: &[u8], is_ruby: bool, line_kind: LineCommentKind) -> Vec<bool> {
+    build_skip_mask_for_template(bytes, is_ruby, line_kind, TemplateKind::None)
+}
+
+fn build_skip_mask_for_template(
+    bytes: &[u8],
+    is_ruby: bool,
+    line_kind: LineCommentKind,
+    template_kind: TemplateKind,
+) -> Vec<bool> {
     let mut mask = vec![false; bytes.len()];
-
-    // Pass 1: heredoc + =begin/=end ranges (Ruby only).
+    apply_template_mask(bytes, &mut mask, template_kind);
     if is_ruby {
-        let ranges = build_block_comment_ranges(bytes);
-        for (s, e) in ranges {
-            let e = e.min(bytes.len());
-            for b in mask.iter_mut().take(e).skip(s) {
-                *b = true;
-            }
-        }
+        mask_ruby_range(bytes, &mut mask, 0, bytes.len());
+    } else {
+        mask_non_ruby(bytes, &mut mask, line_kind);
     }
-
-    // Pass 2: line-by-line walk for line comments, inline comments, strings.
-    let len = bytes.len();
-    let mut i = 0;
-    while i < len {
-        let line_start = i;
-        // Find end of line.
-        let mut eol = i;
-        while eol < len && bytes[eol] != b'\n' {
-            eol += 1;
-        }
-
-        // Find first non-whitespace position on the line.
-        let mut ws = line_start;
-        while ws < eol && (bytes[ws] == b' ' || bytes[ws] == b'\t') {
-            ws += 1;
-        }
-
-        // Whole-line comment detection based on line_kind.
-        let line_is_comment = match line_kind {
-            LineCommentKind::Hash => ws < eol && bytes[ws] == b'#',
-            LineCommentKind::Slash => ws < eol && bytes[ws] == b'/',
-            LineCommentKind::DashHash => ws + 1 < eol && bytes[ws] == b'-' && bytes[ws + 1] == b'#',
-        };
-
-        if line_is_comment {
-            for b in mask.iter_mut().take(eol).skip(ws) {
-                *b = true;
-            }
-        } else {
-            // Walk for string state and (for Hash kind) inline `#` comments.
-            // Skip positions already masked by heredoc/=begin pass.
-            let mut j = line_start;
-            while j < eol {
-                if mask[j] {
-                    j += 1;
-                    continue;
-                }
-                let b = bytes[j];
-                if b == b'\'' || b == b'"' {
-                    let quote = b;
-                    let str_content_start = j + 1;
-                    let mut k = str_content_start;
-                    while k < eol {
-                        if bytes[k] == b'\\' && k + 1 < eol {
-                            k += 2;
-                            continue;
-                        }
-                        if bytes[k] == quote {
-                            break;
-                        }
-                        k += 1;
-                    }
-                    // Mask string interior (NOT the surrounding quotes — extract_quoted
-                    // and similar consumers expect the quote chars to remain visible).
-                    let str_end = k.min(eol);
-                    for b in mask.iter_mut().take(str_end).skip(str_content_start) {
-                        *b = true;
-                    }
-                    j = if k < eol { k + 1 } else { eol };
-                    continue;
-                }
-                // Inline `#` only counts as a comment for Hash kind.
-                if matches!(line_kind, LineCommentKind::Hash) && b == b'#' {
-                    for b in mask.iter_mut().take(eol).skip(j) {
-                        *b = true;
-                    }
-                    break;
-                }
-                j += 1;
-            }
-        }
-
-        i = if eol < len { eol + 1 } else { eol };
-    }
-
-    if is_ruby {
-        mask_percent_q_strings(bytes, &mut mask);
-    }
-
     mask
 }
 
@@ -1262,8 +1606,8 @@ type ScriptFileList = Vec<(String, Vec<u8>)>;
 type ModuleMap = Vec<HashMap<String, HashSet<Arc<str>>>>;
 
 /// Default walker thread count. Conservative cap of 4 chosen because raising
-/// it globally regresses warm-cache and ignore-heavy workloads even though it
-/// helps large cold scans (see issue #13).
+/// it globally regresses warm-cache and large generated-source workloads even
+/// though it helps large cold scans (see issue #13).
 pub fn default_walker_threads() -> usize {
     rayon::current_num_threads().clamp(1, 4)
 }
@@ -1312,7 +1656,7 @@ pub fn scan_source_tree_with_threads_and_explicit_skips(
     builder
         .threads(walker_threads)
         .standard_filters(false)
-        .git_ignore(true)
+        .git_ignore(false)
         .git_global(false)
         .git_exclude(false)
         .follow_links(false)
@@ -1695,7 +2039,9 @@ fn scan_file_bytes(
     let rel_path_arc: Arc<str> = Arc::from(rel_path.as_str());
 
     let full_path = Path::new(path);
-    let (is_ruby, is_yaml, is_slim, is_haml) = classify_file(full_path);
+    let (is_ruby, is_yaml, template_kind) = classify_file(full_path);
+    let is_slim = template_kind == TemplateKind::Slim;
+    let is_haml = template_kind == TemplateKind::Haml;
 
     // Fix #4: Slim line comments use `/`, Haml line comments use `-#`.
     // Other supported file types (Ruby, YAML, ERB, shell etc.) use `#`.
@@ -1715,7 +2061,12 @@ fn scan_file_bytes(
     // YAML does not use module scanning, so files without Ruby scan tokens can
     // skip the full-size comment/string mask and all four Ruby token scanners.
     let mask = if !is_yaml || has_ruby_scan_tokens {
-        build_skip_mask(bytes, is_ruby, line_kind)
+        build_skip_mask_for_template(
+            bytes,
+            is_ruby || template_kind != TemplateKind::None,
+            line_kind,
+            template_kind,
+        )
     } else {
         Vec::new()
     };
@@ -1787,15 +2138,15 @@ fn scan_file_bytes(
     })
 }
 
-/// Classify a path into (is_ruby, is_yaml, is_slim, is_haml). Single pass.
-fn classify_file(full_path: &Path) -> (bool, bool, bool, bool) {
+/// Classify a path into Ruby, YAML, and template dialects in one pass.
+fn classify_file(full_path: &Path) -> (bool, bool, TemplateKind) {
     if let Some(ext) = full_path.extension() {
         let ext_bytes = ext.as_encoded_bytes();
         match ext_bytes.len() {
             2 => {
                 let l = [ext_bytes[0] | 0x20, ext_bytes[1] | 0x20];
                 let is_ruby = matches!(&l, b"rb" | b"ru");
-                return (is_ruby, false, false, false);
+                return (is_ruby, false, TemplateKind::None);
             }
             3 => {
                 let l = [
@@ -1804,7 +2155,12 @@ fn classify_file(full_path: &Path) -> (bool, bool, bool, bool) {
                     ext_bytes[2] | 0x20,
                 ];
                 let is_yaml = &l == b"yml";
-                return (false, is_yaml, false, false);
+                let template = if &l == b"erb" {
+                    TemplateKind::Erb
+                } else {
+                    TemplateKind::None
+                };
+                return (false, is_yaml, template);
             }
             4 => {
                 let l = [
@@ -1814,10 +2170,15 @@ fn classify_file(full_path: &Path) -> (bool, bool, bool, bool) {
                     ext_bytes[3] | 0x20,
                 ];
                 let is_yaml = &l == b"yaml";
-                let is_slim = &l == b"slim";
-                let is_haml = &l == b"haml";
                 let is_ruby = matches!(&l, b"rake" | b"rabl" | b"thor");
-                return (is_ruby, is_yaml, is_slim, is_haml);
+                let template = if &l == b"slim" {
+                    TemplateKind::Slim
+                } else if &l == b"haml" {
+                    TemplateKind::Haml
+                } else {
+                    TemplateKind::None
+                };
+                return (is_ruby, is_yaml, template);
             }
             7 => {
                 // gemspec | builder
@@ -1826,7 +2187,7 @@ fn classify_file(full_path: &Path) -> (bool, bool, bool, bool) {
                     l[i] = b | 0x20;
                 }
                 let is_ruby = &l == b"gemspec" || &l == b"builder";
-                return (is_ruby, false, false, false);
+                return (is_ruby, false, TemplateKind::None);
             }
             8 => {
                 // jbuilder
@@ -1835,7 +2196,7 @@ fn classify_file(full_path: &Path) -> (bool, bool, bool, bool) {
                     l[i] = b | 0x20;
                 }
                 let is_ruby = &l == b"jbuilder";
-                return (is_ruby, false, false, false);
+                return (is_ruby, false, TemplateKind::None);
             }
             _ => {}
         }
@@ -1848,7 +2209,7 @@ fn classify_file(full_path: &Path) -> (bool, bool, bool, bool) {
     let is_ruby = SCANNABLE_FILENAMES
         .iter()
         .any(|f| f.as_bytes() == name_bytes);
-    (is_ruby, false, false, false)
+    (is_ruby, false, TemplateKind::None)
 }
 
 #[cfg(test)]
@@ -2053,6 +2414,99 @@ mod tests {
             modules.contains_key("MyRealModule"),
             "MyRealModule outside heredoc should be found"
         );
+    }
+
+    #[test]
+    fn multiline_strings_mask_static_text_but_keep_interpolation_code() {
+        let input = b"single = 'StaticSingle\nrequire \"single_fake\"'\ndouble = \"StaticDouble\n#{require \"double_dynamic\"; InterpolatedModule}\"\nrequire 'real'\n";
+        let mask = build_skip_mask(input, true, LineCommentKind::Hash);
+        let mut requires = Vec::new();
+        scan_requires_filtered(input, &mask, &mut requires);
+        assert_eq!(requires, vec!["double_dynamic", "real"]);
+
+        let mut modules = HashMap::new();
+        let path: Arc<str> = Arc::from("test.rb");
+        scan_modules_filtered_into(input, &mask, &mut modules, &path);
+        assert!(!modules.contains_key("StaticSingle"));
+        assert!(!modules.contains_key("StaticDouble"));
+        assert!(modules.contains_key("InterpolatedModule"));
+    }
+
+    #[test]
+    fn regex_literals_mask_static_text_but_keep_interpolation_code() {
+        let input = b"slash = /StaticSlash\nrequire 'slash_fake'\n#{SlashInterpolation}/\npercent = %r{StaticPercent\nrequire 'percent_fake'\n#{PercentInterpolation}}\nrequire 'real'\n";
+        let mask = build_skip_mask(input, true, LineCommentKind::Hash);
+        let mut requires = Vec::new();
+        scan_requires_filtered(input, &mask, &mut requires);
+        assert_eq!(requires, vec!["real"]);
+
+        let mut modules = HashMap::new();
+        let path: Arc<str> = Arc::from("test.rb");
+        scan_modules_filtered_into(input, &mask, &mut modules, &path);
+        assert!(!modules.contains_key("StaticSlash"));
+        assert!(!modules.contains_key("StaticPercent"));
+        assert!(modules.contains_key("SlashInterpolation"));
+        assert!(modules.contains_key("PercentInterpolation"));
+    }
+
+    #[test]
+    fn heredoc_accepts_one_char_delimiter_and_keeps_interpolation_code() {
+        let input = b"doc = <<A\nStaticHeredoc require 'fake'\n#{require 'dynamic'; HeredocInterpolation}\nA\nrequire 'real'\n";
+        let mask = build_skip_mask(input, true, LineCommentKind::Hash);
+        let mut requires = Vec::new();
+        scan_requires_filtered(input, &mask, &mut requires);
+        assert_eq!(requires, vec!["dynamic", "real"]);
+
+        let mut modules = HashMap::new();
+        let path: Arc<str> = Arc::from("test.rb");
+        scan_modules_filtered_into(input, &mask, &mut modules, &path);
+        assert!(!modules.contains_key("StaticHeredoc"));
+        assert!(modules.contains_key("HeredocInterpolation"));
+    }
+
+    #[test]
+    fn quoted_heredoc_does_not_expose_interpolation() {
+        let input = b"doc = <<'A'\n#{require 'fake'; HiddenInterpolation}\nA\nrequire 'real'\n";
+        let mask = build_skip_mask(input, true, LineCommentKind::Hash);
+        let mut requires = Vec::new();
+        scan_requires_filtered(input, &mask, &mut requires);
+        assert_eq!(requires, vec!["real"]);
+
+        let mut modules = HashMap::new();
+        let path: Arc<str> = Arc::from("test.rb");
+        scan_modules_filtered_into(input, &mask, &mut modules, &path);
+        assert!(!modules.contains_key("HiddenInterpolation"));
+    }
+
+    #[test]
+    fn commented_and_string_heredoc_openers_are_inactive() {
+        let input = b"# ignored = <<COMMENTED\nrequire 'after_comment'\nCOMMENTED\ntext = \"prefix <<STRING\"\nrequire 'after_string'\nSTRING\nrequire 'real'\n";
+        let mask = build_skip_mask(input, true, LineCommentKind::Hash);
+        let mut requires = Vec::new();
+        scan_requires_filtered(input, &mask, &mut requires);
+        assert_eq!(requires, vec!["after_comment", "after_string", "real"]);
+    }
+
+    #[test]
+    fn division_operator_does_not_start_regex_masking() {
+        let input = b"ratio = Dividend / Divisor\nrequire 'real'\n";
+        let mask = build_skip_mask(input, true, LineCommentKind::Hash);
+        let mut modules = HashMap::new();
+        let path: Arc<str> = Arc::from("test.rb");
+        scan_modules_filtered_into(input, &mask, &mut modules, &path);
+        assert!(modules.contains_key("Dividend"));
+        assert!(modules.contains_key("Divisor"));
+    }
+
+    #[test]
+    fn command_argument_regex_is_masked() {
+        let input = b"puts /CommandRegexModule/\nRealModule.call\n";
+        let mask = build_skip_mask(input, true, LineCommentKind::Hash);
+        let mut modules = HashMap::new();
+        let path: Arc<str> = Arc::from("test.rb");
+        scan_modules_filtered_into(input, &mask, &mut modules, &path);
+        assert!(!modules.contains_key("CommandRegexModule"));
+        assert!(modules.contains_key("RealModule"));
     }
 
     // ── Non-Ruby comment filtering ──
@@ -2504,6 +2958,22 @@ mod tests {
         let (results, _) = scan_source_tree(dir.path(), &default_skip_dirs(), cache);
         assert!(results.requires.contains_key("visible"));
         assert!(!results.requires.contains_key("hidden"));
+    }
+
+    #[test]
+    fn scan_source_tree_scans_gitignored_ruby_sources() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("generated")).unwrap();
+        std::fs::write(dir.path().join(".gitignore"), "generated/\n").unwrap();
+        std::fs::write(
+            dir.path().join("generated/schema.rb"),
+            "require 'generated_source'\nGeneratedModel\n",
+        )
+        .unwrap();
+        let cache = std::sync::Arc::new(crate::cache::FileCache::disabled());
+        let (results, _) = scan_source_tree(dir.path(), &default_skip_dirs(), cache);
+        assert!(results.requires.contains_key("generated_source"));
+        assert!(results.modules.contains_key("GeneratedModel"));
     }
 
     #[test]
@@ -3013,6 +3483,49 @@ mod tests {
     }
 
     #[test]
+    fn templates_only_scan_executable_ruby_and_interpolations() {
+        let dir = tempfile::tempdir().unwrap();
+        let cases = [
+            (
+                "view.erb",
+                "StaticErb require 'static_erb'\n<% require 'erb_exec' %>\n<%= ErbExecModule %>\n<%# require 'erb_comment' ErbCommentModule %>\n",
+                "erb_exec",
+                "ErbExecModule",
+                "StaticErb",
+            ),
+            (
+                "view.haml",
+                "%p StaticHaml require 'static_haml'\n= require 'haml_exec'\n%p hello #{HamlInterpolation}\n- HamlLine.call\n",
+                "haml_exec",
+                "HamlInterpolation",
+                "StaticHaml",
+            ),
+            (
+                "view.slim",
+                "p StaticSlim require 'static_slim'\n= require 'slim_exec'\np hello #{SlimInterpolation}\n- SlimLine.call\n",
+                "slim_exec",
+                "SlimInterpolation",
+                "StaticSlim",
+            ),
+        ];
+
+        for (name, content, expected_require, expected_module, static_module) in cases {
+            let file = dir.path().join(name);
+            std::fs::write(&file, content).unwrap();
+            let mut modules = HashMap::new();
+            let result = scan_file(
+                file.to_str().unwrap(),
+                dir.path().to_str().unwrap(),
+                &mut modules,
+            )
+            .unwrap();
+            assert_eq!(result.requires, vec![expected_require], "{name}");
+            assert!(modules.contains_key(expected_module), "{name}");
+            assert!(!modules.contains_key(static_module), "{name}");
+        }
+    }
+
+    #[test]
     fn scan_file_gemspec() {
         let dir = tempfile::tempdir().unwrap();
         let f = dir.path().join("test.gemspec");
@@ -3100,8 +3613,7 @@ mod tests {
     fn heredoc_with_short_delimiter() {
         let input = b"x = <<A\ncontent\nA\n";
         let ranges = build_block_comment_ranges(input);
-        // Single-char delimiter is skipped (needs >=2 chars)
-        assert!(ranges.is_empty());
+        assert!(!ranges.is_empty());
     }
 
     #[test]

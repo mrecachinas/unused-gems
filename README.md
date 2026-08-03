@@ -149,7 +149,7 @@ Adapter entries map the value used in Rails config to the gem that provides it.
 Built with Rust for maximum performance:
 - **ruby-prism** for accurate Gemfile AST parsing (same parser as CRuby 3.3+)
 - **Hand-rolled byte scanners** with SIMD-accelerated `memchr` — no per-file regex overhead
-- **Parallel file walking** via `ignore` crate (respects `.gitignore`)
+- **Parallel file walking** via `ignore` crate (scans generated sources even when gitignored)
 - **Bincode file cache** — unchanged files skip scanning on repeat runs
 - **Zero-alloc hot path** — extension checks, comment detection all avoid heap allocation
 - **vendor/cache support** — extracts gemspec metadata from packed `.gem` tarballs
@@ -166,4 +166,4 @@ cargo bench -- --baseline main
 ```
 
 It covers cold and warm end-to-end runs, source-tree scaling,
-comment/heredoc-heavy Ruby, and ignore-heavy directory trees.
+comment/heredoc-heavy Ruby, and gitignored generated-source trees.

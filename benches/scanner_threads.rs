@@ -9,7 +9,7 @@
 //! Corpora exercise the three regimes called out in issue #13:
 //!   * `ruby_2000`         — large cold Ruby scan (favors more walker threads)
 //!   * `comment_heredoc_1000` — CPU-heavy comment/heredoc filtering
-//!   * `gitignore_250_of_4250` — ignore-heavy walk (regresses with more threads)
+//!   * `gitignored_generated_4250` — generated sources that remain scannable
 //!
 //! Warm-cache sweep uses a shared in-memory `FileCache` populated once before
 //! the timed iterations so we measure the mostly-cache-hit walker path.
@@ -109,17 +109,17 @@ end
     }
 }
 
-fn ignore_heavy_corpus(visible_files: usize, ignored_files: usize) -> Corpus {
+fn gitignored_generated_corpus(visible_files: usize, generated_files: usize) -> Corpus {
     let dir = TempDir::new().unwrap();
     fs::create_dir(dir.path().join(".git")).unwrap();
     fs::write(dir.path().join(".gitignore"), "generated/\n").unwrap();
     let body = "require \"rack\"\nmodule Visible\nend\n";
     let visible_bytes = write_files(&dir.path().join("app"), visible_files, body);
-    let ignored_bytes = write_files(&dir.path().join("generated"), ignored_files, body);
+    let generated_bytes = write_files(&dir.path().join("generated"), generated_files, body);
     Corpus {
         _dir: dir,
-        files: visible_files as u64,
-        bytes: visible_bytes + ignored_bytes,
+        files: (visible_files + generated_files) as u64,
+        bytes: visible_bytes + generated_bytes,
     }
 }
 
@@ -160,20 +160,24 @@ fn bench_thread_sweep(c: &mut Criterion) {
         });
     }
 
-    // Ignore-heavy: expected to regress with more walker threads (issue #13).
-    let ignore = ignore_heavy_corpus(250, 4_000);
-    group.throughput(Throughput::Elements(ignore.files));
+    // Gitignored generated sources remain in the walk and scan workload.
+    let generated = gitignored_generated_corpus(250, 4_000);
+    group.throughput(Throughput::Elements(generated.files));
     for &t in THREAD_COUNTS {
-        group.bench_with_input(BenchmarkId::new("gitignore_250_of_4250", t), &t, |b, &t| {
-            b.iter(|| {
-                scanner::scan_source_tree_with_threads(
-                    ignore.path(),
-                    &scanner::default_skip_dirs(),
-                    Arc::new(cache::FileCache::disabled()),
-                    Some(t),
-                )
-            });
-        });
+        group.bench_with_input(
+            BenchmarkId::new("gitignored_generated_4250", t),
+            &t,
+            |b, &t| {
+                b.iter(|| {
+                    scanner::scan_source_tree_with_threads(
+                        generated.path(),
+                        &scanner::default_skip_dirs(),
+                        Arc::new(cache::FileCache::disabled()),
+                        Some(t),
+                    )
+                });
+            },
+        );
     }
 
     // Warm-cache sweep: populate a shared cache once, then sweep threads.
