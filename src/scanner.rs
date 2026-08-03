@@ -333,6 +333,41 @@ fn set_mask(mask: &mut [u8], start: usize, end: usize, value: bool) {
     mask[start..end].fill(u8::from(value));
 }
 
+type PercentEndCache = HashMap<usize, Option<usize>>;
+
+#[cfg(test)]
+type PercentScanSteps = usize;
+#[cfg(not(test))]
+type PercentScanSteps = ();
+
+#[inline]
+fn count_percent_scan_step(steps: &mut PercentScanSteps) {
+    #[cfg(test)]
+    {
+        *steps += 1;
+    }
+    #[cfg(not(test))]
+    {
+        let _ = steps;
+    }
+}
+
+#[inline]
+fn is_percent_literal_type(byte: u8) -> bool {
+    matches!(
+        byte,
+        b'q' | b'Q' | b'r' | b'w' | b'W' | b'i' | b'I' | b's' | b'x'
+    )
+}
+
+#[inline]
+fn is_percent_literal_open(bytes: &[u8], open_pos: usize) -> bool {
+    open_pos >= 2
+        && bytes[open_pos - 2] == b'%'
+        && is_percent_literal_type(bytes[open_pos - 1])
+        && (open_pos == 2 || !is_word_char(bytes[open_pos - 3]))
+}
+
 fn find_interpolation_end(bytes: &[u8], mut i: usize, end: usize) -> Option<usize> {
     let mut depth = 1usize;
     while i < end {
@@ -369,7 +404,14 @@ fn find_interpolation_end(bytes: &[u8], mut i: usize, end: usize) -> Option<usiz
     None
 }
 
-fn expose_interpolations(bytes: &[u8], mask: &mut [u8], start: usize, end: usize) {
+fn expose_interpolations(
+    bytes: &[u8],
+    mask: &mut [u8],
+    start: usize,
+    end: usize,
+    percent_ends: &mut PercentEndCache,
+    percent_steps: &mut PercentScanSteps,
+) {
     let mut i = start;
     while i + 1 < end {
         if bytes[i] == b'\\' {
@@ -379,7 +421,7 @@ fn expose_interpolations(bytes: &[u8], mask: &mut [u8], start: usize, end: usize
         if bytes[i] == b'#' && bytes[i + 1] == b'{' {
             if let Some(close) = find_interpolation_end(bytes, i + 2, end) {
                 set_mask(mask, i + 2, close, false);
-                mask_ruby_range(bytes, mask, i + 2, close);
+                mask_ruby_range_cached(bytes, mask, i + 2, close, percent_ends, percent_steps);
                 i = close + 1;
                 continue;
             }
@@ -672,6 +714,106 @@ fn find_delimited_end(
     None
 }
 
+fn find_percent_literal_end(
+    bytes: &[u8],
+    open_pos: usize,
+    content_start: usize,
+    end: usize,
+    open: u8,
+    close: u8,
+    regex: bool,
+    percent_ends: &mut PercentEndCache,
+    percent_steps: &mut PercentScanSteps,
+) -> Option<usize> {
+    if let Some(cached) = percent_ends.get(&open_pos) {
+        return *cached;
+    }
+
+    if open == close {
+        let mut i = content_start;
+        let mut in_class = false;
+        while i < end {
+            count_percent_scan_step(percent_steps);
+            if bytes[i] == b'\\' {
+                i = (i + 2).min(end);
+                continue;
+            }
+            if i + 1 < end && bytes[i] == b'#' && bytes[i + 1] == b'{' {
+                if let Some(interpolation_end) = find_interpolation_end(bytes, i + 2, end) {
+                    i = interpolation_end + 1;
+                    continue;
+                }
+            }
+            if regex {
+                if bytes[i] == b'[' {
+                    in_class = true;
+                } else if bytes[i] == b']' {
+                    in_class = false;
+                }
+                if in_class {
+                    i += 1;
+                    continue;
+                }
+            }
+            if bytes[i] == close {
+                return Some(i);
+            }
+            i += 1;
+        }
+        percent_ends.insert(open_pos, None);
+        return None;
+    }
+
+    let mut stack = Vec::with_capacity(8);
+    stack.push((open_pos, true));
+    let mut i = content_start;
+    let mut in_class = false;
+    while i < end {
+        count_percent_scan_step(percent_steps);
+        if bytes[i] == b'\\' {
+            i = (i + 2).min(end);
+            continue;
+        }
+        if i + 1 < end && bytes[i] == b'#' && bytes[i + 1] == b'{' {
+            if let Some(interpolation_end) = find_interpolation_end(bytes, i + 2, end) {
+                i = interpolation_end + 1;
+                continue;
+            }
+        }
+        if regex {
+            if bytes[i] == b'[' {
+                in_class = true;
+            } else if bytes[i] == b']' {
+                in_class = false;
+            }
+            if in_class {
+                i += 1;
+                continue;
+            }
+        }
+        if bytes[i] == open {
+            stack.push((i, is_percent_literal_open(bytes, i)));
+        } else if bytes[i] == close {
+            if let Some((matched_open, is_percent_open)) = stack.pop() {
+                if is_percent_open && matched_open != open_pos {
+                    percent_ends.insert(matched_open, Some(i));
+                }
+                if stack.is_empty() {
+                    return Some(i);
+                }
+            }
+        }
+        i += 1;
+    }
+
+    for (unmatched_open, is_percent_open) in stack {
+        if is_percent_open {
+            percent_ends.insert(unmatched_open, None);
+        }
+    }
+    None
+}
+
 fn parse_heredoc(bytes: &[u8], abs: usize, end: usize) -> Option<(usize, usize, bool)> {
     if abs > 0
         && !matches!(
@@ -732,6 +874,29 @@ fn parse_heredoc(bytes: &[u8], abs: usize, end: usize) -> Option<(usize, usize, 
 }
 
 fn mask_ruby_range(bytes: &[u8], mask: &mut [u8], start: usize, end: usize) {
+    let mut percent_ends = PercentEndCache::new();
+    #[cfg(test)]
+    let mut percent_steps = 0;
+    #[cfg(not(test))]
+    let mut percent_steps = ();
+    mask_ruby_range_cached(
+        bytes,
+        mask,
+        start,
+        end,
+        &mut percent_ends,
+        &mut percent_steps,
+    );
+}
+
+fn mask_ruby_range_cached(
+    bytes: &[u8],
+    mask: &mut [u8],
+    start: usize,
+    end: usize,
+    percent_ends: &mut PercentEndCache,
+    percent_steps: &mut PercentScanSteps,
+) {
     let mut i = start;
     while i < end {
         if mask[i] != 0 {
@@ -799,15 +964,19 @@ fn mask_ruby_range(bytes: &[u8], mask: &mut [u8], start: usize, end: usize) {
                 };
                 set_mask(mask, content_start, literal_end, true);
                 if quote == b'"' {
-                    expose_interpolations(bytes, mask, content_start, literal_end);
+                    expose_interpolations(
+                        bytes,
+                        mask,
+                        content_start,
+                        literal_end,
+                        percent_ends,
+                        percent_steps,
+                    );
                 }
                 i = if found_close { close + 1 } else { literal_end };
             }
             b'%' if i + 2 < end
-                && matches!(
-                    bytes[i + 1],
-                    b'q' | b'Q' | b'r' | b'w' | b'W' | b'i' | b'I' | b's' | b'x'
-                )
+                && is_percent_literal_type(bytes[i + 1])
                 && (i == start || mask[i - 1] != 0 || !is_word_char(bytes[i - 1])) =>
             {
                 let (open, close) = match bytes[i + 2] {
@@ -824,12 +993,27 @@ fn mask_ruby_range(bytes: &[u8], mask: &mut [u8], start: usize, end: usize) {
                     }
                 };
                 let content_start = i + 3;
-                if let Some(literal_end) =
-                    find_delimited_end(bytes, content_start, end, open, close, bytes[i + 1] == b'r')
-                {
+                if let Some(literal_end) = find_percent_literal_end(
+                    bytes,
+                    i + 2,
+                    content_start,
+                    end,
+                    open,
+                    close,
+                    bytes[i + 1] == b'r',
+                    percent_ends,
+                    percent_steps,
+                ) {
                     set_mask(mask, content_start, literal_end, true);
                     if matches!(bytes[i + 1], b'Q' | b'r' | b'W' | b'I' | b'x') {
-                        expose_interpolations(bytes, mask, content_start, literal_end);
+                        expose_interpolations(
+                            bytes,
+                            mask,
+                            content_start,
+                            literal_end,
+                            percent_ends,
+                            percent_steps,
+                        );
                     }
                     i = literal_end + 1;
                 } else {
@@ -843,7 +1027,14 @@ fn mask_ruby_range(bytes: &[u8], mask: &mut [u8], start: usize, end: usize) {
             b'/' if is_regex_start(bytes, mask, start, i) => {
                 if let Some(regex_end) = find_delimited_end(bytes, i + 1, end, b'/', b'/', true) {
                     set_mask(mask, i + 1, regex_end, true);
-                    expose_interpolations(bytes, mask, i + 1, regex_end);
+                    expose_interpolations(
+                        bytes,
+                        mask,
+                        i + 1,
+                        regex_end,
+                        percent_ends,
+                        percent_steps,
+                    );
                     i = regex_end + 1;
                 } else {
                     i += 1;
@@ -858,7 +1049,14 @@ fn mask_ruby_range(bytes: &[u8], mask: &mut [u8], start: usize, end: usize) {
                     set_mask(mask, i + 2, delim_end, true);
                     set_mask(mask, body_start, heredoc_end, true);
                     if interpolated {
-                        expose_interpolations(bytes, mask, body_start, heredoc_end);
+                        expose_interpolations(
+                            bytes,
+                            mask,
+                            body_start,
+                            heredoc_end,
+                            percent_ends,
+                            percent_steps,
+                        );
                     }
                 }
                 i += 2;
@@ -943,6 +1141,22 @@ fn is_commented(bytes: &[u8], pos: usize, block_ranges: &[(usize, usize)]) -> bo
 #[cfg(test)]
 fn build_skip_mask(bytes: &[u8], is_ruby: bool, line_kind: LineCommentKind) -> Vec<u8> {
     build_skip_mask_for_template(bytes, is_ruby, line_kind, TemplateKind::None)
+}
+
+#[cfg(test)]
+fn build_ruby_skip_mask_with_percent_steps(bytes: &[u8]) -> (Vec<u8>, usize) {
+    let mut mask = vec![0; bytes.len()];
+    let mut percent_ends = PercentEndCache::new();
+    let mut percent_steps = 0;
+    mask_ruby_range_cached(
+        bytes,
+        &mut mask,
+        0,
+        bytes.len(),
+        &mut percent_ends,
+        &mut percent_steps,
+    );
+    (mask, percent_steps)
 }
 
 fn build_skip_mask_for_template(
@@ -2609,6 +2823,45 @@ AfterPercentLiterals.call
         ] {
             assert!(modules.contains_key(visible), "{visible}");
         }
+    }
+
+    #[test]
+    fn repeated_malformed_percent_literals_scan_linearly() {
+        fn build_case(lines: usize) -> (Vec<u8>, usize) {
+            let mut input = Vec::with_capacity(lines * 12 + 128);
+            for _ in 0..lines {
+                input.extend_from_slice(b"x = %w[a b\n");
+            }
+            input.extend_from_slice(
+                b"valid = %W[\nStaticValidPercent\n#{ValidPercentInterpolation}\n]\nrequire 'after_adversarial_percent'\n",
+            );
+            let (mask, steps) = build_ruby_skip_mask_with_percent_steps(&input);
+
+            let mut requires = Vec::new();
+            scan_requires_filtered(&input, &mask, &mut requires);
+            assert_eq!(requires, vec!["after_adversarial_percent"]);
+
+            let mut modules = HashMap::new();
+            let path: Arc<str> = Arc::from("test.rb");
+            scan_modules_filtered_into(&input, &mask, &mut modules, &path);
+            assert!(!modules.contains_key("StaticValidPercent"));
+            assert!(modules.contains_key("ValidPercentInterpolation"));
+            (input, steps)
+        }
+
+        let (small, small_steps) = build_case(512);
+        let (large, large_steps) = build_case(1_024);
+        assert!(
+            large_steps <= small_steps * 3,
+            "doubling input must remain linear: {small_steps} -> {large_steps}"
+        );
+        assert!(
+            large_steps <= large.len() * 2,
+            "delimiter scan steps must stay proportional to bytes: {} steps for {} bytes",
+            large_steps,
+            large.len()
+        );
+        assert!(small_steps <= small.len() * 2);
     }
 
     #[test]
