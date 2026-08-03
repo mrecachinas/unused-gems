@@ -30,6 +30,10 @@ name = "scanner"
 harness = false
 
 [[bench]]
+name = "scanner_threads"
+harness = false
+
+[[bench]]
 name = "end_to_end"
 harness = false
 

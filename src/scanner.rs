@@ -1226,18 +1226,44 @@ pub type CacheUpdate = (
 type ScriptFileList = Vec<(String, Vec<u8>)>;
 type ModuleMap = Vec<HashMap<String, HashSet<Arc<str>>>>;
 
+/// Default walker thread count. Conservative cap of 4 chosen because raising
+/// it globally regresses warm-cache and ignore-heavy workloads even though it
+/// helps large cold scans (see issue #13).
+pub fn default_walker_threads() -> usize {
+    rayon::current_num_threads().clamp(1, 4)
+}
+
+/// Public entry point using the default (capped) walker thread count.
+#[allow(dead_code)]
 pub fn scan_source_tree(
     dir: &Path,
     skip_dirs: &[&str],
     cache: Arc<crate::cache::FileCache>,
 ) -> (ScanResults, Vec<CacheUpdate>) {
+    scan_source_tree_with_threads(dir, skip_dirs, cache, None)
+}
+
+/// Scan with an explicit walker thread count. `None` uses the conservative
+/// default cap; `Some(n)` overrides it (clamped to at least 1). Intended for
+/// CLI `--jobs`, tests, and thread-sweep benchmarks so callers can vary the
+/// walker fan-out without mutating a global thread pool.
+pub fn scan_source_tree_with_threads(
+    dir: &Path,
+    skip_dirs: &[&str],
+    cache: Arc<crate::cache::FileCache>,
+    threads: Option<usize>,
+) -> (ScanResults, Vec<CacheUpdate>) {
     let skip_set: HashSet<String> = skip_dirs.iter().map(|s| s.to_string()).collect();
     let dir_str = dir.to_string_lossy().to_string();
     let use_cache = cache.is_enabled();
 
+    let walker_threads = threads
+        .map(|n| n.max(1))
+        .unwrap_or_else(default_walker_threads);
+
     let mut builder = ignore::WalkBuilder::new(dir);
     builder
-        .threads(rayon::current_num_threads().clamp(1, 4))
+        .threads(walker_threads)
         .standard_filters(false)
         .git_ignore(true)
         .git_global(false)
@@ -2450,6 +2476,54 @@ mod tests {
         let (results2, updates2) = scan_source_tree(dir.path(), &[], cache2);
         assert!(results2.requires.contains_key("cached_gem"));
         assert!(updates2.is_empty()); // all cache hits
+    }
+
+    #[test]
+    fn scan_source_tree_with_threads_matches_default_across_counts() {
+        // Same inputs across thread counts must produce identical scan results.
+        let dir = tempfile::tempdir().unwrap();
+        let app = dir.path().join("app");
+        std::fs::create_dir_all(&app).unwrap();
+        for i in 0..25 {
+            std::fs::write(
+                app.join(format!("f{i}.rb")),
+                format!("require 'g{i}'\nmodule M{i}\nend\n"),
+            )
+            .unwrap();
+        }
+
+        fn sorted<T: Ord + Clone>(v: impl IntoIterator<Item = T>) -> Vec<T> {
+            let mut v: Vec<T> = v.into_iter().collect();
+            v.sort();
+            v
+        }
+        let cache = std::sync::Arc::new(crate::cache::FileCache::disabled());
+        let (baseline, _) = scan_source_tree_with_threads(dir.path(), &[], cache.clone(), None);
+        let baseline_reqs = sorted(baseline.requires.keys().cloned());
+        let baseline_mods = sorted(baseline.modules.keys().cloned());
+
+        for threads in [1usize, 2, 4, 8, 12] {
+            let cache = std::sync::Arc::new(crate::cache::FileCache::disabled());
+            let (r, _) = scan_source_tree_with_threads(dir.path(), &[], cache, Some(threads));
+            assert_eq!(sorted(r.requires.keys().cloned()), baseline_reqs);
+            assert_eq!(sorted(r.modules.keys().cloned()), baseline_mods);
+        }
+    }
+
+    #[test]
+    fn scan_source_tree_with_threads_zero_is_treated_as_one() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.rb"), "require 'x'\n").unwrap();
+        let cache = std::sync::Arc::new(crate::cache::FileCache::disabled());
+        // 0 must not panic; walker floor is 1.
+        let (r, _) = scan_source_tree_with_threads(dir.path(), &[], cache, Some(0));
+        assert!(r.requires.contains_key("x"));
+    }
+
+    #[test]
+    fn default_walker_threads_is_capped_at_four() {
+        assert!(default_walker_threads() >= 1);
+        assert!(default_walker_threads() <= 4);
     }
 
     // ── Filtered scanner edge cases ──
