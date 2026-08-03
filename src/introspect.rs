@@ -1149,18 +1149,18 @@ mod tests {
     }
 
     #[test]
-    fn build_gem_index_prefers_locked_native_then_ruby_artifact() {
+    fn build_gem_index_prefers_normalized_locked_native_then_ruby_artifact() {
         let dir = tempfile::tempdir().unwrap();
         let gems_dir = dir.path().join("gems");
         std::fs::create_dir_all(gems_dir.join("native-1.0.0")).unwrap();
-        std::fs::create_dir_all(gems_dir.join("native-1.0.0-arm64-darwin-25")).unwrap();
+        std::fs::create_dir_all(gems_dir.join("native-1.0.0-arm64-darwin")).unwrap();
         std::fs::write(
             dir.path().join("Gemfile.lock"),
             "\
 GEM
   specs:
     native (1.0.0)
-    native (1.0.0-arm64-darwin-25)
+    native (1.0.0-arm64-darwin)
 
 PLATFORMS
   arm64-darwin-25
@@ -1175,10 +1175,7 @@ PLATFORMS
             &lockfile,
             Some("arm64-darwin-25"),
         );
-        assert_eq!(
-            native["native"],
-            gems_dir.join("native-1.0.0-arm64-darwin-25")
-        );
+        assert_eq!(native["native"], gems_dir.join("native-1.0.0-arm64-darwin"));
 
         let ruby =
             build_gem_index_for_lock(&[dir.path().to_path_buf()], &lockfile, Some("x86_64-linux"));
@@ -2025,12 +2022,12 @@ PLATFORMS
     }
 
     #[test]
-    fn vendor_path_index_picks_locked_native_artifact() {
+    fn vendor_path_index_picks_normalized_locked_native_artifact() {
         let dir = tempfile::tempdir().unwrap();
         let cache_dir = dir.path().join("vendor").join("cache");
         std::fs::create_dir_all(&cache_dir).unwrap();
         std::fs::write(cache_dir.join("native-1.0.0.gem"), b"").unwrap();
-        std::fs::write(cache_dir.join("native-1.0.0-arm64-darwin-25.gem"), b"").unwrap();
+        std::fs::write(cache_dir.join("native-1.0.0-arm64-darwin.gem"), b"").unwrap();
         std::fs::write(cache_dir.join("native-2.0.0.gem"), b"").unwrap();
         std::fs::write(
             dir.path().join("Gemfile.lock"),
@@ -2038,7 +2035,7 @@ PLATFORMS
 GEM
   specs:
     native (1.0.0)
-    native (1.0.0-arm64-darwin-25)
+    native (1.0.0-arm64-darwin)
 
 PLATFORMS
   arm64-darwin-25
@@ -2052,7 +2049,7 @@ PLATFORMS
             build_vendor_cache_path_index_for_lock(dir.path(), &lockfile, Some("arm64-darwin-25"));
         assert_eq!(
             index["native"],
-            cache_dir.join("native-1.0.0-arm64-darwin-25.gem")
+            cache_dir.join("native-1.0.0-arm64-darwin.gem")
         );
     }
 

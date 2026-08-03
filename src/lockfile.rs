@@ -261,16 +261,33 @@ fn parse_spec_line(line: &str) -> Option<(String, String)> {
 }
 
 fn split_resolved_artifact(resolved: &str, platforms: &[String]) -> (String, Option<String>) {
-    for platform in platforms {
-        if platform == "ruby" {
-            continue;
-        }
+    let mut suffixes: Vec<String> = platforms
+        .iter()
+        .filter(|platform| platform.as_str() != "ruby")
+        .flat_map(|platform| {
+            let mut suffixes = vec![platform.clone()];
+            if let Some(normalized) = normalize_os_versioned_platform(platform) {
+                suffixes.push(normalized);
+            }
+            suffixes
+        })
+        .collect();
+    suffixes.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
+    suffixes.dedup();
+
+    for platform in suffixes {
         let suffix = format!("-{platform}");
         if let Some(version) = resolved.strip_suffix(&suffix) {
-            return (version.to_string(), Some(platform.clone()));
+            return (version.to_string(), Some(platform));
         }
     }
     (resolved.to_string(), None)
+}
+
+fn normalize_os_versioned_platform(platform: &str) -> Option<String> {
+    let (base, version) = platform.rsplit_once('-')?;
+    (!version.is_empty() && version.bytes().all(|byte| byte.is_ascii_digit()))
+        .then(|| base.to_string())
 }
 
 pub fn count_transitive_deps(gem_name: &str, lock_deps: &HashMap<String, Vec<String>>) -> usize {
@@ -380,13 +397,17 @@ GEM
     nokogiri (1.18.9-arm64-darwin)
 
 PLATFORMS
-  arm64-darwin
+  arm64-darwin-25
   ruby
 ",
         )
         .unwrap();
 
         let lockfile = parse_gemfile_lock(dir.path());
+        assert_eq!(
+            lockfile.artifacts("nokogiri")[1].platform.as_deref(),
+            Some("arm64-darwin")
+        );
         assert_eq!(
             lockfile.preferred_registry_full_names("nokogiri", Some("arm64-darwin-25")),
             vec![

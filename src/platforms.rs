@@ -1,31 +1,49 @@
 use std::collections::HashSet;
-
-use once_cell::sync::Lazy;
+use std::path::Path;
+use std::process::Command;
 
 #[derive(Debug)]
-struct RuntimePlatform {
+pub struct RuntimePlatform {
     dsl_tokens: HashSet<String>,
     gem_platform: Option<String>,
 }
 
-static CURRENT_RUNTIME: Lazy<RuntimePlatform> = Lazy::new(resolve_current_runtime);
+impl RuntimePlatform {
+    pub fn dsl_tokens(&self) -> &HashSet<String> {
+        &self.dsl_tokens
+    }
 
-pub fn current_platform_set() -> &'static HashSet<String> {
-    &CURRENT_RUNTIME.dsl_tokens
+    pub fn gem_platform(&self) -> Option<&str> {
+        self.gem_platform.as_deref()
+    }
 }
 
-pub fn current_gem_platform() -> Option<&'static str> {
-    CURRENT_RUNTIME.gem_platform.as_deref()
+pub fn resolve_current_runtime(project_dir: &Path) -> RuntimePlatform {
+    let runtime_override = std::env::var("UNUSED_GEMS_RUBY_RUNTIME").ok();
+    let token_override = std::env::var("UNUSED_GEMS_PLATFORM_TOKENS").ok();
+    resolve_current_runtime_with(
+        project_dir,
+        runtime_override.as_deref(),
+        token_override.as_deref(),
+        probe_ruby_platform,
+    )
 }
 
-fn resolve_current_runtime() -> RuntimePlatform {
-    let mut runtime = std::env::var("UNUSED_GEMS_RUBY_RUNTIME")
-        .ok()
-        .and_then(|value| parse_runtime_override(&value))
-        .or_else(probe_ruby_platform)
+fn resolve_current_runtime_with<F>(
+    project_dir: &Path,
+    runtime_override: Option<&str>,
+    token_override: Option<&str>,
+    probe: F,
+) -> RuntimePlatform
+where
+    F: FnOnce(&Path) -> Option<RuntimePlatform>,
+{
+    let mut runtime = runtime_override
+        .and_then(parse_runtime_override)
+        .or_else(|| probe(project_dir))
         .unwrap_or_else(fallback_runtime);
 
-    if let Ok(tokens) = std::env::var("UNUSED_GEMS_PLATFORM_TOKENS") {
+    if let Some(tokens) = token_override {
         let parsed: HashSet<String> = tokens
             .split(',')
             .map(str::trim)
@@ -54,15 +72,18 @@ fn parse_runtime_override(value: &str) -> Option<RuntimePlatform> {
     })
 }
 
-fn probe_ruby_platform() -> Option<RuntimePlatform> {
-    let output = std::process::Command::new("ruby")
-        .args([
-            "-rrubygems",
-            "-e",
-            "puts RUBY_ENGINE; puts RUBY_PLATFORM; puts RUBY_VERSION; puts Gem::Platform.local",
-        ])
-        .output()
-        .ok()?;
+fn ruby_probe_command(project_dir: &Path) -> Command {
+    let mut command = Command::new("ruby");
+    command.current_dir(project_dir).args([
+        "-rrubygems",
+        "-e",
+        "puts RUBY_ENGINE; puts RUBY_PLATFORM; puts RUBY_VERSION; puts Gem::Platform.local",
+    ]);
+    command
+}
+
+fn probe_ruby_platform(project_dir: &Path) -> Option<RuntimePlatform> {
+    let output = ruby_probe_command(project_dir).output().ok()?;
     if !output.status.success() {
         return None;
     }
@@ -233,5 +254,32 @@ mod tests {
             set(&["ruby", "ruby_34", "mri", "mri_34"])
         );
         assert_eq!(runtime.gem_platform.as_deref(), Some("arm64-darwin-25"));
+    }
+
+    #[test]
+    fn runtime_probe_uses_project_directory_not_caller_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let caller_dir = dir.path().join("caller");
+        let project_dir = dir.path().join("project");
+        std::fs::create_dir_all(&caller_dir).unwrap();
+        std::fs::create_dir_all(&project_dir).unwrap();
+        std::fs::write(caller_dir.join(".ruby-version"), "3.4.2\n").unwrap();
+        std::fs::write(project_dir.join(".ruby-version"), "jruby-9.4.12.0\n").unwrap();
+
+        let runtime = resolve_current_runtime_with(&project_dir, None, None, |probe_dir| {
+            let selected = std::fs::read_to_string(probe_dir.join(".ruby-version")).ok()?;
+            if selected.starts_with("jruby") {
+                parse_runtime_override("jruby|java|3.1.4|java")
+            } else {
+                parse_runtime_override("ruby|arm64-darwin25|3.4.2|arm64-darwin-25")
+            }
+        });
+
+        assert_eq!(runtime.dsl_tokens, set(&["jruby"]));
+        assert_eq!(runtime.gem_platform.as_deref(), Some("java"));
+        assert_eq!(
+            ruby_probe_command(&project_dir).get_current_dir(),
+            Some(project_dir.as_path())
+        );
     }
 }

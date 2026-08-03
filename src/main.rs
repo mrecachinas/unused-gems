@@ -221,7 +221,8 @@ fn main() {
             lockfile::parse_gemfile_lock(&dir)
         }
     );
-    let current_gem_platform = platforms::current_gem_platform();
+    let runtime_platform = platforms::resolve_current_runtime(&dir);
+    let current_gem_platform = runtime_platform.gem_platform();
     let (
         ((mut gem_index, vendor_path_index), (mut scan_results, cache_updates)),
         (db_adapters, (cable_adapters, (storage_adapters, cache_config_adapters))),
@@ -461,7 +462,7 @@ fn main() {
 
     // 7. Apply platform filter
     {
-        let current_platforms = platforms::current_platform_set();
+        let current_platforms = runtime_platform.dsl_tokens();
         for result in results.values_mut() {
             if !result.gem.platforms.is_empty()
                 && !result
@@ -1302,8 +1303,8 @@ mod tests {
     }
 
     #[test]
-    fn current_platform_set_does_not_include_invalid_os_tokens() {
-        let platforms = platforms::current_platform_set();
+    fn derived_platform_set_does_not_include_invalid_os_tokens() {
+        let platforms = platforms::derive_platform_tokens("ruby", "x86_64-linux", "3.4.0");
         assert!(!platforms.contains("darwin"));
         assert!(!platforms.contains("linux"));
         assert!(!platforms.contains("java"));
