@@ -118,7 +118,7 @@ fn ignore_heavy_corpus(visible_files: usize, ignored_files: usize) -> Corpus {
     let ignored_bytes = write_files(&dir.path().join("generated"), ignored_files, body);
     Corpus {
         _dir: dir,
-        files: (visible_files + ignored_files) as u64,
+        files: visible_files as u64,
         bytes: visible_bytes + ignored_bytes,
     }
 }
@@ -180,15 +180,12 @@ fn bench_thread_sweep(c: &mut Criterion) {
     // Uses a disk-backed cache scoped to the corpus so the cache-hit walker
     // path is what varies with thread count.
     let warm = ruby_corpus(2_000);
-    let warm_cache = Arc::new(cache::FileCache::load(warm.path()));
-    // Prime the cache. Discard the update batch by not persisting it — instead
-    // build a fresh in-process cache that already knows every file's hash by
-    // re-running once with a live cache instance.
+    // Prime and persist the cache before entering the timed region.
     {
         let (_r, updates) = scanner::scan_source_tree_with_threads(
             warm.path(),
             &scanner::default_skip_dirs(),
-            Arc::clone(&warm_cache),
+            Arc::new(cache::FileCache::load(warm.path())),
             Some(1),
         );
         let mut mut_cache = cache::FileCache::load(warm.path());
@@ -197,15 +194,15 @@ fn bench_thread_sweep(c: &mut Criterion) {
         }
         mut_cache.save();
     }
+    let warm_cache = Arc::new(cache::FileCache::load(warm.path()));
     group.throughput(Throughput::Bytes(warm.bytes));
     for &t in THREAD_COUNTS {
         group.bench_with_input(BenchmarkId::new("ruby_2000_warm", t), &t, |b, &t| {
             b.iter(|| {
-                let cache = Arc::new(cache::FileCache::load(warm.path()));
                 scanner::scan_source_tree_with_threads(
                     warm.path(),
                     &scanner::default_skip_dirs(),
-                    cache,
+                    Arc::clone(&warm_cache),
                     Some(t),
                 )
             });

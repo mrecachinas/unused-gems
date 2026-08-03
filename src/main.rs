@@ -14,6 +14,7 @@ mod scripts;
 mod types;
 
 use std::collections::{HashMap, HashSet};
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -35,7 +36,7 @@ struct Cli {
     /// scanner's conservative walker thread cap (default 4) — useful for large
     /// cold scans on many-core machines. Leave unset to keep the default cap.
     #[arg(short, long)]
-    jobs: Option<usize>,
+    jobs: Option<NonZeroUsize>,
 
     /// Show detailed output (file locations, require paths, transitive deps)
     #[arg(short, long)]
@@ -102,13 +103,13 @@ fn main() {
     // thread count is plumbed explicitly below via `scan_source_tree_with_threads`
     // so an explicit `--jobs` actually raises the walker fan-out past the
     // conservative default cap of 4.
-    if let Some(jobs) = cli.jobs {
+    if let Some(jobs) = cli.jobs.map(NonZeroUsize::get) {
         rayon::ThreadPoolBuilder::new()
             .num_threads(jobs)
             .build_global()
             .ok();
     }
-    let walker_threads: Option<usize> = cli.jobs;
+    let walker_threads = cli.jobs.map(NonZeroUsize::get);
 
     let mut skip_dirs: Vec<&str> = scanner::default_skip_dirs();
     let extra_skip: Vec<String> = cli.skip_dirs.unwrap_or_default();
