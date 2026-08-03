@@ -93,16 +93,7 @@ const DEFAULT_SKIP_DIRS: &[&str] = &[
     "doc",
 ];
 
-const SKIP_DIRS_AT_ANY_DEPTH: &[&str] = &[
-    "vendor",
-    ".bundle",
-    "node_modules",
-    ".git",
-    "tmp",
-    "log",
-    "coverage",
-    "pkg",
-];
+const SKIP_DIRS_AT_ANY_DEPTH: &[&str] = &[".bundle", "node_modules", ".git"];
 
 // ── Hand-rolled byte scanners (memchr + manual parsing) ──────────────────────
 
@@ -1787,6 +1778,15 @@ pub fn scan_source_tree_with_threads_and_explicit_skips(
         .filter_entry(move |entry| {
             if entry.file_type().is_some_and(|ft| ft.is_dir()) {
                 let name = entry.file_name().to_string_lossy();
+                let is_vendor_bundle = name == "bundle"
+                    && entry
+                        .path()
+                        .parent()
+                        .and_then(Path::file_name)
+                        .is_some_and(|parent| parent == "vendor");
+                if is_vendor_bundle {
+                    return false;
+                }
                 let is_builtin = DEFAULT_SKIP_DIRS.contains(&name.as_ref());
                 let skip_at_any_depth = explicit_skip_set.contains(name.as_ref())
                     || !is_builtin
@@ -3165,47 +3165,45 @@ AfterPercentLiterals.call
     }
 
     #[test]
-    fn scan_source_tree_skips_deep_vendor() {
+    fn scan_source_tree_scans_nested_builtin_names() {
         let dir = tempfile::tempdir().unwrap();
-        let vendor = dir.path().join("engines/foo/vendor");
-        std::fs::create_dir_all(&vendor).unwrap();
-        std::fs::write(vendor.join("gem.rb"), "require 'hidden'\n").unwrap();
+        for (name, require_path) in [
+            ("vendor", "nested_vendor"),
+            ("tmp", "nested_tmp"),
+            ("coverage", "nested_coverage"),
+            ("pkg", "nested_pkg"),
+        ] {
+            let nested = dir.path().join("app/services").join(name);
+            std::fs::create_dir_all(&nested).unwrap();
+            std::fs::write(
+                nested.join("source.rb"),
+                format!("require '{require_path}'\n"),
+            )
+            .unwrap();
+        }
+        let cache = std::sync::Arc::new(crate::cache::FileCache::disabled());
+        let (results, _) = scan_source_tree(dir.path(), &default_skip_dirs(), cache);
+        for visible in [
+            "nested_vendor",
+            "nested_tmp",
+            "nested_coverage",
+            "nested_pkg",
+        ] {
+            assert!(results.requires.contains_key(visible), "{visible}");
+        }
+    }
+
+    #[test]
+    fn scan_source_tree_skips_nested_vendor_bundle() {
+        let dir = tempfile::tempdir().unwrap();
+        let bundle = dir.path().join("engines/foo/vendor/bundle");
+        std::fs::create_dir_all(&bundle).unwrap();
+        std::fs::write(bundle.join("gem.rb"), "require 'hidden'\n").unwrap();
         std::fs::write(dir.path().join("app.rb"), "require 'visible'\n").unwrap();
         let cache = std::sync::Arc::new(crate::cache::FileCache::disabled());
         let (results, _) = scan_source_tree(dir.path(), &default_skip_dirs(), cache);
         assert!(results.requires.contains_key("visible"));
         assert!(!results.requires.contains_key("hidden"));
-    }
-
-    #[test]
-    fn scan_source_tree_skips_nested_build_output_dirs() {
-        let dir = tempfile::tempdir().unwrap();
-        for (name, require_path) in [
-            ("tmp", "hidden_tmp"),
-            ("coverage", "hidden_coverage"),
-            ("pkg", "hidden_pkg"),
-            (".bundle", "hidden_bundle"),
-        ] {
-            let nested = dir.path().join("engines/foo").join(name);
-            std::fs::create_dir_all(&nested).unwrap();
-            std::fs::write(
-                nested.join("generated.rb"),
-                format!("require '{require_path}'\n"),
-            )
-            .unwrap();
-        }
-        std::fs::write(dir.path().join("visible.rb"), "require 'visible_nested'\n").unwrap();
-        let cache = std::sync::Arc::new(crate::cache::FileCache::disabled());
-        let (results, _) = scan_source_tree(dir.path(), &default_skip_dirs(), cache);
-        assert!(results.requires.contains_key("visible_nested"));
-        for hidden in [
-            "hidden_tmp",
-            "hidden_coverage",
-            "hidden_pkg",
-            "hidden_bundle",
-        ] {
-            assert!(!results.requires.contains_key(hidden), "{hidden}");
-        }
     }
 
     #[test]
