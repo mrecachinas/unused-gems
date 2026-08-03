@@ -326,11 +326,9 @@ fn build_block_comment_ranges(bytes: &[u8]) -> Vec<(usize, usize)> {
 }
 
 #[inline]
-fn set_mask(mask: &mut [bool], start: usize, end: usize, value: bool) {
+fn set_mask(mask: &mut [u8], start: usize, end: usize, value: bool) {
     let end = end.min(mask.len());
-    for byte in mask.iter_mut().take(end).skip(start) {
-        *byte = value;
-    }
+    mask[start..end].fill(u8::from(value));
 }
 
 fn find_interpolation_end(bytes: &[u8], mut i: usize, end: usize) -> Option<usize> {
@@ -369,7 +367,7 @@ fn find_interpolation_end(bytes: &[u8], mut i: usize, end: usize) -> Option<usiz
     None
 }
 
-fn expose_interpolations(bytes: &[u8], mask: &mut [bool], start: usize, end: usize) {
+fn expose_interpolations(bytes: &[u8], mask: &mut [u8], start: usize, end: usize) {
     let mut i = start;
     while i + 1 < end {
         if bytes[i] == b'\\' {
@@ -388,11 +386,11 @@ fn expose_interpolations(bytes: &[u8], mask: &mut [bool], start: usize, end: usi
     }
 }
 
-fn apply_template_mask(bytes: &[u8], mask: &mut [bool], kind: TemplateKind) {
+fn apply_template_mask(bytes: &[u8], mask: &mut [u8], kind: TemplateKind) {
     match kind {
         TemplateKind::None => {}
         TemplateKind::Erb => {
-            mask.fill(true);
+            mask.fill(1);
             let mut pos = 0;
             while let Some(idx) = memmem::find(&bytes[pos..], b"<%") {
                 let open = pos + idx;
@@ -417,7 +415,7 @@ fn apply_template_mask(bytes: &[u8], mask: &mut [bool], kind: TemplateKind) {
             }
         }
         TemplateKind::Haml | TemplateKind::Slim => {
-            mask.fill(true);
+            mask.fill(1);
             let mut line_start = 0;
             while line_start < bytes.len() {
                 let eol = memchr::memchr(b'\n', &bytes[line_start..])
@@ -463,10 +461,10 @@ fn apply_template_mask(bytes: &[u8], mask: &mut [bool], kind: TemplateKind) {
     }
 }
 
-fn previous_significant(bytes: &[u8], mask: &[bool], start: usize, mut i: usize) -> Option<usize> {
+fn previous_significant(bytes: &[u8], mask: &[u8], start: usize, mut i: usize) -> Option<usize> {
     while i > start {
         i -= 1;
-        if mask[i] {
+        if mask[i] != 0 {
             return None;
         }
         if bytes[i] == b'\n' {
@@ -479,7 +477,7 @@ fn previous_significant(bytes: &[u8], mask: &[bool], start: usize, mut i: usize)
     None
 }
 
-fn is_regex_start(bytes: &[u8], mask: &[bool], start: usize, i: usize) -> bool {
+fn is_regex_start(bytes: &[u8], mask: &[u8], start: usize, i: usize) -> bool {
     let Some(prev) = previous_significant(bytes, mask, start, i) else {
         return true;
     };
@@ -636,10 +634,10 @@ fn parse_heredoc(bytes: &[u8], abs: usize, end: usize) -> Option<(usize, usize, 
     None
 }
 
-fn mask_ruby_range(bytes: &[u8], mask: &mut [bool], start: usize, end: usize) {
+fn mask_ruby_range(bytes: &[u8], mask: &mut [u8], start: usize, end: usize) {
     let mut i = start;
     while i < end {
-        if mask[i] {
+        if mask[i] != 0 {
             i += 1;
             continue;
         }
@@ -697,7 +695,7 @@ fn mask_ruby_range(bytes: &[u8], mask: &mut [bool], start: usize, end: usize) {
             }
             b'%' if i + 2 < end
                 && matches!(bytes[i + 1], b'q' | b'Q' | b'r')
-                && (i == start || mask[i - 1] || !is_word_char(bytes[i - 1])) =>
+                && (i == start || mask[i - 1] != 0 || !is_word_char(bytes[i - 1])) =>
             {
                 let (open, close) = match bytes[i + 2] {
                     b'{' => (b'{', b'}'),
@@ -754,7 +752,7 @@ fn mask_ruby_range(bytes: &[u8], mask: &mut [bool], start: usize, end: usize) {
     }
 }
 
-fn mask_non_ruby(bytes: &[u8], mask: &mut [bool], line_kind: LineCommentKind) {
+fn mask_non_ruby(bytes: &[u8], mask: &mut [u8], line_kind: LineCommentKind) {
     let mut line_start = 0;
     while line_start < bytes.len() {
         let eol = memchr::memchr(b'\n', &bytes[line_start..])
@@ -809,7 +807,7 @@ fn is_commented(bytes: &[u8], pos: usize, block_ranges: &[(usize, usize)]) -> bo
 
 /// Build a unified per-byte skip mask for tests and non-template callers.
 ///
-/// `mask[i] == true` means position `i` should be ignored by all token-level
+/// `mask[i] != 0` means position `i` should be ignored by all token-level
 /// scanners. The mask covers:
 ///   - `#` line comments (whole line, leading-whitespace aware)
 ///   - inline `#` comments after non-string code (Hash kind only)
@@ -827,7 +825,7 @@ fn is_commented(bytes: &[u8], pos: usize, block_ranges: &[(usize, usize)]) -> bo
 /// #3 (`raise "Please require 'oauth2'"` not detected as a require) holds for
 /// both Ruby and the templating dialects.
 #[cfg(test)]
-fn build_skip_mask(bytes: &[u8], is_ruby: bool, line_kind: LineCommentKind) -> Vec<bool> {
+fn build_skip_mask(bytes: &[u8], is_ruby: bool, line_kind: LineCommentKind) -> Vec<u8> {
     build_skip_mask_for_template(bytes, is_ruby, line_kind, TemplateKind::None)
 }
 
@@ -836,8 +834,8 @@ fn build_skip_mask_for_template(
     is_ruby: bool,
     line_kind: LineCommentKind,
     template_kind: TemplateKind,
-) -> Vec<bool> {
-    let mut mask = vec![false; bytes.len()];
+) -> Vec<u8> {
+    let mut mask = vec![0; bytes.len()];
     apply_template_mask(bytes, &mut mask, template_kind);
     if is_ruby {
         mask_ruby_range(bytes, &mut mask, 0, bytes.len());
@@ -849,8 +847,8 @@ fn build_skip_mask_for_template(
 
 /// O(1) replacement for `is_commented` using a precomputed mask.
 #[inline]
-fn is_skipped(mask: &[bool], pos: usize) -> bool {
-    mask.get(pos).copied().unwrap_or(false)
+fn is_skipped(mask: &[u8], pos: usize) -> bool {
+    mask.get(pos).copied().unwrap_or(0) != 0
 }
 
 /// Extract a quoted string starting at position `i` (which should point at the quote char).
@@ -1152,7 +1150,7 @@ fn scan_bundler_require(
 /// using a precomputed `mask`. For non-Ruby files the caller still passes a
 /// mask built with appropriate `LineCommentKind` so YAML `#` comments etc.
 /// continue to be filtered.
-fn scan_requires_filtered(bytes: &[u8], mask: &[bool], results: &mut Vec<String>) {
+fn scan_requires_filtered(bytes: &[u8], mask: &[u8], results: &mut Vec<String>) {
     let mut pos = 0;
     while let Some(idx) = REQUIRE_FINDER.find(&bytes[pos..]) {
         let abs = pos + idx;
@@ -1186,7 +1184,7 @@ fn scan_requires_filtered(bytes: &[u8], mask: &[bool], results: &mut Vec<String>
     }
 }
 
-fn scan_autoloads_filtered(bytes: &[u8], mask: &[bool], results: &mut Vec<String>) {
+fn scan_autoloads_filtered(bytes: &[u8], mask: &[u8], results: &mut Vec<String>) {
     let mut pos = 0;
     while let Some(idx) = AUTOLOAD_FINDER.find(&bytes[pos..]) {
         let abs = pos + idx;
@@ -1237,7 +1235,7 @@ fn scan_autoloads_filtered(bytes: &[u8], mask: &[bool], results: &mut Vec<String
     }
 }
 
-fn scan_gem_bin_filtered(bytes: &[u8], mask: &[bool], results: &mut Vec<String>) {
+fn scan_gem_bin_filtered(bytes: &[u8], mask: &[u8], results: &mut Vec<String>) {
     let mut pos = 0;
     while let Some(idx) = GEM_DOT_FINDER.find(&bytes[pos..]) {
         let abs = pos + idx;
@@ -1272,7 +1270,7 @@ fn scan_gem_bin_filtered(bytes: &[u8], mask: &[bool], results: &mut Vec<String>)
 
 fn scan_modules_filtered_into(
     bytes: &[u8],
-    mask: &[bool],
+    mask: &[u8],
     modules: &mut HashMap<String, HashSet<Arc<str>>>,
     rel_path: &Arc<str>,
 ) {
@@ -1356,7 +1354,7 @@ fn scan_modules_filtered_into(
 
 fn scan_bundler_require_filtered(
     bytes: &[u8],
-    mask: &[bool],
+    mask: &[u8],
     bundler_groups: &mut Vec<String>,
     bundler_require_all: &mut bool,
 ) {
@@ -1525,7 +1523,7 @@ fn strip_inline_comment(s: &str) -> String {
 /// and insert each quoted module name into `modules`.
 fn scan_middleware_refs(
     bytes: &[u8],
-    mask: &[bool],
+    mask: &[u8],
     modules: &mut HashMap<String, HashSet<Arc<str>>>,
     rel_path: &Arc<str>,
 ) {
