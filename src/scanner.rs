@@ -769,6 +769,7 @@ fn find_delimited_end(
     None
 }
 
+#[allow(clippy::too_many_arguments)]
 fn find_percent_literal_end(
     bytes: &[u8],
     open_pos: usize,
