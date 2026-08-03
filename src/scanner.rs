@@ -93,6 +93,17 @@ const DEFAULT_SKIP_DIRS: &[&str] = &[
     "doc",
 ];
 
+const SKIP_DIRS_AT_ANY_DEPTH: &[&str] = &[
+    "vendor",
+    ".bundle",
+    "node_modules",
+    ".git",
+    "tmp",
+    "log",
+    "coverage",
+    "pkg",
+];
+
 // ── Hand-rolled byte scanners (memchr + manual parsing) ──────────────────────
 
 #[inline]
@@ -386,6 +397,59 @@ fn expose_interpolations(bytes: &[u8], mask: &mut [u8], start: usize, end: usize
     }
 }
 
+fn expose_template_attributes(bytes: &[u8], mask: &mut [u8], start: usize, end: usize) {
+    let mut i = start;
+    while i < end {
+        if matches!(bytes[i], b'{' | b'(') {
+            let open = bytes[i];
+            let close = if open == b'{' { b'}' } else { b')' };
+            if let Some(attribute_end) = find_delimited_end(bytes, i + 1, end, open, close, false) {
+                set_mask(mask, i + 1, attribute_end, false);
+                i = attribute_end + 1;
+                continue;
+            }
+        }
+        i += 1;
+    }
+}
+
+fn expose_template_assignments(bytes: &[u8], mask: &mut [u8], start: usize, end: usize) {
+    let mut i = start;
+    while i < end {
+        if bytes[i] != b'='
+            || bytes.get(i.wrapping_sub(1)) == Some(&b'=')
+            || bytes.get(i + 1) == Some(&b'=')
+            || bytes.get(i + 1) == Some(&b'>')
+        {
+            i += 1;
+            continue;
+        }
+        let mut expression_start = i + 1;
+        while expression_start < end && matches!(bytes[expression_start], b' ' | b'\t') {
+            expression_start += 1;
+        }
+        if expression_start >= end {
+            break;
+        }
+        let inline_output = i == start
+            || bytes[i - 1].is_ascii_whitespace()
+            || bytes.get(i + 1).is_some_and(u8::is_ascii_whitespace);
+        let expression_end = if inline_output {
+            end
+        } else {
+            let mut expression_end = expression_start;
+            while expression_end < end
+                && !matches!(bytes[expression_end], b' ' | b'\t' | b',' | b')' | b'}')
+            {
+                expression_end += 1;
+            }
+            expression_end
+        };
+        set_mask(mask, expression_start, expression_end, false);
+        i = expression_end;
+    }
+}
+
 fn apply_template_mask(bytes: &[u8], mask: &mut [u8], kind: TemplateKind) {
     match kind {
         TemplateKind::None => {}
@@ -417,6 +481,7 @@ fn apply_template_mask(bytes: &[u8], mask: &mut [u8], kind: TemplateKind) {
         TemplateKind::Haml | TemplateKind::Slim => {
             mask.fill(1);
             let mut line_start = 0;
+            let mut ruby_filter_indent = None;
             while line_start < bytes.len() {
                 let eol = memchr::memchr(b'\n', &bytes[line_start..])
                     .map(|n| line_start + n)
@@ -424,6 +489,28 @@ fn apply_template_mask(bytes: &[u8], mask: &mut [u8], kind: TemplateKind) {
                 let mut ws = line_start;
                 while ws < eol && matches!(bytes[ws], b' ' | b'\t') {
                     ws += 1;
+                }
+                let indent = ws - line_start;
+                let content_end = if eol > ws && bytes[eol - 1] == b'\r' {
+                    eol - 1
+                } else {
+                    eol
+                };
+                if let Some(filter_indent) = ruby_filter_indent {
+                    if ws == content_end || indent > filter_indent {
+                        set_mask(mask, ws, content_end, false);
+                        line_start = if eol < bytes.len() { eol + 1 } else { eol };
+                        continue;
+                    }
+                    ruby_filter_indent = None;
+                }
+                let filter_line = &bytes[ws..content_end];
+                if (kind == TemplateKind::Haml && filter_line == b":ruby")
+                    || (kind == TemplateKind::Slim && filter_line == b"ruby:")
+                {
+                    ruby_filter_indent = Some(indent);
+                    line_start = if eol < bytes.len() { eol + 1 } else { eol };
+                    continue;
                 }
                 let is_haml_comment = kind == TemplateKind::Haml
                     && ws + 1 < eol
@@ -437,16 +524,30 @@ fn apply_template_mask(bytes: &[u8], mask: &mut [u8], kind: TemplateKind) {
                         _ => false,
                     };
                     if executable {
-                        set_mask(mask, ws + 1, eol, false);
+                        set_mask(mask, ws + 1, content_end, false);
+                    } else {
+                        let tag_line = match kind {
+                            TemplateKind::Haml => {
+                                ws < content_end && matches!(bytes[ws], b'%' | b'.' | b'#')
+                            }
+                            TemplateKind::Slim => {
+                                ws < content_end && bytes[ws].is_ascii_alphabetic()
+                            }
+                            _ => false,
+                        };
+                        if tag_line {
+                            expose_template_attributes(bytes, mask, ws, content_end);
+                            expose_template_assignments(bytes, mask, ws, content_end);
+                        }
                     }
                     let mut i = line_start;
-                    while i + 1 < eol {
+                    while i + 1 < content_end {
                         if bytes[i] == b'\\' {
-                            i = (i + 2).min(eol);
+                            i = (i + 2).min(content_end);
                             continue;
                         }
                         if bytes[i] == b'#' && bytes[i + 1] == b'{' {
-                            if let Some(close) = find_interpolation_end(bytes, i + 2, eol) {
+                            if let Some(close) = find_interpolation_end(bytes, i + 2, content_end) {
                                 set_mask(mask, i + 2, close, false);
                                 i = close + 1;
                                 continue;
@@ -622,12 +723,17 @@ fn parse_heredoc(bytes: &[u8], abs: usize, end: usize) -> Option<(usize, usize, 
         let eol = memchr::memchr(b'\n', &bytes[line_start..end])
             .map(|n| line_start + n)
             .unwrap_or(end);
+        let content_end = if eol > line_start && bytes[eol - 1] == b'\r' {
+            eol - 1
+        } else {
+            eol
+        };
         let mut content = line_start;
-        while content < eol && matches!(bytes[content], b' ' | b'\t') {
+        while content < content_end && matches!(bytes[content], b' ' | b'\t') {
             content += 1;
         }
-        if content + delim.len() == eol && &bytes[content..eol] == delim {
-            return Some((delim_end, eol, quote != Some(b'\'')));
+        if content + delim.len() == content_end && &bytes[content..content_end] == delim {
+            return Some((delim_end, content_end, quote != Some(b'\'')));
         }
         line_start = if eol < end { eol + 1 } else { eol };
     }
@@ -659,6 +765,10 @@ fn mask_ruby_range(bytes: &[u8], mask: &mut [u8], start: usize, end: usize) {
             }
         }
         match bytes[i] {
+            b'?' if i + 1 < end && !bytes[i + 1].is_ascii_whitespace() => {
+                i += if bytes[i + 1] == b'\\' { 3 } else { 2 };
+                i = i.min(end);
+            }
             b'#' => {
                 let eol = memchr::memchr(b'\n', &bytes[i..end])
                     .map(|n| i + n)
@@ -670,6 +780,7 @@ fn mask_ruby_range(bytes: &[u8], mask: &mut [u8], start: usize, end: usize) {
                 let quote = bytes[i];
                 let content_start = i + 1;
                 let mut close = content_start;
+                let mut found_close = false;
                 while close < end {
                     if bytes[close] == b'\\' {
                         close = (close + 2).min(end);
@@ -682,19 +793,30 @@ fn mask_ruby_range(bytes: &[u8], mask: &mut [u8], start: usize, end: usize) {
                             .map(|interpolation_end| interpolation_end + 1)
                             .unwrap_or(end);
                     } else if bytes[close] == quote {
+                        found_close = true;
                         break;
                     } else {
                         close += 1;
                     }
                 }
-                set_mask(mask, content_start, close, true);
+                let literal_end = if found_close {
+                    close
+                } else {
+                    memchr::memchr(b'\n', &bytes[content_start..end])
+                        .map(|offset| content_start + offset)
+                        .unwrap_or(end)
+                };
+                set_mask(mask, content_start, literal_end, true);
                 if quote == b'"' {
-                    expose_interpolations(bytes, mask, content_start, close);
+                    expose_interpolations(bytes, mask, content_start, literal_end);
                 }
-                i = if close < end { close + 1 } else { end };
+                i = if found_close { close + 1 } else { literal_end };
             }
             b'%' if i + 2 < end
-                && matches!(bytes[i + 1], b'q' | b'Q' | b'r')
+                && matches!(
+                    bytes[i + 1],
+                    b'q' | b'Q' | b'r' | b'w' | b'W' | b'i' | b'I' | b's' | b'x'
+                )
                 && (i == start || mask[i - 1] != 0 || !is_word_char(bytes[i - 1])) =>
             {
                 let (open, close) = match bytes[i + 2] {
@@ -715,13 +837,16 @@ fn mask_ruby_range(bytes: &[u8], mask: &mut [u8], start: usize, end: usize) {
                     find_delimited_end(bytes, content_start, end, open, close, bytes[i + 1] == b'r')
                 {
                     set_mask(mask, content_start, literal_end, true);
-                    if bytes[i + 1] != b'q' {
+                    if matches!(bytes[i + 1], b'Q' | b'r' | b'W' | b'I' | b'x') {
                         expose_interpolations(bytes, mask, content_start, literal_end);
                     }
                     i = literal_end + 1;
                 } else {
-                    set_mask(mask, content_start, end, true);
-                    i = end;
+                    let literal_end = memchr::memchr(b'\n', &bytes[content_start..end])
+                        .map(|offset| content_start + offset)
+                        .unwrap_or(end);
+                    set_mask(mask, content_start, literal_end, true);
+                    i = literal_end;
                 }
             }
             b'/' if is_regex_start(bytes, mask, start, i) => {
@@ -1665,7 +1790,7 @@ pub fn scan_source_tree_with_threads_and_explicit_skips(
                 let is_builtin = DEFAULT_SKIP_DIRS.contains(&name.as_ref());
                 let skip_at_any_depth = explicit_skip_set.contains(name.as_ref())
                     || !is_builtin
-                    || matches!(name.as_ref(), ".git" | ".bundle" | "node_modules");
+                    || SKIP_DIRS_AT_ANY_DEPTH.contains(&name.as_ref());
                 if skip_set.contains(name.as_ref()) && (entry.depth() == 1 || skip_at_any_depth) {
                     return false;
                 }
@@ -2431,6 +2556,62 @@ mod tests {
     }
 
     #[test]
+    fn malformed_quotes_and_character_literals_do_not_mask_later_code() {
+        let input =
+            b"message = \"unterminated\napostrophe = ?'\nrequire 'after_malformed'\nAfterMalformed.call\n";
+        let mask = build_skip_mask(input, true, LineCommentKind::Hash);
+        let mut requires = Vec::new();
+        scan_requires_filtered(input, &mask, &mut requires);
+        assert_eq!(requires, vec!["after_malformed"]);
+
+        let mut modules = HashMap::new();
+        let path: Arc<str> = Arc::from("test.rb");
+        scan_modules_filtered_into(input, &mask, &mut modules, &path);
+        assert!(modules.contains_key("AfterMalformed"));
+    }
+
+    #[test]
+    fn percent_literal_families_mask_static_text_and_bound_failures() {
+        let input = br#"
+words = %w[StaticWords can't require 'words_fake']
+symbols = %i[StaticSymbols developer's]
+expanded_words = %W[StaticExpanded #{ExpandedWordsInterpolation}]
+expanded_symbols = %I[StaticSymbolsExpanded #{ExpandedSymbolsInterpolation}]
+symbol = %s[StaticSymbol]
+command = %x[StaticCommand require 'command_fake' #{CommandInterpolation}]
+broken = %w[unterminated apostrophe's
+require 'after_percent_literals'
+AfterPercentLiterals.call
+"#;
+        let mask = build_skip_mask(input, true, LineCommentKind::Hash);
+        let mut requires = Vec::new();
+        scan_requires_filtered(input, &mask, &mut requires);
+        assert_eq!(requires, vec!["after_percent_literals"]);
+
+        let mut modules = HashMap::new();
+        let path: Arc<str> = Arc::from("test.rb");
+        scan_modules_filtered_into(input, &mask, &mut modules, &path);
+        for hidden in [
+            "StaticWords",
+            "StaticSymbols",
+            "StaticExpanded",
+            "StaticSymbolsExpanded",
+            "StaticSymbol",
+            "StaticCommand",
+        ] {
+            assert!(!modules.contains_key(hidden), "{hidden}");
+        }
+        for visible in [
+            "ExpandedWordsInterpolation",
+            "ExpandedSymbolsInterpolation",
+            "CommandInterpolation",
+            "AfterPercentLiterals",
+        ] {
+            assert!(modules.contains_key(visible), "{visible}");
+        }
+    }
+
+    #[test]
     fn regex_literals_mask_static_text_but_keep_interpolation_code() {
         let input = b"slash = /StaticSlash\nrequire 'slash_fake'\n#{SlashInterpolation}/\npercent = %r{StaticPercent\nrequire 'percent_fake'\n#{PercentInterpolation}}\nrequire 'real'\n";
         let mask = build_skip_mask(input, true, LineCommentKind::Hash);
@@ -2460,6 +2641,15 @@ mod tests {
         scan_modules_filtered_into(input, &mask, &mut modules, &path);
         assert!(!modules.contains_key("StaticHeredoc"));
         assert!(modules.contains_key("HeredocInterpolation"));
+    }
+
+    #[test]
+    fn heredoc_accepts_crlf_terminator() {
+        let input = b"doc = <<~TEXT\r\nrequire 'hidden_crlf'\r\nTEXT\r\nrequire 'after_crlf'\r\n";
+        let mask = build_skip_mask(input, true, LineCommentKind::Hash);
+        let mut requires = Vec::new();
+        scan_requires_filtered(input, &mask, &mut requires);
+        assert_eq!(requires, vec!["after_crlf"]);
     }
 
     #[test]
@@ -2984,7 +3174,38 @@ mod tests {
         let cache = std::sync::Arc::new(crate::cache::FileCache::disabled());
         let (results, _) = scan_source_tree(dir.path(), &default_skip_dirs(), cache);
         assert!(results.requires.contains_key("visible"));
-        assert!(results.requires.contains_key("hidden"));
+        assert!(!results.requires.contains_key("hidden"));
+    }
+
+    #[test]
+    fn scan_source_tree_skips_nested_build_output_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, require_path) in [
+            ("tmp", "hidden_tmp"),
+            ("coverage", "hidden_coverage"),
+            ("pkg", "hidden_pkg"),
+            (".bundle", "hidden_bundle"),
+        ] {
+            let nested = dir.path().join("engines/foo").join(name);
+            std::fs::create_dir_all(&nested).unwrap();
+            std::fs::write(
+                nested.join("generated.rb"),
+                format!("require '{require_path}'\n"),
+            )
+            .unwrap();
+        }
+        std::fs::write(dir.path().join("visible.rb"), "require 'visible_nested'\n").unwrap();
+        let cache = std::sync::Arc::new(crate::cache::FileCache::disabled());
+        let (results, _) = scan_source_tree(dir.path(), &default_skip_dirs(), cache);
+        assert!(results.requires.contains_key("visible_nested"));
+        for hidden in [
+            "hidden_tmp",
+            "hidden_coverage",
+            "hidden_pkg",
+            "hidden_bundle",
+        ] {
+            assert!(!results.requires.contains_key(hidden), "{hidden}");
+        }
     }
 
     #[test]
@@ -3519,6 +3740,57 @@ mod tests {
             .unwrap();
             assert_eq!(result.requires, vec![expected_require], "{name}");
             assert!(modules.contains_key(expected_module), "{name}");
+            assert!(!modules.contains_key(static_module), "{name}");
+        }
+    }
+
+    #[test]
+    fn haml_and_slim_scan_inline_attributes_and_ruby_filters() {
+        let dir = tempfile::tempdir().unwrap();
+        let cases = [
+            (
+                "forms.haml",
+                "%p= HamlInlineOutput\n%div{ class: HamlHashAttribute }\n%span(title=HamlParenAttribute)\n:ruby\n  require 'haml_filter'\n  HamlFilterModule.call\n%p StaticHamlAfter\n",
+                [
+                    "HamlInlineOutput",
+                    "HamlHashAttribute",
+                    "HamlParenAttribute",
+                    "HamlFilterModule",
+                ],
+                "haml_filter",
+                "StaticHamlAfter",
+            ),
+            (
+                "forms.slim",
+                "p = SlimInlineOutput\np class=SlimAttribute data-id=SlimDataAttribute\nruby:\n  require 'slim_filter'\n  SlimFilterModule.call\np StaticSlimAfter\n",
+                [
+                    "SlimInlineOutput",
+                    "SlimAttribute",
+                    "SlimDataAttribute",
+                    "SlimFilterModule",
+                ],
+                "slim_filter",
+                "StaticSlimAfter",
+            ),
+        ];
+
+        for (name, content, expected_modules, expected_require, static_module) in cases {
+            let file = dir.path().join(name);
+            std::fs::write(&file, content).unwrap();
+            let mut modules = HashMap::new();
+            let result = scan_file(
+                file.to_str().unwrap(),
+                dir.path().to_str().unwrap(),
+                &mut modules,
+            )
+            .unwrap();
+            assert!(
+                result.requires.contains(&expected_require.to_string()),
+                "{name}"
+            );
+            for expected in expected_modules {
+                assert!(modules.contains_key(expected), "{name}: {expected}");
+            }
             assert!(!modules.contains_key(static_module), "{name}");
         }
     }
