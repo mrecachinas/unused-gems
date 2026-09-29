@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime};
@@ -48,10 +48,18 @@ struct CacheFileRef<'a> {
     entries: &'a HashMap<String, CacheEntry>,
 }
 
+#[derive(Default)]
+struct CacheState {
+    entries: HashMap<String, CacheEntry>,
+    /// Files looked up by the source walk. `None` until the first lookup; when
+    /// set, `save` drops entries for files the walk no longer visits.
+    visited: Option<HashSet<String>>,
+}
+
 pub struct FileCache {
     /// Wrapped in Mutex so we can `take()` (consume) entries on cache hit
     /// without cloning. Lock is held only briefly per file.
-    entries: Mutex<HashMap<String, CacheEntry>>,
+    state: Mutex<CacheState>,
     dirty: std::sync::atomic::AtomicBool,
     cache_path: std::path::PathBuf,
 }
@@ -73,7 +81,10 @@ impl FileCache {
             HashMap::new()
         };
         FileCache {
-            entries: Mutex::new(entries),
+            state: Mutex::new(CacheState {
+                entries,
+                visited: None,
+            }),
             dirty: std::sync::atomic::AtomicBool::new(false),
             cache_path,
         }
@@ -81,7 +92,7 @@ impl FileCache {
 
     pub fn disabled() -> Self {
         FileCache {
-            entries: Mutex::new(HashMap::new()),
+            state: Mutex::new(CacheState::default()),
             dirty: std::sync::atomic::AtomicBool::new(false),
             cache_path: std::path::PathBuf::new(),
         }
@@ -91,8 +102,8 @@ impl FileCache {
     /// Kept for tests / external readers; scanner uses `take()` to avoid clones.
     #[allow(dead_code)]
     pub fn get(&self, rel_path: &str, mtime: SystemTime, size: u64) -> Option<CacheEntry> {
-        let entries = self.entries.lock().unwrap();
-        let entry = entries.get(rel_path)?;
+        let state = self.state.lock().unwrap();
+        let entry = state.entries.get(rel_path)?;
         let duration = mtime.duration_since(SystemTime::UNIX_EPOCH).ok()?;
         let mtime_secs = duration.as_secs();
         let mtime_nanos = duration.subsec_nanos();
@@ -118,6 +129,8 @@ impl FileCache {
     /// Consume the cache entry on hit (removes from internal map, returns owned CacheEntry).
     /// This avoids cloning the inner Vec<String>s on the hot path.
     /// If validation fails, the entry is left in place.
+    /// Every lookup records `rel_path` as visited so `save` can prune entries
+    /// for files that no longer exist (or are no longer scanned).
     pub fn take(
         &self,
         rel_path: &str,
@@ -125,9 +138,13 @@ impl FileCache {
         size: u64,
         _path: &Path,
     ) -> Option<CacheEntry> {
-        let mut entries = self.entries.lock().unwrap();
+        let mut state = self.state.lock().unwrap();
+        state
+            .visited
+            .get_or_insert_with(HashSet::new)
+            .insert(rel_path.to_string());
         // Validate before removing
-        let entry = entries.get(rel_path)?;
+        let entry = state.entries.get(rel_path)?;
         let duration = mtime.duration_since(SystemTime::UNIX_EPOCH).ok()?;
         let mtime_secs = duration.as_secs();
         let mtime_nanos = duration.subsec_nanos();
@@ -139,14 +156,14 @@ impl FileCache {
         if entry.content_fingerprint != content_fingerprint(_path) {
             return None;
         }
-        entries.remove(rel_path)
+        state.entries.remove(rel_path)
     }
 
     /// Re-insert a previously `take()`n entry back into the cache without marking
     /// it dirty. Used by the scanner cache-hit path to preserve durability while
     /// avoiding spurious cache_buf round-trips.
     pub(crate) fn reinsert(&self, rel_path: String, entry: CacheEntry) {
-        self.entries.lock().unwrap().insert(rel_path, entry);
+        self.state.lock().unwrap().entries.insert(rel_path, entry);
     }
 
     /// Insert/update a cache entry.
@@ -163,7 +180,7 @@ impl FileCache {
             .unwrap_or_default();
         let mtime_secs = duration.as_secs();
         let mtime_nanos = duration.subsec_nanos();
-        self.entries.lock().unwrap().insert(
+        self.state.lock().unwrap().entries.insert(
             update.rel_path,
             CacheEntry {
                 mtime_secs,
@@ -181,20 +198,39 @@ impl FileCache {
         self.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
-    /// Write cache to disk if modified.
+    /// Write cache to disk if modified, dropping entries for files the walk did
+    /// not visit. The file is written to a temporary sibling and renamed into
+    /// place so readers never observe a partially written cache.
     pub fn save(&self) {
-        if !self.dirty.load(std::sync::atomic::Ordering::Relaxed)
-            || self.cache_path.as_os_str().is_empty()
-        {
+        if self.cache_path.as_os_str().is_empty() {
             return;
         }
-        let entries = self.entries.lock().unwrap();
+        let mut state = self.state.lock().unwrap();
+        let CacheState { entries, visited } = &mut *state;
+        let mut pruned = false;
+        if let Some(visited) = visited {
+            let before = entries.len();
+            entries.retain(|rel_path, _| visited.contains(rel_path));
+            pruned = entries.len() != before;
+        }
+        if !pruned && !self.dirty.load(std::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
         let cf = CacheFileRef {
             version: CACHE_VERSION,
-            entries: &entries,
+            entries,
         };
-        if let Ok(data) = bincode::serialize(&cf) {
-            let _ = std::fs::write(&self.cache_path, data);
+        let Ok(data) = bincode::serialize(&cf) else {
+            return;
+        };
+        let tmp_path = self
+            .cache_path
+            .with_file_name(format!("{CACHE_FILE}.{}.tmp", std::process::id()));
+        let written = std::fs::write(&tmp_path, data)
+            .and_then(|()| std::fs::rename(&tmp_path, &self.cache_path));
+        // Cache writes are best-effort (e.g. read-only checkouts).
+        if written.is_err() {
+            let _ = std::fs::remove_file(&tmp_path);
         }
     }
 
@@ -396,6 +432,75 @@ mod tests {
     fn disabled_cache_save_is_noop() {
         let cache = FileCache::disabled();
         cache.save(); // should not panic or write anything
+    }
+
+    #[test]
+    fn save_prunes_entries_for_files_not_visited() {
+        let dir = tempfile::tempdir().unwrap();
+        let mtime = SystemTime::UNIX_EPOCH + Duration::from_secs(1000000);
+        {
+            let mut cache = FileCache::load(dir.path());
+            cache.put(update("kept.rb", mtime, 1));
+            cache.put(update("deleted.rb", mtime, 1));
+            cache.save();
+        }
+
+        // A later walk only looks up kept.rb (deleted.rb no longer exists).
+        let cache = FileCache::load(dir.path());
+        let hit = cache
+            .take("kept.rb", mtime, 1, Path::new("kept.rb"))
+            .unwrap();
+        cache.reinsert("kept.rb".to_string(), hit);
+        cache.save();
+
+        let cache = FileCache::load(dir.path());
+        assert!(cache.get("kept.rb", mtime, 1).is_some());
+        assert!(cache.get("deleted.rb", mtime, 1).is_none());
+    }
+
+    #[test]
+    fn save_without_walk_does_not_prune() {
+        let dir = tempfile::tempdir().unwrap();
+        let mtime = SystemTime::UNIX_EPOCH + Duration::from_secs(1000000);
+        {
+            let mut cache = FileCache::load(dir.path());
+            cache.put(update("a.rb", mtime, 1));
+            cache.save();
+        }
+        let mut cache = FileCache::load(dir.path());
+        cache.put(update("b.rb", mtime, 1));
+        cache.save();
+
+        let cache = FileCache::load(dir.path());
+        assert!(cache.get("a.rb", mtime, 1).is_some());
+        assert!(cache.get("b.rb", mtime, 1).is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_replaces_cache_file_atomically() {
+        let dir = tempfile::tempdir().unwrap();
+        let mtime = SystemTime::UNIX_EPOCH + Duration::from_secs(1000000);
+        let mut cache = FileCache::load(dir.path());
+        cache.put(update("a.rb", mtime, 1));
+        cache.save();
+
+        // A hard link keeps pointing at the old inode only if the cache was
+        // replaced via rename rather than truncated and rewritten in place.
+        let snapshot = dir.path().join("snapshot");
+        std::fs::hard_link(dir.path().join(CACHE_FILE), &snapshot).unwrap();
+        let before = std::fs::read(&snapshot).unwrap();
+        cache.put(update("b.rb", mtime, 2));
+        cache.save();
+
+        assert_eq!(std::fs::read(&snapshot).unwrap(), before);
+        assert_ne!(std::fs::read(dir.path().join(CACHE_FILE)).unwrap(), before);
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .filter(|entry| entry.file_name().to_string_lossy().ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty());
     }
 
     #[test]
