@@ -494,59 +494,6 @@ fn expose_interpolations(
     }
 }
 
-fn expose_template_attributes(bytes: &[u8], mask: &mut [u8], start: usize, end: usize) {
-    let mut i = start;
-    while i < end {
-        if matches!(bytes[i], b'{' | b'(') {
-            let open = bytes[i];
-            let close = if open == b'{' { b'}' } else { b')' };
-            if let Some(attribute_end) = find_delimited_end(bytes, i + 1, end, open, close, false) {
-                set_mask(mask, i + 1, attribute_end, false);
-                i = attribute_end + 1;
-                continue;
-            }
-        }
-        i += 1;
-    }
-}
-
-fn expose_template_assignments(bytes: &[u8], mask: &mut [u8], start: usize, end: usize) {
-    let mut i = start;
-    while i < end {
-        if bytes[i] != b'='
-            || bytes.get(i.wrapping_sub(1)) == Some(&b'=')
-            || bytes.get(i + 1) == Some(&b'=')
-            || bytes.get(i + 1) == Some(&b'>')
-        {
-            i += 1;
-            continue;
-        }
-        let mut expression_start = i + 1;
-        while expression_start < end && matches!(bytes[expression_start], b' ' | b'\t') {
-            expression_start += 1;
-        }
-        if expression_start >= end {
-            break;
-        }
-        let inline_output = i == start
-            || bytes[i - 1].is_ascii_whitespace()
-            || bytes.get(i + 1).is_some_and(u8::is_ascii_whitespace);
-        let expression_end = if inline_output {
-            end
-        } else {
-            let mut expression_end = expression_start;
-            while expression_end < end
-                && !matches!(bytes[expression_end], b' ' | b'\t' | b',' | b')' | b'}')
-            {
-                expression_end += 1;
-            }
-            expression_end
-        };
-        set_mask(mask, expression_start, expression_end, false);
-        i = expression_end;
-    }
-}
-
 fn apply_template_mask(bytes: &[u8], mask: &mut [u8], kind: TemplateKind) {
     match kind {
         TemplateKind::None => {}
@@ -575,87 +522,451 @@ fn apply_template_mask(bytes: &[u8], mask: &mut [u8], kind: TemplateKind) {
                 pos = close + 2;
             }
         }
-        TemplateKind::Haml | TemplateKind::Slim => {
-            mask.fill(1);
-            let mut line_start = 0;
-            let mut ruby_filter_indent = None;
-            while line_start < bytes.len() {
-                let eol = memchr::memchr(b'\n', &bytes[line_start..])
-                    .map(|n| line_start + n)
-                    .unwrap_or(bytes.len());
-                let mut ws = line_start;
-                while ws < eol && matches!(bytes[ws], b' ' | b'\t') {
-                    ws += 1;
+        TemplateKind::Haml | TemplateKind::Slim => apply_indented_template_mask(bytes, mask, kind),
+    }
+}
+
+/// An indented block owned by a previous template line.
+#[derive(Copy, Clone, PartialEq, Eq)]
+enum TemplateBlock {
+    /// `:ruby` / `ruby:` filter body.
+    Ruby,
+    /// Other filters and Slim `|` text blocks: text with `#{}` interpolation.
+    Text,
+    /// `-#` (Haml) / `/` (Slim) comment bodies.
+    Comment,
+}
+
+/// Slim embedded engines whose bodies are not Slim markup.
+const SLIM_EMBEDDED_ENGINES: &[&[u8]] = &[
+    b"javascript",
+    b"css",
+    b"sass",
+    b"scss",
+    b"less",
+    b"coffee",
+    b"markdown",
+    b"textile",
+    b"rdoc",
+    b"creole",
+    b"wiki",
+    b"mediawiki",
+    b"org",
+    b"erb",
+];
+
+/// Haml and Slim: expose Ruby code (`=`/`-` lines, tag attributes, tag output
+/// after `=`, `:ruby` filters, multi-line continuations) and `#{}`
+/// interpolation in text; everything else stays masked.
+fn apply_indented_template_mask(bytes: &[u8], mask: &mut [u8], kind: TemplateKind) {
+    mask.fill(1);
+    let len = bytes.len();
+    let mut line_start = 0;
+    let mut block: Option<(usize, TemplateBlock)> = None;
+    let mut ruby_continues = false;
+    while line_start < len {
+        let eol = memchr::memchr(b'\n', &bytes[line_start..])
+            .map(|n| line_start + n)
+            .unwrap_or(len);
+        let mut ws = line_start;
+        while ws < eol && matches!(bytes[ws], b' ' | b'\t') {
+            ws += 1;
+        }
+        let indent = ws - line_start;
+        let content_end = if eol > ws && bytes[eol - 1] == b'\r' {
+            eol - 1
+        } else {
+            eol
+        };
+        let next_line = |pos: usize| {
+            memchr::memchr(b'\n', &bytes[pos..])
+                .map(|n| pos + n + 1)
+                .unwrap_or(len)
+        };
+
+        if let Some((block_indent, block_kind)) = block {
+            if ws == content_end || indent > block_indent {
+                match block_kind {
+                    TemplateBlock::Ruby => set_mask(mask, ws, content_end, false),
+                    TemplateBlock::Text => expose_text_interpolations(bytes, mask, ws, content_end),
+                    TemplateBlock::Comment => {}
                 }
-                let indent = ws - line_start;
-                let content_end = if eol > ws && bytes[eol - 1] == b'\r' {
-                    eol - 1
-                } else {
-                    eol
-                };
-                if let Some(filter_indent) = ruby_filter_indent {
-                    if ws == content_end || indent > filter_indent {
-                        set_mask(mask, ws, content_end, false);
-                        line_start = if eol < bytes.len() { eol + 1 } else { eol };
-                        continue;
-                    }
-                    ruby_filter_indent = None;
-                }
-                let filter_line = &bytes[ws..content_end];
-                if (kind == TemplateKind::Haml && filter_line == b":ruby")
-                    || (kind == TemplateKind::Slim && filter_line == b"ruby:")
-                {
-                    ruby_filter_indent = Some(indent);
-                    line_start = if eol < bytes.len() { eol + 1 } else { eol };
-                    continue;
-                }
-                let is_haml_comment = kind == TemplateKind::Haml
-                    && ws + 1 < eol
-                    && bytes[ws] == b'-'
-                    && bytes[ws + 1] == b'#';
-                let is_slim_comment = kind == TemplateKind::Slim && ws < eol && bytes[ws] == b'/';
-                if !is_haml_comment && !is_slim_comment {
-                    let executable = match kind {
-                        TemplateKind::Haml => ws < eol && matches!(bytes[ws], b'=' | b'-' | b'~'),
-                        TemplateKind::Slim => ws < eol && matches!(bytes[ws], b'=' | b'-'),
-                        _ => false,
-                    };
-                    if executable {
-                        set_mask(mask, ws + 1, content_end, false);
+                line_start = next_line(line_start);
+                continue;
+            }
+            block = None;
+        }
+        if ruby_continues {
+            // Include the preceding newline so literals spanning lines stay whole.
+            set_mask(mask, line_start.saturating_sub(1), content_end, false);
+            ruby_continues = ruby_line_continues(bytes, ws, content_end, kind);
+            line_start = next_line(line_start);
+            continue;
+        }
+        let content = &bytes[ws..content_end];
+        if content.is_empty() {
+            line_start = next_line(line_start);
+            continue;
+        }
+
+        let mut resume = line_start;
+        match kind {
+            TemplateKind::Haml => {
+                if content.starts_with(b"-#") {
+                    block = Some((indent, TemplateBlock::Comment));
+                } else if let Some(filter) = content.strip_prefix(b":") {
+                    let kind = if filter == b"ruby" {
+                        TemplateBlock::Ruby
                     } else {
-                        let tag_line = match kind {
-                            TemplateKind::Haml => {
-                                ws < content_end && matches!(bytes[ws], b'%' | b'.' | b'#')
-                            }
-                            TemplateKind::Slim => {
-                                ws < content_end && bytes[ws].is_ascii_alphabetic()
-                            }
-                            _ => false,
-                        };
-                        if tag_line {
-                            expose_template_attributes(bytes, mask, ws, content_end);
-                            expose_template_assignments(bytes, mask, ws, content_end);
-                        }
-                    }
-                    let mut i = line_start;
-                    while i + 1 < content_end {
-                        if bytes[i] == b'\\' {
-                            i = (i + 2).min(content_end);
-                            continue;
-                        }
-                        if bytes[i] == b'#' && bytes[i + 1] == b'{' {
-                            if let Some(close) = find_interpolation_end(bytes, i + 2, content_end) {
-                                set_mask(mask, i + 2, close, false);
-                                i = close + 1;
-                                continue;
-                            }
-                        }
-                        i += 1;
-                    }
+                        TemplateBlock::Text
+                    };
+                    block = Some((indent, kind));
+                } else if let Some(code) = haml_script_start(bytes, ws, content_end) {
+                    set_mask(mask, code, content_end, false);
+                    ruby_continues = ruby_line_continues(bytes, code, content_end, kind);
+                } else if is_haml_tag_start(content) {
+                    let (end, continues) = parse_haml_tag(bytes, mask, ws);
+                    resume = end;
+                    ruby_continues = continues;
                 }
-                line_start = if eol < bytes.len() { eol + 1 } else { eol };
+            }
+            TemplateKind::Slim => {
+                if content[0] == b'/' {
+                    block = Some((indent, TemplateBlock::Comment));
+                } else if content[0] == b'|' || content[0] == b'\'' {
+                    block = Some((indent, TemplateBlock::Text));
+                } else if content == b"ruby:" {
+                    block = Some((indent, TemplateBlock::Ruby));
+                } else if content
+                    .strip_suffix(b":")
+                    .is_some_and(|engine| SLIM_EMBEDDED_ENGINES.contains(&engine))
+                {
+                    block = Some((indent, TemplateBlock::Text));
+                } else if matches!(content[0], b'=' | b'-') {
+                    let mut code = ws + 1;
+                    while code < content_end && matches!(bytes[code], b'=' | b'<' | b'>' | b'\'') {
+                        code += 1;
+                    }
+                    set_mask(mask, code, content_end, false);
+                    ruby_continues = ruby_line_continues(bytes, code, content_end, kind);
+                } else if is_slim_tag_start(content) {
+                    let (end, continues) = parse_slim_tag(bytes, mask, ws);
+                    resume = end;
+                    ruby_continues = continues;
+                }
+            }
+            _ => {}
+        }
+        if block != Some((indent, TemplateBlock::Comment)) {
+            expose_text_interpolations(bytes, mask, line_start, content_end);
+        }
+        line_start = next_line(resume.max(line_start));
+    }
+}
+
+fn expose_text_interpolations(bytes: &[u8], mask: &mut [u8], start: usize, end: usize) {
+    let mut i = start;
+    while i + 1 < end {
+        if bytes[i] == b'\\' {
+            i = (i + 2).min(end);
+            continue;
+        }
+        if bytes[i] == b'#' && bytes[i + 1] == b'{' {
+            if let Some(close) = find_interpolation_end(bytes, i + 2, end) {
+                set_mask(mask, i + 2, close, false);
+                i = close + 1;
+                continue;
             }
         }
+        i += 1;
+    }
+}
+
+/// Whether Ruby code ending at `end` continues on the next line: Haml and Slim
+/// both continue after a trailing `,`; Slim also after a trailing `\`.
+fn ruby_line_continues(bytes: &[u8], start: usize, end: usize, kind: TemplateKind) -> bool {
+    let code = bytes[start..end].trim_ascii_end();
+    match code.last() {
+        Some(b',') => true,
+        Some(b'\\') => kind == TemplateKind::Slim,
+        _ => false,
+    }
+}
+
+/// Start of the Ruby code on a Haml script line (`= x`, `- x`, `~ x`,
+/// `!= x`, `&= x`); `==`, `!==` and `&==` are interpolated text.
+fn haml_script_start(bytes: &[u8], ws: usize, end: usize) -> Option<usize> {
+    let rest = &bytes[ws..end];
+    let indicator = match rest {
+        [b'!' | b'&', b'=', b'=', ..] | [b'=', b'=', ..] => return None,
+        [b'!' | b'&', b'=', ..] => 2,
+        [b'=' | b'-' | b'~', ..] => 1,
+        _ => return None,
+    };
+    Some(ws + indicator)
+}
+
+#[inline]
+fn is_template_name_char(b: u8) -> bool {
+    is_word_char(b) || b == b'-'
+}
+
+fn is_haml_tag_start(content: &[u8]) -> bool {
+    match content {
+        [b'%', next, ..] => is_template_name_char(*next),
+        [b'.' | b'#', next, ..] => is_template_name_char(*next),
+        _ => false,
+    }
+}
+
+fn is_slim_tag_start(content: &[u8]) -> bool {
+    match content {
+        [first, ..] if first.is_ascii_alphabetic() => true,
+        [b'.' | b'#', next, ..] => is_template_name_char(*next),
+        _ => false,
+    }
+}
+
+/// Skip `.class` / `#id` shortcuts (and a tag name when `tag_prefix` is set).
+fn skip_tag_and_shortcuts(bytes: &[u8], mut i: usize, end: usize, tag_prefix: Option<u8>) -> usize {
+    if tag_prefix.is_none_or(|prefix| bytes.get(i) == Some(&prefix)) {
+        if tag_prefix.is_some() {
+            i += 1;
+        }
+        // Namespaced names (`svg:rect`) keep inner colons; a trailing `:` is
+        // Slim's inline nesting.
+        while i < end
+            && (is_template_name_char(bytes[i])
+                || (bytes[i] == b':' && bytes.get(i + 1).is_some_and(|&b| is_word_char(b))))
+        {
+            i += 1;
+        }
+    }
+    while i + 1 < end && matches!(bytes[i], b'.' | b'#') && is_template_name_char(bytes[i + 1]) {
+        i += 1;
+        while i < end && is_template_name_char(bytes[i]) {
+            i += 1;
+        }
+    }
+    i
+}
+
+fn line_content_end(bytes: &[u8], pos: usize) -> usize {
+    let eol = memchr::memchr(b'\n', &bytes[pos..])
+        .map(|n| pos + n)
+        .unwrap_or(bytes.len());
+    if eol > pos && bytes[eol - 1] == b'\r' {
+        eol - 1
+    } else {
+        eol
+    }
+}
+
+/// Closing bracket for a template attribute group opened at `open_pos`,
+/// skipping quoted strings; attribute groups may span lines.
+fn find_template_group_end(bytes: &[u8], open_pos: usize) -> Option<usize> {
+    const MAX_LINES: usize = 64;
+    let open = bytes[open_pos];
+    let close = match open {
+        b'(' => b')',
+        b'[' => b']',
+        _ => b'}',
+    };
+    let mut depth = 0usize;
+    let mut lines = 0;
+    let mut i = open_pos;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => {
+                i += 2;
+                continue;
+            }
+            quote @ (b'\'' | b'"') => {
+                i += 1;
+                while i < bytes.len() && bytes[i] != quote && bytes[i] != b'\n' {
+                    i += if bytes[i] == b'\\' { 2 } else { 1 };
+                }
+                if bytes.get(i) != Some(&quote) {
+                    continue;
+                }
+            }
+            b'\n' => {
+                lines += 1;
+                if lines > MAX_LINES {
+                    return None;
+                }
+            }
+            b if b == open => depth += 1,
+            b if b == close => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Expose an attribute group at `open_pos`; returns the position after it.
+fn expose_attribute_group(bytes: &[u8], mask: &mut [u8], open_pos: usize) -> usize {
+    match find_template_group_end(bytes, open_pos) {
+        Some(close) => {
+            set_mask(mask, open_pos + 1, close, false);
+            close + 1
+        }
+        None => {
+            let end = line_content_end(bytes, open_pos);
+            set_mask(mask, open_pos + 1, end, false);
+            end
+        }
+    }
+}
+
+/// Parse a Haml tag line (`%tag.cls#id{...}(...)[...]= code`) starting at
+/// `ws`. Returns the last consumed position and whether Ruby continues on
+/// the next line. Text after the tag stays masked.
+fn parse_haml_tag(bytes: &[u8], mask: &mut [u8], ws: usize) -> (usize, bool) {
+    let mut end = line_content_end(bytes, ws);
+    let mut i = skip_tag_and_shortcuts(bytes, ws, end, Some(b'%'));
+    while i < end && matches!(bytes[i], b'{' | b'(' | b'[') {
+        i = expose_attribute_group(bytes, mask, i);
+        end = line_content_end(bytes, i);
+    }
+    while i < end && matches!(bytes[i], b'<' | b'>') {
+        i += 1;
+    }
+    if let Some(code) = haml_script_start(bytes, i, end) {
+        set_mask(mask, code, end, false);
+        return (
+            end,
+            ruby_line_continues(bytes, code, end, TemplateKind::Haml),
+        );
+    }
+    (end, false)
+}
+
+/// Parse a Slim tag line following Slim's own grammar: tag and shortcuts,
+/// then either a wrapped attribute group or `name=value` attributes (code
+/// values are Ruby, quoted values are text), then `:` inline nesting, `=`
+/// output, or text.
+fn parse_slim_tag(bytes: &[u8], mask: &mut [u8], ws: usize) -> (usize, bool) {
+    let mut end = line_content_end(bytes, ws);
+    let mut i = ws;
+    loop {
+        i = if bytes[i].is_ascii_alphabetic() {
+            skip_tag_and_shortcuts(bytes, i, end, None)
+        } else {
+            skip_tag_and_shortcuts(bytes, i, end, Some(b'*'))
+        };
+        while i < end && matches!(bytes[i], b'<' | b'>' | b'\'') {
+            i += 1;
+        }
+        let group = skip_whitespace_inline(bytes, i);
+        if group < end && matches!(bytes[group], b'(' | b'[' | b'{') {
+            i = expose_attribute_group(bytes, mask, group);
+            end = line_content_end(bytes, i);
+        } else {
+            i = parse_slim_plain_attributes(bytes, mask, i, end);
+        }
+        let next = skip_whitespace_inline(bytes, i);
+        if next < end && bytes[next] == b':' {
+            let child = skip_whitespace_inline(bytes, next + 1);
+            if child < end && is_slim_tag_start(&bytes[child..end]) {
+                i = child;
+                continue;
+            }
+            return (end, false);
+        }
+        if next < end && bytes[next] == b'=' {
+            let mut code = next + 1;
+            while code < end && matches!(bytes[code], b'=' | b'<' | b'>' | b'\'') {
+                code += 1;
+            }
+            set_mask(mask, code, end, false);
+            return (
+                end,
+                ruby_line_continues(bytes, code, end, TemplateKind::Slim),
+            );
+        }
+        return (end, false);
+    }
+}
+
+/// Unwrapped Slim attributes: `name = value` pairs until something that is
+/// not an attribute. Code values end at whitespace outside brackets.
+fn parse_slim_plain_attributes(bytes: &[u8], mask: &mut [u8], mut i: usize, end: usize) -> usize {
+    loop {
+        let name_start = skip_whitespace_inline(bytes, i);
+        let mut name_end = name_start;
+        while name_end < end
+            && !bytes[name_end].is_ascii_whitespace()
+            && !matches!(
+                bytes[name_end],
+                b'"' | b'\'' | b'<' | b'>' | b'/' | b'=' | b'(' | b')' | b'[' | b']' | b'{' | b'}'
+            )
+        {
+            name_end += 1;
+        }
+        if name_end == name_start || bytes[name_start] == b':' {
+            return i;
+        }
+        let eq = skip_whitespace_inline(bytes, name_end);
+        if eq >= end || bytes[eq] != b'=' {
+            return i;
+        }
+        let mut value = eq + 1;
+        if value < end && bytes[value] == b'=' {
+            value += 1;
+        }
+        value = skip_whitespace_inline(bytes, value);
+        if value >= end {
+            return i;
+        }
+        if matches!(bytes[value], b'"' | b'\'') {
+            let quote = bytes[value];
+            let mut close = value + 1;
+            while close < end && bytes[close] != quote {
+                close += if bytes[close] == b'\\' { 2 } else { 1 };
+            }
+            i = (close + 1).min(end);
+            continue;
+        }
+        let mut code_end = value;
+        let mut depth = 0usize;
+        let mut delims = (0u8, 0u8);
+        while code_end < end {
+            let b = bytes[code_end];
+            if depth == 0 && b.is_ascii_whitespace() {
+                break;
+            }
+            if matches!(b, b'"' | b'\'') {
+                code_end += 1;
+                while code_end < end && bytes[code_end] != b {
+                    code_end += if bytes[code_end] == b'\\' { 2 } else { 1 };
+                }
+            } else if depth == 0 && matches!(b, b'(' | b'[' | b'{') {
+                delims = (
+                    b,
+                    match b {
+                        b'(' => b')',
+                        b'[' => b']',
+                        _ => b'}',
+                    },
+                );
+                depth = 1;
+            } else if depth > 0 && b == delims.0 {
+                depth += 1;
+            } else if depth > 0 && b == delims.1 {
+                depth -= 1;
+            }
+            code_end += 1;
+        }
+        let code_end = code_end.min(end);
+        set_mask(mask, value, code_end, false);
+        i = code_end;
     }
 }
 
@@ -5197,6 +5508,95 @@ require 'real_regex'
             assert!(modules.contains_key(expected_module), "{name}");
             assert!(!modules.contains_key(static_module), "{name}");
         }
+    }
+
+    fn template_modules(name: &str, content: &str) -> HashSet<String> {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join(name);
+        std::fs::write(&file, content).unwrap();
+        let mut modules = HashMap::new();
+        scan_file(
+            file.to_str().unwrap(),
+            dir.path().to_str().unwrap(),
+            &mut modules,
+        );
+        modules.into_keys().collect()
+    }
+
+    #[test]
+    fn haml_and_slim_text_is_not_exposed_as_ruby() {
+        for (name, content) in [
+            (
+                "a.haml",
+                "%p Hello (it's me)\n= Beta.render\n%p= link_to 'x', y\n",
+            ),
+            (
+                "a.slim",
+                "p Hello (it's me)\n= Beta.render\np = link_to 'x', y\n",
+            ),
+        ] {
+            let modules = template_modules(name, content);
+            assert!(modules.contains("Beta"), "{name}: {modules:?}");
+        }
+        let modules = template_modules("b.haml", "%p See (Gamma docs) here {Delta}\n");
+        assert!(!modules.contains("Gamma"), "{modules:?}");
+        assert!(!modules.contains("Delta"), "{modules:?}");
+    }
+
+    #[test]
+    fn haml_and_slim_attributes_and_output_after_tags() {
+        let modules = template_modules(
+            "a.haml",
+            "%p{class: \"a\"}= Beta.x\n#main= Gamma.x\n%a.btn#go(href=Delta.path)[Epsilon] text\n%img/\n",
+        );
+        for expected in ["Beta", "Gamma", "Delta", "Epsilon"] {
+            assert!(modules.contains(expected), "{expected}: {modules:?}");
+        }
+        let modules = template_modules(
+            "a.slim",
+            "div class=Beta.cls\na(href=Gamma.path title=\"it's\") Text\nli: a href=Delta.path Link\n.box#id data-x=Epsilon.x Plain Text\n",
+        );
+        for expected in ["Beta", "Gamma", "Delta", "Epsilon"] {
+            assert!(modules.contains(expected), "{expected}: {modules:?}");
+        }
+        assert!(!modules.contains("Link"));
+        assert!(!modules.contains("Plain"));
+    }
+
+    #[test]
+    fn haml_and_slim_multiline_ruby() {
+        for (name, content) in [
+            ("a.haml", "= link_to \"x\",\n  Beta.path\n%p Static\n"),
+            ("a.slim", "= link_to \"x\",\n  Beta.path\np Static\n"),
+            ("b.slim", "= link_to \"x\", \\\n  Beta.path\np Static\n"),
+            ("b.haml", "%div{ a: 1,\n  b: Beta.x }\n%p Static\n"),
+            ("c.haml", "%p= link_to \"x\",\n  Beta.path\n%p Static\n"),
+            ("c.slim", "div(a=1\n  b=Beta.x)\np Static\n"),
+        ] {
+            let modules = template_modules(name, content);
+            assert!(modules.contains("Beta"), "{name}: {modules:?}");
+            assert!(!modules.contains("Static"), "{name}: {modules:?}");
+        }
+    }
+
+    #[test]
+    fn haml_and_slim_filters_and_comment_blocks_stay_masked() {
+        let modules = template_modules(
+            "a.haml",
+            ":javascript\n  var Beta = 1;\n  .Gamma { x }\n-#\n  %p= Delta.x\n= Epsilon.x\n",
+        );
+        assert!(!modules.contains("Beta"));
+        assert!(!modules.contains("Gamma"));
+        assert!(!modules.contains("Delta"));
+        assert!(modules.contains("Epsilon"));
+        let modules = template_modules(
+            "a.slim",
+            "javascript:\n  Beta = foo.bar\n/\n  p = Delta.x\n| Some text\n  Gamma = x\n= Epsilon.x\n",
+        );
+        assert!(!modules.contains("Beta"));
+        assert!(!modules.contains("Delta"));
+        assert!(!modules.contains("Gamma"));
+        assert!(modules.contains("Epsilon"));
     }
 
     #[test]
