@@ -23,7 +23,7 @@ Parse Gemfile (ruby-prism AST)
   → Match gem usage against scan results
   → Scan database adapters (config/database.yml)
   → Scan scripts (Makefile, Dockerfile, CI configs)
-  → [lazy] Only unresolved gems: discover module names → re-match
+  → [lazy] Only unresolved gems: discover module names (+ vendor/cache listing for uninstalled gems) → re-match
   → Apply ignore file (.unused_gems.yml)
   → Parse Gemfile.lock (transitive dep counts)
   → Output (text/json/github) or diff against baseline
@@ -50,7 +50,11 @@ Parse Gemfile (ruby-prism AST)
 
 **Comment filtering:** All scanners (Ruby and non-Ruby) filter `#` comment lines. Ruby files additionally filter `=begin`/`=end` blocks, heredoc content, and inline comments (e.g., `x = 1 # require 'foo'`). Script scanning strips comment lines before regex matching.
 
-**Require path resolution is multi-layered:** (1) introspect installed gem, (2) vendor/cache tarball metadata, (3) hard-coded `KNOWN_REQUIRE_PATHS` table in main.rs, (4) heuristic name transforms (hyphen→underscore, snake→PascalCase).
+**Gem path discovery (introspect.rs `find_gem_paths`):** BUNDLE_PATH (`ruby/<api>` of the active Ruby, else newest) → GEM_PATH + GEM_HOME → filesystem probes for rbenv, rvm, mise, asdf, chruby and a version-manager `ruby` on PATH (each yields `<prefix>/lib/ruby/gems/<api>` + `~/.gem/ruby/<api>`) → `gem environment gempath` run in the project dir as a last resort. Installed versions are ordered with `Gem::Version` semantics (prereleases sort first).
+
+**Require path resolution is multi-layered:** (1) introspect the installed gem (require dirs from `<base>/specifications/<full_name>.gemspec` or the checkout's `*.gemspec`) UNIONed with (2) the curated `known::REQUIRE_PATHS` table; (3) heuristic name transforms (hyphen→slash/underscore) only when neither applies; (4) lazily, for uninstalled gems still unresolved, the real file listing of the `vendor/cache` `.gem` (bounded reads). Only `lib/*.rb` stems, folders named after the gem (incl. hyphen→slash like `rubocop/performance`) and folders with their own `<folder>.rb` that no other Gemfile gem claims are require roots; other folders are namespace extensions whose files are listed individually (so `solid_cache`'s `lib/active_support/` never claims `require "active_support"`).
+
+**Module names:** top-level declarations of `lib/<gem>.rb` (ruby-prism) ∪ `known::MODULE_NAMES` ∪ PascalCase heuristics. `introspect::NamespaceClaims` filters constants and prefix heuristics owned by another gem (Gemfile, installed, known table; longest prefix wins) or shared by a gem family (`Google::Cloud`), except namespaces of undeclared direct lockfile dependencies. Ruby core/stdlib constants are never used as evidence.
 
 **Bundler.require handling:** When `Bundler.require(*Rails.groups)` is detected, only `:default` group gems are marked `BundlerRequired`. Dev/test-only gems without direct code references are reported as `Unused`.
 

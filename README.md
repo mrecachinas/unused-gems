@@ -6,7 +6,7 @@ High-performance scanner for unused gems in Ruby projects, built in Rust with [r
 
 - **Gemfile parsing** via ruby-prism AST — handles `gem`, `group`, `platforms`, `require:`, `path:`, `git:`, `eval_gemfile` and `gemspec` directives
 - **Parallel source scanning** with rayon — scans Ruby/ERB/HAML/YAML files concurrently
-- **Gem introspection** — discovers actual require paths and module names from installed gems
+- **Gem introspection** — discovers actual require paths and top-level module names from installed gems (rbenv, rvm, mise, asdf, chruby, GEM_PATH/GEM_HOME, BUNDLE_PATH, git checkouts), without letting namespace-extension folders or reopened constants claim other gems' usage
 - **Script/CI detection** — finds gem usage in Makefiles, Dockerfiles, CI configs
 - **Gemfile.lock analysis** — counts transitive dependency chains
 - **Monorepo support** — merge multiple explicit Gemfiles with one source scan
@@ -176,7 +176,7 @@ Built with Rust for maximum performance:
 - **Parallel file walking** via `ignore` crate (scans generated sources even when gitignored)
 - **Bincode file cache** — unchanged files skip scanning on repeat runs
 - **Zero-alloc hot path** — extension checks, comment detection all avoid heap allocation
-- **vendor/cache support** — extracts gemspec metadata from packed `.gem` tarballs
+- **vendor/cache support** — lists require paths from packed `.gem` tarballs (size-bounded, only for gems that aren't installed)
 
 On github/github (~53K Ruby files): **~2.8s** (vs scc line counting at 1.85s).
 
