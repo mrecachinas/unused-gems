@@ -81,8 +81,8 @@ unused-gems --diff baseline.json /path/to/project
 # Fail only when a gem becomes unused or a newly added gem is unused
 unused-gems --diff baseline.json --fail-on new /path/to/project
 
-# Skip additional directories
-unused-gems --skip-dirs tmp,cache /path/to/project
+# Skip additional directories (names, or paths relative to the project root)
+unused-gems --skip-dirs tmp,cache,app/legacy /path/to/project
 
 # Treat the test group as active for Bundler.require(*Rails.groups)
 unused-gems --rails-env test /path/to/project
@@ -102,7 +102,7 @@ unused-gems --gemfile engines/a/Gemfile --gemfile engines/b/Gemfile /path/to/pro
     --ignore-file <PATH>  Path to ignore file (default: .unused_gems.yml)
     --gemfile <PATH>      Gemfile path to analyze; repeat for monorepos
     --diff <BASELINE>     Compare against previous JSON output
-    --skip-dirs <DIRS>    Additional directories to skip (comma-separated)
+    --skip-dirs <DIRS>    Additional directories to skip (comma-separated names or root-relative paths)
     --rails-env <ENV>      Rails environment group considered active
 -h, --help                Print help
 ```
@@ -174,7 +174,7 @@ Built with Rust for maximum performance:
 - **ruby-prism** for accurate Gemfile AST parsing (same parser as CRuby 3.3+)
 - **Hand-rolled byte scanners** with SIMD-accelerated `memchr` — no per-file regex overhead
 - **Parallel file walking** via `ignore` crate (scans generated sources even when gitignored)
-- **Bincode file cache** — unchanged files skip scanning on repeat runs
+- **Bincode file cache** — unchanged files skip scanning on repeat runs (entries for removed files are pruned; the cache is replaced atomically)
 - **Zero-alloc hot path** — extension checks, comment detection all avoid heap allocation
 - **vendor/cache support** — extracts gemspec metadata from packed `.gem` tarballs
 

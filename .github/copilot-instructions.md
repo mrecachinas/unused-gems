@@ -19,6 +19,7 @@ Set `BENCH=1` to log per-step timing via the `timed!` macro in main.rs.
 ```
 Parse Gemfile (ruby-prism AST)
   → [parallel] Build gem index + Scan source tree (rayon::join)
+  → Scan storage adapters (config/storage.yml + attachment `service:` names from the walk)
   → Resolve require_paths per gem (parallel, multi-layer heuristics)
   → Match gem usage against scan results
   → Scan database adapters (config/database.yml)
@@ -46,9 +47,15 @@ Parse Gemfile (ruby-prism AST)
 - Byte-level scanning with `memchr::memmem::Finder` instead of regex in hot paths (scanner.rs)
 - `once_cell::sync::Lazy` for static regex and lookup table initialization
 - `rayon` for parallelism: `rayon::join()` for concurrent stages, `par_iter()` for batch operations
-- Bincode file cache keyed by mtime (nanosecond precision) + size to skip re-scanning unchanged files
+- Bincode file cache keyed by mtime (nanosecond precision) + size to skip re-scanning unchanged files; entries hold everything a file contributes (requires, its unique constant names, bundler groups, attachment storage services), unvisited entries are pruned on save, and the file is written atomically (temp file + rename). Bump `CACHE_VERSION` when entry contents change
+- Never re-read source files outside the walker: collect new per-file facts in `scan_file_bytes_with` and expose them via `FileResult`/`ScanResults`
+- Per-file dedup (borrowed `&[u8]` sets) before touching thread-wide maps; lexer memo caches (`LexCache`) keep malformed input linear
 
-**Comment filtering:** All scanners (Ruby and non-Ruby) filter `#` comment lines. Ruby files additionally filter `=begin`/`=end` blocks, heredoc content, and inline comments (e.g., `x = 1 # require 'foo'`). Script scanning strips comment lines before regex matching.
+**Comment filtering:** All scanners (Ruby and non-Ruby) filter `#` comment lines. Ruby files additionally filter `=begin`/`=end` blocks, heredoc content, string/regex/percent-literal interiors (keeping `#{}` code), the `__END__` data section, and inline comments (e.g., `x = 1 # require 'foo'`). Haml/Slim tag lines are parsed so only attributes, `=` output, script lines (with `,`/`\` continuations) and `#{}` are treated as Ruby. Script scanning strips comment lines before regex matching.
+
+**RuboCop configs:** `.rubocop*.yml` / `.standard*.yml` are parsed with serde_yaml (`require`/`plugins` strings, lists or single-key maps; `inherit_gem` keys) with a line-based fallback for non-YAML (ERB) configs.
+
+**Walking:** Symlinks are followed (loops are skipped). `--skip-dirs` entries match directory names, or paths relative to the scan root when they contain a separator (`app/legacy`).
 
 **Require path resolution is multi-layered:** (1) introspect installed gem, (2) vendor/cache tarball metadata, (3) hard-coded `KNOWN_REQUIRE_PATHS` table in main.rs, (4) heuristic name transforms (hyphen→underscore, snake→PascalCase).
 

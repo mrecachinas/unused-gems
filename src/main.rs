@@ -58,7 +58,7 @@ struct Cli {
     #[arg(long)]
     diff: Option<String>,
 
-    /// Additional directories to skip (comma-separated)
+    /// Additional directories to skip (comma-separated names or root-relative paths)
     #[arg(long, value_delimiter = ',')]
     skip_dirs: Option<Vec<String>>,
 
