@@ -330,7 +330,17 @@ fn main() {
             },
         )
     );
-    introspect::index_declared_gem_sources(&dir, &gems, &gem_paths, &mut gem_index);
+    let lockfile_paths: Vec<PathBuf> = gemfile_paths
+        .iter()
+        .map(|gemfile| lockfile::lockfile_path_for(gemfile))
+        .collect();
+    introspect::index_declared_gem_sources(
+        &dir,
+        &gems,
+        &gem_paths,
+        &lockfile_paths,
+        &mut gem_index,
+    );
     // Attachment `service:` symbols come from the parallel source walk.
     let storage_adapters = timed!(
         "scan_storage_adapters",
@@ -552,7 +562,7 @@ fn main() {
         let report = diff::compute_diff(&results, baseline);
         match cli.output.as_str() {
             "json" => diff::print_diff_json(&report),
-            "github" => diff::print_diff_github(&report, &dir),
+            "github" => diff::print_diff_github(&report, &results, &dir),
             _ => diff::print_diff_text(&report),
         }
         let new_unused_count = report.new_unused_count();

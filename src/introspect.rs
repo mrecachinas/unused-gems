@@ -935,6 +935,7 @@ pub fn index_declared_gem_sources(
     project_dir: &Path,
     gems: &[GemEntry],
     gem_paths: &[PathBuf],
+    lockfile_paths: &[PathBuf],
     index: &mut HashMap<String, PathBuf>,
 ) {
     let mut git_context: Option<(Vec<PathBuf>, HashMap<String, LockedGitSource>)> = None;
@@ -955,7 +956,7 @@ pub fn index_declared_gem_sources(
                 let (roots, locked) = git_context.get_or_insert_with(|| {
                     (
                         git_checkout_roots(project_dir, gem_paths),
-                        read_locked_git_sources(project_dir),
+                        read_locked_git_sources(lockfile_paths),
                     )
                 });
                 if let Some(path) = find_git_checkout(roots, &gem.name, url, locked.get(&gem.name))
@@ -986,11 +987,18 @@ struct LockedGitSource {
     revision: String,
 }
 
-/// Map gem name → GIT `remote:`/`revision:` from the project's Gemfile.lock.
-fn read_locked_git_sources(project_dir: &Path) -> HashMap<String, LockedGitSource> {
-    std::fs::read_to_string(project_dir.join("Gemfile.lock"))
-        .map(|content| parse_locked_git_sources(&content))
-        .unwrap_or_default()
+/// Map gem name → GIT `remote:`/`revision:` from the analyzed Gemfiles' lockfiles
+/// (`Gemfile.lock`, `gems.locked`, `<gemfile>.lock`). Earlier lockfiles win.
+fn read_locked_git_sources(lockfile_paths: &[PathBuf]) -> HashMap<String, LockedGitSource> {
+    let mut sources = HashMap::new();
+    for path in lockfile_paths {
+        if let Ok(content) = std::fs::read_to_string(path) {
+            for (name, source) in parse_locked_git_sources(&content) {
+                sources.entry(name).or_insert(source);
+            }
+        }
+    }
+    sources
 }
 
 fn parse_locked_git_sources(content: &str) -> HashMap<String, LockedGitSource> {
@@ -2434,7 +2442,13 @@ PLATFORMS
             declarations: Vec::new(),
         }];
         let mut index = HashMap::new();
-        index_declared_gem_sources(dir.path(), &gems, &[], &mut index);
+        index_declared_gem_sources(
+            dir.path(),
+            &gems,
+            &[],
+            &[dir.path().join("Gemfile.lock")],
+            &mut index,
+        );
         assert_eq!(index.get("admin_tools"), Some(&gem_dir));
     }
 
@@ -2458,7 +2472,13 @@ PLATFORMS
             declarations: Vec::new(),
         }];
         let mut index = HashMap::new();
-        index_declared_gem_sources(dir.path(), &gems, &[], &mut index);
+        index_declared_gem_sources(
+            dir.path(),
+            &gems,
+            &[],
+            &[dir.path().join("Gemfile.lock")],
+            &mut index,
+        );
         assert_eq!(index.get("custom_gem"), Some(&checkout));
     }
 
@@ -2484,7 +2504,13 @@ PLATFORMS
         }];
 
         let mut index = HashMap::new();
-        index_declared_gem_sources(dir.path(), &gems, &[], &mut index);
+        index_declared_gem_sources(
+            dir.path(),
+            &gems,
+            &[],
+            &[dir.path().join("Gemfile.lock")],
+            &mut index,
+        );
         assert_eq!(index.get("custom_gem"), Some(&first));
     }
 
@@ -2512,7 +2538,13 @@ PLATFORMS
             git_gem("foo-bar", "https://example.com/foo-bar.git"),
         ];
         let mut index = HashMap::new();
-        index_declared_gem_sources(dir.path(), &gems, &[], &mut index);
+        index_declared_gem_sources(
+            dir.path(),
+            &gems,
+            &[],
+            &[dir.path().join("Gemfile.lock")],
+            &mut index,
+        );
         assert_eq!(index["foo"], root.join("foo-c0ffee123456"));
         assert_eq!(index["foo-bar"], root.join("foo-bar-0a1b2c3d4e5f"));
     }
@@ -2537,8 +2569,39 @@ PLATFORMS
         }
         let gems = vec![git_gem("activesupport", "https://github.com/rails/rails")];
         let mut index = HashMap::new();
-        index_declared_gem_sources(&project, &gems, &[gem_home], &mut index);
+        index_declared_gem_sources(
+            &project,
+            &gems,
+            &[gem_home],
+            &[project.join("Gemfile.lock")],
+            &mut index,
+        );
         assert_eq!(index["activesupport"], locked);
+    }
+
+    #[test]
+    fn index_git_gem_prefers_revision_from_gems_locked() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("app");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(
+            project.join("gems.locked"),
+            "GIT\n  remote: https://github.com/acme/foo.git\n  revision: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n  specs:\n    foo (1.0.0)\n",
+        )
+        .unwrap();
+        let gem_home = dir.path().join("gem_home");
+        let checkouts = gem_home.join("bundler/gems");
+        let stale = checkouts.join("foo-aaaaaaaaaaaa");
+        let locked = checkouts.join("foo-bbbbbbbbbbbb");
+        for path in [&stale, &locked] {
+            std::fs::create_dir_all(path.join("lib")).unwrap();
+            std::fs::write(path.join("foo.gemspec"), "").unwrap();
+        }
+        let gems = vec![git_gem("foo", "https://github.com/acme/foo.git")];
+        let lockfile = crate::lockfile::lockfile_path_for(&project.join("gems.rb"));
+        let mut index = HashMap::new();
+        index_declared_gem_sources(&project, &gems, &[gem_home], &[lockfile], &mut index);
+        assert_eq!(index["foo"], locked);
     }
 
     #[test]
@@ -2550,7 +2613,13 @@ PLATFORMS
         std::fs::write(checkout.join("acme.gemspec"), "").unwrap();
         let gems = vec![git_gem("acme", "git@example.com:org/acme-sdk.git")];
         let mut index = HashMap::new();
-        index_declared_gem_sources(dir.path(), &gems, &[gem_home], &mut index);
+        index_declared_gem_sources(
+            dir.path(),
+            &gems,
+            &[gem_home],
+            &[dir.path().join("Gemfile.lock")],
+            &mut index,
+        );
         assert_eq!(index["acme"], checkout);
     }
 

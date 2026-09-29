@@ -166,17 +166,15 @@ pub fn print_diff_json(report: &DiffReport) {
 }
 
 /// Emit a GitHub warning annotation for each gem that is newly unused.
-pub fn print_diff_github(report: &DiffReport, dir: &Path) {
+pub fn print_diff_github(report: &DiffReport, results: &HashMap<String, GemResult>, dir: &Path) {
     let line_nums = crate::output::gemfile_line_numbers(dir);
     for c in report.new_unused() {
-        let location = match line_nums.get(&c.name) {
-            Some(line) => format!(
-                "file={},line={}",
-                crate::output::escape_property("Gemfile"),
-                line
-            ),
-            None => format!("file={}", crate::output::escape_property("Gemfile")),
-        };
+        let location = crate::output::annotation_location(&crate::output::gem_location(
+            results.get(&c.name),
+            &c.name,
+            dir,
+            &line_nums,
+        ));
         let msg = match &c.previous_status {
             Some(prev) => format!("Gem '{}' became unused (was: {})", c.name, prev),
             None => format!("Newly added gem '{}' appears unused", c.name),
@@ -329,6 +327,6 @@ mod tests {
         assert_eq!(report.new_unused_count(), 2);
         print_diff_json(&report);
         let dir = tempfile::tempdir().unwrap();
-        print_diff_github(&report, dir.path());
+        print_diff_github(&report, &results, dir.path());
     }
 }

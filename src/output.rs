@@ -219,9 +219,10 @@ pub fn print_results_json(
 
 pub fn print_results_sarif(
     results: &HashMap<String, GemResult>,
-    _dir: &Path,
+    dir: &Path,
     _lock_deps: &HashMap<String, Vec<String>>,
 ) -> usize {
+    let line_nums = gemfile_line_numbers(dir);
     let mut sarif_results = Vec::new();
     let mut sorted: Vec<(&String, &GemResult)> = results.iter().collect();
     sorted.sort_by_key(|(n, _)| n.as_str());
@@ -230,15 +231,16 @@ pub fn print_results_sarif(
         if info.status != GemStatus::Unused {
             continue;
         }
+        let (file, line) = gem_location(Some(info), name, dir, &line_nums);
+        let mut physical = serde_json::json!({ "artifactLocation": { "uri": file } });
+        if let Some(line) = line {
+            physical["region"] = serde_json::json!({ "startLine": line });
+        }
         sarif_results.push(serde_json::json!({
             "ruleId": "unused-gem",
             "level": "warning",
             "message": { "text": format!("Gem '{}' appears unused", name) },
-            "locations": [{
-                "physicalLocation": {
-                    "artifactLocation": { "uri": "Gemfile" }
-                }
-            }]
+            "locations": [{ "physicalLocation": physical }]
         }));
     }
 
@@ -290,20 +292,7 @@ pub fn print_results_github(
             continue;
         }
 
-        let declared = info
-            .gem
-            .declarations
-            .iter()
-            .find_map(|d| Some((d.file.as_ref()?, d.line?)));
-        let location = match (declared, line_nums.get(name)) {
-            (Some((file, line)), _) => format!(
-                "file={},line={}",
-                escape_property(&file.strip_prefix(dir).unwrap_or(file).display().to_string()),
-                line
-            ),
-            (None, Some(line)) => format!("file={},line={}", escape_property("Gemfile"), line),
-            (None, None) => format!("file={}", escape_property("Gemfile")),
-        };
+        let location = annotation_location(&gem_location(Some(info), name, dir, &line_nums));
 
         let level = if info.status == GemStatus::Unused {
             "warning"
@@ -431,6 +420,40 @@ fn summarize_evidence(evidence: &[Evidence]) -> String {
     parts.join(", ")
 }
 
+/// Where a gem is declared, relative to `dir`: its first declaration's recorded
+/// file:line (Gemfile, gems.rb, eval_gemfile, gemspec), else the root Gemfile line.
+pub(crate) fn gem_location(
+    info: Option<&GemResult>,
+    name: &str,
+    dir: &Path,
+    line_nums: &HashMap<String, usize>,
+) -> (String, Option<usize>) {
+    let declared = info.and_then(|info| {
+        info.gem
+            .declarations
+            .iter()
+            .find_map(|d| Some((d.file.as_ref()?, d.line?)))
+    });
+    match declared {
+        Some((file, line)) => (
+            file.strip_prefix(dir)
+                .unwrap_or(file)
+                .to_string_lossy()
+                .replace('\\', "/"),
+            Some(line),
+        ),
+        None => ("Gemfile".to_string(), line_nums.get(name).copied()),
+    }
+}
+
+/// `file=…[,line=…]` properties for a GitHub workflow command.
+pub(crate) fn annotation_location((file, line): &(String, Option<usize>)) -> String {
+    match line {
+        Some(line) => format!("file={},line={}", escape_property(file), line),
+        None => format!("file={}", escape_property(file)),
+    }
+}
+
 pub(crate) fn gemfile_line_numbers(dir: &Path) -> HashMap<String, usize> {
     let gemfile_path = dir.join("Gemfile");
     let content = match std::fs::read_to_string(gemfile_path) {
@@ -466,6 +489,33 @@ mod tests {
             source: None,
             declarations: Vec::new(),
         }
+    }
+
+    #[test]
+    fn gem_location_prefers_recorded_declaration_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let (name, mut result) = make_result("nokogiri", GemStatus::Unused, &["default"]);
+        let mut line_nums = HashMap::new();
+        line_nums.insert(name.clone(), 3);
+        assert_eq!(
+            gem_location(Some(&result), &name, dir.path(), &line_nums),
+            ("Gemfile".to_string(), Some(3))
+        );
+        result.gem.declarations.push(crate::types::GemDeclaration {
+            groups: vec!["default".to_string()],
+            platforms: Vec::new(),
+            autorequire: true,
+            install_if: crate::types::InstallCondition::Always,
+            file: Some(dir.path().join("gems.rb")),
+            line: Some(7),
+        });
+        let location = gem_location(Some(&result), &name, dir.path(), &line_nums);
+        assert_eq!(location, ("gems.rb".to_string(), Some(7)));
+        assert_eq!(annotation_location(&location), "file=gems.rb,line=7");
+        assert_eq!(
+            annotation_location(&("a,b:c".to_string(), None)),
+            "file=a%2Cb%3Ac"
+        );
     }
 
     fn make_result(name: &str, status: GemStatus, groups: &[&str]) -> (String, GemResult) {
