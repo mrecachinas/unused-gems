@@ -166,16 +166,14 @@ fn build_gem_result(gem_entry: &GemEntry, meta: &GemMeta, indexes: &MatchIndexes
     }
 
     // Determine status
-    let is_bundler_required = indexes.bundler_require_all
-        && gem_entry.groups.iter().any(|g| g == "default")
-        || gem_entry
-            .groups
-            .iter()
-            .any(|g| indexes.bundler_groups.contains(g));
+    let is_bundler_required = gem_entry.bundler_autorequired(|group| {
+        (indexes.bundler_require_all && group == "default")
+            || indexes.bundler_groups.contains(group)
+    });
 
     let status = if !found_files.is_empty() {
         GemStatus::Used
-    } else if is_bundler_required && !gem_entry.require_false {
+    } else if is_bundler_required {
         evidence.push(Evidence::BundlerRequire);
         GemStatus::BundlerRequired
     } else {
@@ -246,6 +244,7 @@ mod tests {
             module_names: module_names.iter().map(|s| s.to_string()).collect(),
             require_false: false,
             source: None,
+            declarations: Vec::new(),
         }
     }
 

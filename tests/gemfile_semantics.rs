@@ -17,13 +17,37 @@ fn write(path: &Path, contents: &str) {
 
 /// Run the tool over `project` and return `name -> (status, groups)`.
 fn run_tool(project: &Path) -> BTreeMap<String, (String, Vec<String>)> {
+    run_json(project, &[])
+        .into_iter()
+        .map(|(name, entry)| {
+            let status = entry["status"].as_str().unwrap().to_string();
+            let groups = entry["groups"]
+                .as_array()
+                .map(|g| {
+                    g.iter()
+                        .map(|v| v.as_str().unwrap().to_string())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            (name, (status, groups))
+        })
+        .collect()
+}
+
+/// Run the tool with extra CLI args and return `name -> JSON record`.
+fn run_json(project: &Path, extra: &[&str]) -> BTreeMap<String, serde_json::Value> {
     let bin = env!("CARGO_BIN_EXE_unused-gems");
     let output = Command::new(bin)
         .arg("--output")
         .arg("json")
         .arg("--no-cache")
         .arg("--quiet")
+        .args(extra)
         .arg(project)
+        .env(
+            "UNUSED_GEMS_RUBY_RUNTIME",
+            "ruby|x86_64-linux|3.4.8|x86_64-linux",
+        )
         .output()
         .unwrap_or_else(|e| panic!("invoke {bin}: {e}"));
 
@@ -48,19 +72,7 @@ fn run_tool(project: &Path) -> BTreeMap<String, (String, Vec<String>)> {
         .as_array()
         .expect("results array")
         .iter()
-        .map(|entry| {
-            let name = entry["name"].as_str().unwrap().to_string();
-            let status = entry["status"].as_str().unwrap().to_string();
-            let groups = entry["groups"]
-                .as_array()
-                .map(|g| {
-                    g.iter()
-                        .map(|v| v.as_str().unwrap().to_string())
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default();
-            (name, (status, groups))
-        })
+        .map(|entry| (entry["name"].as_str().unwrap().to_string(), entry.clone()))
         .collect()
 }
 
@@ -370,4 +382,214 @@ fn same_name_and_version_gemspecs_are_not_ambiguous() {
     let results = run_tool(root);
     let names: Vec<&String> = results.keys().collect();
     assert_eq!(names, vec!["rspec", "same"], "unexpected gems: {:?}", names);
+}
+
+#[test]
+fn gems_rb_is_discovered_with_gems_locked() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(&root.join("gems.rb"), "gem 'a'\n");
+    write(
+        &root.join("gems.locked"),
+        "GEM\n  specs:\n    a (1.0)\n      b (>= 0)\n    b (1.0)\n\nDEPENDENCIES\n  a\n",
+    );
+    write(&root.join("app.rb"), "# nothing\n");
+
+    let results = run_json(root, &[]);
+    assert_eq!(results["a"]["status"], "unused");
+    assert_eq!(results["a"]["transitive_dep_count"], 1);
+}
+
+#[test]
+fn explicit_gemfile_uses_its_own_lockfile_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(&root.join("Gemfile"), "gem 'a'\n");
+    write(
+        &root.join("Gemfile.lock"),
+        "GEM\n  specs:\n    a (1.0)\n      b (>= 0)\n      c (>= 0)\n    b (1.0)\n    c (1.0)\n",
+    );
+    write(&root.join("gemfiles/rails7.gemfile"), "gem 'a'\n");
+    write(
+        &root.join("gemfiles/rails7.gemfile.lock"),
+        "GEM\n  specs:\n    a (1.0)\n    b (1.0)\n",
+    );
+    write(&root.join("app.rb"), "# nothing\n");
+
+    let results = run_json(root, &["--gemfile", "gemfiles/rails7.gemfile"]);
+    assert_eq!(results["a"]["status"], "unused");
+    // Root Gemfile.lock (a -> b, c) must not leak into the rails7 analysis.
+    assert_eq!(results["a"]["transitive_dep_count"], 0);
+}
+
+fn write_engine(dir: &Path) {
+    write(
+        &dir.join("foo_bar_engine.gemspec"),
+        "Gem::Specification.new do |s|\n  s.name = \"foo_bar_engine\"\n  s.version = \"0.1\"\nend\n",
+    );
+    write(&dir.join("lib/fbe.rb"), "module Fbe; end\n");
+}
+
+#[test]
+fn path_and_git_source_blocks_and_shorthands_are_introspected() {
+    // The engine gem `foo_bar_engine` only provides lib/fbe.rb, so usage can
+    // only be detected by introspecting the declared source checkout.
+    let cases = [
+        (
+            "path block",
+            "path \"engines/foo_bar_engine\" do\n  gem \"foo_bar_engine\"\nend\n",
+        ),
+        (
+            "monorepo path block",
+            "path \"engines\" do\n  gem \"foo_bar_engine\"\nend\n",
+        ),
+        (
+            "path option",
+            "gem \"foo_bar_engine\", path: \"engines/foo_bar_engine\"\n",
+        ),
+        (
+            "github option",
+            "gem \"foo_bar_engine\", github: \"x/foo_bar_engine\"\n",
+        ),
+        (
+            "custom git_source option",
+            "git_source(:corp) { |r| \"https://git.corp/#{r}.git\" }\ngem \"foo_bar_engine\", corp: \"x/foo_bar_engine\"\n",
+        ),
+        (
+            "git block",
+            "git \"https://example.com/x/foo_bar_engine.git\" do\n  gem \"foo_bar_engine\"\nend\n",
+        ),
+        (
+            "github block",
+            "github \"x/foo_bar_engine\" do\n  gem \"foo_bar_engine\"\nend\n",
+        ),
+    ];
+    for (label, gemfile) in cases {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(&root.join("Gemfile"), gemfile);
+        write_engine(&root.join("engines/foo_bar_engine"));
+        write_engine(
+            &root.join("vendor/bundle/ruby/3.4.0/bundler/gems/foo_bar_engine-abc123def456"),
+        );
+        write(&root.join("app/x.rb"), "require \"fbe\"\n");
+
+        let results = run_tool(root);
+        assert_eq!(status_of(&results, "foo_bar_engine"), "used", "{label}");
+    }
+}
+
+#[test]
+fn per_declaration_bundler_require_semantics() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        &root.join("Gemfile"),
+        r#"source "https://rubygems.org"
+gem "strgroup", group: "test"
+group "development" do
+  gem "strblock"
+end
+gem "strplat", platforms: "jruby"
+platforms "jruby" do
+  gem "strplatblock"
+end
+gem "installif", install_if: -> { false }
+install_if -> { false } do
+  gem "installifblock"
+end
+gem "installunknown", install_if: -> { ENV["CI"] }
+group :development do
+  gem "dupreq", require: false
+end
+gem "dupreq"
+gem "reqnil", require: nil
+gem "platboth", platform: :jruby, platforms: :ruby
+gem "braces", ">= 0", { require: false }
+platforms :jruby do
+  gem "mixdup"
+end
+group :test do
+  gem "mixdup"
+end
+"#,
+    );
+    write(&root.join("app/boot.rb"), "Bundler.require(:default)\n");
+
+    let results = run_tool(root);
+    // String groups/platforms are to_sym'd by Bundler.
+    assert_eq!(groups_of(&results, "strgroup"), vec!["test"]);
+    assert_eq!(status_of(&results, "strgroup"), "unused");
+    assert_eq!(groups_of(&results, "strblock"), vec!["development"]);
+    assert_eq!(status_of(&results, "strblock"), "unused");
+    assert_eq!(status_of(&results, "strplat"), "platform_excluded");
+    assert_eq!(status_of(&results, "strplatblock"), "platform_excluded");
+    // `platform:` wins over `platforms:`.
+    assert_eq!(status_of(&results, "platboth"), "platform_excluded");
+    // Statically false install_if is never Bundler.require'd.
+    assert_eq!(status_of(&results, "installif"), "unused");
+    assert_eq!(status_of(&results, "installifblock"), "unused");
+    assert_eq!(status_of(&results, "installunknown"), "bundler_required");
+    // Any declaration with autorequire in an active group loads the gem.
+    assert_eq!(status_of(&results, "dupreq"), "bundler_required");
+    assert_eq!(status_of(&results, "reqnil"), "unused");
+    assert_eq!(status_of(&results, "braces"), "unused");
+    // The :default declaration is JRuby-only; on MRI only the :test one applies.
+    assert_eq!(status_of(&results, "mixdup"), "unused");
+    assert_eq!(groups_of(&results, "mixdup"), vec!["test"]);
+}
+
+#[test]
+fn gemspec_in_group_block_uses_bundler_2_6_semantics() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        &root.join("Gemfile"),
+        "group :ci do\n  platforms :jruby do\n    gemspec\n  end\nend\n",
+    );
+    write(
+        &root.join("mygem.gemspec"),
+        "Gem::Specification.new do |s|\n  s.name = \"mygem\"\n  s.add_development_dependency \"devdep\"\nend\n",
+    );
+    write(
+        &root.join("app/boot.rb"),
+        "Bundler.require(:default, :development)\n",
+    );
+
+    let results = run_tool(root);
+    assert_eq!(groups_of(&results, "mygem"), vec!["default"]);
+    assert_eq!(status_of(&results, "mygem"), "bundler_required");
+    assert_eq!(groups_of(&results, "devdep"), vec!["development"]);
+    assert_eq!(status_of(&results, "devdep"), "bundler_required");
+}
+
+#[test]
+fn github_annotations_point_at_declaring_file_and_line() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        &root.join("Gemfile"),
+        "source 'https://rubygems.org'\ngem 'root_gem'\neval_gemfile 'gemfiles/extra.gemfile'\n",
+    );
+    write(
+        &root.join("gemfiles/extra.gemfile"),
+        "\n\ngem 'extra_gem'\n",
+    );
+    write(&root.join("app.rb"), "# nothing\n");
+
+    let bin = env!("CARGO_BIN_EXE_unused-gems");
+    let output = Command::new(bin)
+        .args(["--output", "github", "--no-cache", "--quiet"])
+        .arg(root)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("file=Gemfile,line=2::Gem 'root_gem'"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("file=gemfiles/extra.gemfile,line=3::Gem 'extra_gem'"),
+        "{stdout}"
+    );
 }

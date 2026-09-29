@@ -3,15 +3,29 @@ use std::path::{Component, Path, PathBuf};
 
 use ruby_prism::{self, Node, Visit};
 
-use crate::types::GemEntry;
+use crate::types::{GemDeclaration, GemEntry, GemSource, InstallCondition};
 
 const DEFAULT_DEVELOPMENT_GROUP: &str = "development";
 
+/// Bundler's default Gemfile discovery for `dir`: `Gemfile`, then `gems.rb`.
+/// Returns `<dir>/Gemfile` when neither exists so callers report that name.
+pub fn default_gemfile_path(dir: &Path) -> PathBuf {
+    let gemfile = dir.join("Gemfile");
+    if gemfile.is_file() {
+        return gemfile;
+    }
+    let gems_rb = dir.join("gems.rb");
+    if gems_rb.is_file() {
+        return gems_rb;
+    }
+    gemfile
+}
+
 /// Parse a Gemfile using ruby-prism AST and extract gem declarations.
 pub fn parse_gemfile(dir: &Path) -> Vec<GemEntry> {
-    let gemfile_path = dir.join("Gemfile");
+    let gemfile_path = default_gemfile_path(dir);
     if !gemfile_path.exists() {
-        eprintln!("Error: No Gemfile found in {}", dir.display());
+        eprintln!("Error: No Gemfile or gems.rb found in {}", dir.display());
         std::process::exit(1);
     }
 
@@ -27,6 +41,7 @@ pub fn parse_gemfiles(dir: &Path, gemfile_paths: &[PathBuf]) -> Vec<GemEntry> {
         gems: Vec::new(),
         active: Vec::new(),
         evaluations: 0,
+        git_sources: DEFAULT_GIT_SOURCES.iter().map(|s| s.to_string()).collect(),
     };
 
     for path in gemfile_paths {
@@ -35,7 +50,9 @@ pub fn parse_gemfiles(dir: &Path, gemfile_paths: &[PathBuf]) -> Vec<GemEntry> {
         } else {
             dir.join(path)
         };
-        eval_gemfile_file(&mut ctx, &abs, &[], &[]);
+        // Each top-level Gemfile is its own Bundler::Dsl with default git sources.
+        ctx.git_sources = DEFAULT_GIT_SOURCES.iter().map(|s| s.to_string()).collect();
+        eval_gemfile_file(&mut ctx, &abs, &DslScope::default());
     }
 
     merge_duplicate_gems(ctx.gems)
@@ -44,6 +61,9 @@ pub fn parse_gemfiles(dir: &Path, gemfile_paths: &[PathBuf]) -> Vec<GemEntry> {
 /// Upper bound on evaluated Gemfiles, guarding against pathological
 /// `eval_gemfile` graphs (a deep diamond can otherwise expand exponentially).
 const MAX_GEMFILE_EVALUATIONS: usize = 1024;
+
+/// Git source shorthands Bundler registers by default (`Dsl#add_git_sources`).
+const DEFAULT_GIT_SOURCES: &[&str] = &["github", "gist", "bitbucket", "gitlab"];
 
 /// Shared state threaded through nested `eval_gemfile` evaluation.
 struct ParseCtx {
@@ -56,6 +76,8 @@ struct ParseCtx {
     /// under a different group/platform context still contributes its context.
     active: Vec<PathBuf>,
     evaluations: usize,
+    /// Option keys that name a git source (`github:`, custom `git_source(:name)`).
+    git_sources: HashSet<String>,
 }
 
 /// A gem declaration plus the provenance Bundler needs to resolve duplicates.
@@ -65,7 +87,24 @@ struct PendingGem {
     gemspec_dev_dep: bool,
 }
 
-fn eval_gemfile_file(ctx: &mut ParseCtx, path: &Path, groups: &[String], platforms: &[String]) {
+/// Block context enclosing a declaration (`group`, `platforms`, `install_if`,
+/// `path`/`git`/`github`/`source` blocks). `eval_gemfile` inherits it.
+#[derive(Debug, Clone, Default)]
+struct DslScope {
+    groups: Vec<String>,
+    platforms: Vec<String>,
+    install_if: Vec<InstallCondition>,
+    source: Option<ScopeSource>,
+}
+
+#[derive(Debug, Clone)]
+enum ScopeSource {
+    /// `path "dir" do` — each gem resolves to `dir` or `dir/<subdir>`.
+    Path(PathBuf),
+    Git(String),
+}
+
+fn eval_gemfile_file(ctx: &mut ParseCtx, path: &Path, scope: &DslScope) {
     let path = lexical_normalize(path);
     if !path.is_file() {
         return;
@@ -108,8 +147,7 @@ fn eval_gemfile_file(ctx: &mut ParseCtx, path: &Path, groups: &[String], platfor
         source: &source,
         gemfile_path: path.clone(),
         base_dir,
-        current_groups: groups.to_vec(),
-        current_platforms: platforms.to_vec(),
+        scope: scope.clone(),
     };
     visitor.ctx.active.push(key);
     visitor.visit(&parse_result.node());
@@ -121,8 +159,7 @@ struct GemfileVisitor<'a, 's> {
     source: &'s [u8],
     gemfile_path: PathBuf,
     base_dir: PathBuf,
-    current_groups: Vec<String>,
-    current_platforms: Vec<String>,
+    scope: DslScope,
 }
 
 impl GemfileVisitor<'_, '_> {
@@ -142,87 +179,102 @@ impl GemfileVisitor<'_, '_> {
             None => return,
         };
 
-        let mut require_false = false;
+        let mut autorequire = true;
         let mut require_paths: Vec<String> = Vec::new();
-        let mut groups: Vec<String> = self.current_groups.clone();
-        let mut platforms: Vec<String> = self.current_platforms.clone();
+        let mut group_opt: Option<Vec<String>> = None;
+        let mut groups_opt: Option<Vec<String>> = None;
+        let mut platform_opt: Option<Vec<String>> = None;
+        let mut platforms_opt: Option<Vec<String>> = None;
+        let mut install_if_opt: Option<InstallCondition> = None;
         let mut source = None;
 
-        // Check remaining args for keyword hash
-        for arg in &arg_list[1..] {
-            if let Some(hash) = arg.as_keyword_hash_node() {
-                for elem in hash.elements().iter() {
-                    if let Some(assoc) = elem.as_assoc_node() {
-                        let key_name = extract_key_name(&assoc.key(), self.source);
-                        match key_name.as_deref() {
-                            Some("require") => {
-                                if assoc.value().as_false_node().is_some() {
-                                    require_false = true;
-                                } else if let Some(s) =
-                                    extract_string_value(&assoc.value(), self.source)
-                                {
-                                    require_paths.push(s);
-                                } else if let Some(arr) = assoc.value().as_array_node() {
-                                    if arr.elements().is_empty() {
-                                        require_false = true;
-                                    }
-                                    for el in arr.elements().iter() {
-                                        if let Some(s) = extract_string_value(&el, self.source) {
-                                            require_paths.push(s);
-                                        }
-                                    }
-                                }
+        // Like Bundler (`args.last.is_a?(Hash)`), only a trailing hash holds options,
+        // whether written as keywords or as a braced `{ ... }` literal.
+        let options = arg_list[1..].last().and_then(|last| {
+            last.as_keyword_hash_node()
+                .map(|h| h.elements())
+                .or_else(|| last.as_hash_node().map(|h| h.elements()))
+        });
+        for elem in options.iter().flat_map(|elements| elements.iter()) {
+            let assoc = match elem.as_assoc_node() {
+                Some(a) => a,
+                None => continue,
+            };
+            let value = assoc.value();
+            let key_name = extract_key_name(&assoc.key(), self.source);
+            match key_name.as_deref() {
+                Some("require") => {
+                    // Bundler: `Array(opts["require"] || [])` — false/nil/[] disable
+                    // autorequire; `true` means the gem name.
+                    if value.as_false_node().is_some() || value.as_nil_node().is_some() {
+                        autorequire = false;
+                    } else if let Some(s) = extract_string_value(&value, self.source) {
+                        require_paths.push(s);
+                    } else if let Some(arr) = value.as_array_node() {
+                        if arr.elements().is_empty() {
+                            autorequire = false;
+                        }
+                        for el in arr.elements().iter() {
+                            if let Some(s) = extract_string_value(&el, self.source) {
+                                require_paths.push(s);
                             }
-                            Some("group") | Some("groups") => {
-                                if let Some(sym) = extract_symbol_value(&assoc.value(), self.source)
-                                {
-                                    groups.push(sym);
-                                } else if let Some(arr) = assoc.value().as_array_node() {
-                                    for el in arr.elements().iter() {
-                                        if let Some(s) = extract_symbol_value(&el, self.source) {
-                                            groups.push(s);
-                                        }
-                                    }
-                                }
-                            }
-                            Some("platform") | Some("platforms") => {
-                                if let Some(sym) = extract_symbol_value(&assoc.value(), self.source)
-                                {
-                                    platforms.push(sym);
-                                } else if let Some(arr) = assoc.value().as_array_node() {
-                                    for el in arr.elements().iter() {
-                                        if let Some(s) = extract_symbol_value(&el, self.source) {
-                                            platforms.push(s);
-                                        }
-                                    }
-                                }
-                            }
-                            Some("path") => {
-                                if let Some(s) = extract_string_value(&assoc.value(), self.source) {
-                                    let path = PathBuf::from(s);
-                                    let path = if path.is_absolute() {
-                                        path
-                                    } else {
-                                        self.base_dir.join(path)
-                                    };
-                                    source = Some(crate::types::GemSource::Path(path));
-                                }
-                            }
-                            Some("git") => {
-                                if let Some(s) = extract_string_value(&assoc.value(), self.source) {
-                                    source = Some(crate::types::GemSource::Git(s));
-                                }
-                            }
-                            _ => {}
                         }
                     }
                 }
+                Some("group") => group_opt = Some(extract_name_list(&value, self.source)),
+                Some("groups") => groups_opt = Some(extract_name_list(&value, self.source)),
+                Some("platform") => platform_opt = Some(extract_name_list(&value, self.source)),
+                Some("platforms") => platforms_opt = Some(extract_name_list(&value, self.source)),
+                Some("install_if") => install_if_opt = Some(eval_install_condition(&value)),
+                Some("path") => {
+                    if let Some(s) = extract_string_value(&value, self.source) {
+                        let dir = expand_source_path(&s, &self.base_dir);
+                        source = Some(GemSource::Path(resolve_path_gem_dir(&dir, &name)));
+                    }
+                }
+                Some("git") => {
+                    if let Some(s) = extract_string_value(&value, self.source) {
+                        source = Some(GemSource::Git(s));
+                    }
+                }
+                Some(key) if self.ctx.git_sources.contains(key) => {
+                    if let Some(s) = extract_string_value(&value, self.source) {
+                        source = Some(GemSource::Git(git_source_uri(key, &s)));
+                    }
+                }
+                _ => {}
             }
         }
 
+        // Bundler: `opts["groups"] || opts["group"]` and `opts["platform"] || opts["platforms"]`.
+        let mut groups = self.scope.groups.clone();
+        groups.extend(groups_opt.or(group_opt).unwrap_or_default());
         if groups.is_empty() {
             groups.push("default".to_string());
         }
+        let mut platforms = self.scope.platforms.clone();
+        platforms.extend(platform_opt.or(platforms_opt).unwrap_or_default());
+        let mut conditions = self.scope.install_if.clone();
+        conditions.extend(install_if_opt);
+
+        if source.is_none() {
+            source = match &self.scope.source {
+                Some(ScopeSource::Path(dir)) => {
+                    Some(GemSource::Path(resolve_path_gem_dir(dir, &name)))
+                }
+                Some(ScopeSource::Git(uri)) => Some(GemSource::Git(uri.clone())),
+                None => None,
+            };
+        }
+
+        let declaration = GemDeclaration {
+            groups: groups.clone(),
+            platforms: platforms.clone(),
+            autorequire,
+            install_if: InstallCondition::all(&conditions),
+            file: Some(self.gemfile_path.clone()),
+            line: Some(line_of(self.source, node.location().start_offset())),
+        };
 
         self.ctx.gems.push(PendingGem {
             entry: GemEntry {
@@ -231,38 +283,40 @@ impl GemfileVisitor<'_, '_> {
                 platforms,
                 require_paths,
                 module_names: Vec::new(),
-                require_false,
+                require_false: !autorequire,
                 source,
+                declarations: vec![declaration],
             },
             gemspec_dev_dep: false,
         });
     }
 
-    fn extract_group_names(&self, node: &ruby_prism::CallNode<'_>) -> Vec<String> {
-        let mut groups = Vec::new();
+    /// Positional symbol/string arguments of a block DSL call (`group "test", :ci do`).
+    fn extract_block_names(&self, node: &ruby_prism::CallNode<'_>) -> Vec<String> {
+        let mut names = Vec::new();
         if let Some(args) = node.arguments() {
             for arg in args.arguments().iter() {
-                if let Some(sym) = extract_symbol_value(&arg, self.source) {
-                    groups.push(sym);
+                if let Some(name) = extract_name(&arg, self.source) {
+                    names.push(name);
                 }
             }
         }
-        groups
+        names
     }
 
-    fn extract_platform_names(&self, node: &ruby_prism::CallNode<'_>) -> Vec<String> {
-        let mut platforms = Vec::new();
-        if let Some(args) = node.arguments() {
-            for arg in args.arguments().iter() {
-                if let Some(sym) = extract_symbol_value(&arg, self.source) {
-                    platforms.push(sym);
-                }
-            }
-        }
-        platforms
+    fn first_string_arg(&self, node: &ruby_prism::CallNode<'_>) -> Option<String> {
+        let first = node.arguments()?.arguments().iter().next()?;
+        extract_string_value(&first, self.source)
     }
 
-    /// Evaluate `eval_gemfile <expr>` inline, preserving group/platform context.
+    /// Visit a block-taking DSL call with `scope` active, restoring the outer scope after.
+    fn visit_with_scope(&mut self, node: &ruby_prism::CallNode<'_>, scope: DslScope) {
+        let outer = std::mem::replace(&mut self.scope, scope);
+        ruby_prism::visit_call_node(self, node);
+        self.scope = outer;
+    }
+
+    /// Evaluate `eval_gemfile <expr>` inline, preserving the enclosing block context.
     fn handle_eval_gemfile(&mut self, node: &ruby_prism::CallNode<'_>) {
         let first = node
             .arguments()
@@ -299,9 +353,8 @@ impl GemfileVisitor<'_, '_> {
             return;
         }
 
-        let groups = self.current_groups.clone();
-        let platforms = self.current_platforms.clone();
-        eval_gemfile_file(self.ctx, &target, &groups, &platforms);
+        let scope = self.scope.clone();
+        eval_gemfile_file(self.ctx, &target, &scope);
     }
 
     /// Handle a `gemspec` directive, honoring `path:`, `name:` and `development_group:`.
@@ -379,61 +432,215 @@ impl GemfileVisitor<'_, '_> {
             None => return,
         };
 
-        let self_groups = if self.current_groups.is_empty() {
-            vec!["default".to_string()]
-        } else {
-            self.current_groups.clone()
-        };
-
-        // Bundler wraps development dependencies in `group(development_group)`, which
-        // nests inside any enclosing group block but does not imply :default.
-        let mut dev_groups = self.current_groups.clone();
-        if !dev_groups.contains(&development_group) {
-            dev_groups.push(development_group);
-        }
-
+        // Bundler >= 2.6 adds the gemspec's own gem via `add_dependency`, bypassing the
+        // enclosing `group`/`platforms`/`install_if` blocks: it is always [:default] on
+        // all platforms, and development dependencies get only `development_group`.
+        let line = line_of(self.source, node.location().start_offset());
         register_gemspec(
             self.ctx,
             spec,
             &spec_dir,
-            &self_groups,
-            &dev_groups,
-            &self.current_platforms,
+            &development_group,
+            &self.gemfile_path,
+            line,
         );
     }
 }
 
 impl Visit<'_> for GemfileVisitor<'_, '_> {
     fn visit_call_node(&mut self, node: &ruby_prism::CallNode<'_>) {
+        if node.receiver().is_some() {
+            ruby_prism::visit_call_node(self, node);
+            return;
+        }
         let name = node.name();
-        let name_bytes = name.as_slice();
+        let has_block = node.block().and_then(|b| b.as_block_node()).is_some();
 
-        if name_bytes == b"gem" && node.receiver().is_none() {
-            self.handle_gem(node);
-        } else if name_bytes == b"group" && node.receiver().is_none() {
-            let groups = self.extract_group_names(node);
-            let prev_len = self.current_groups.len();
-            self.current_groups.extend(groups);
-            ruby_prism::visit_call_node(self, node);
-            self.current_groups.truncate(prev_len);
-            return;
-        } else if (name_bytes == b"platforms" || name_bytes == b"platform")
-            && node.receiver().is_none()
-        {
-            let platforms = self.extract_platform_names(node);
-            let prev_len = self.current_platforms.len();
-            self.current_platforms.extend(platforms);
-            ruby_prism::visit_call_node(self, node);
-            self.current_platforms.truncate(prev_len);
-            return;
-        } else if name_bytes == b"eval_gemfile" && node.receiver().is_none() {
-            self.handle_eval_gemfile(node);
-        } else if name_bytes == b"gemspec" && node.receiver().is_none() {
-            self.handle_gemspec(node);
+        match name.as_slice() {
+            b"gem" => self.handle_gem(node),
+            b"group" => {
+                let mut scope = self.scope.clone();
+                scope.groups.extend(self.extract_block_names(node));
+                return self.visit_with_scope(node, scope);
+            }
+            b"platforms" | b"platform" => {
+                let mut scope = self.scope.clone();
+                scope.platforms.extend(self.extract_block_names(node));
+                return self.visit_with_scope(node, scope);
+            }
+            b"install_if" => {
+                let mut scope = self.scope.clone();
+                if let Some(args) = node.arguments() {
+                    scope
+                        .install_if
+                        .extend(args.arguments().iter().map(|a| eval_install_condition(&a)));
+                }
+                return self.visit_with_scope(node, scope);
+            }
+            b"path" if has_block => {
+                if let Some(dir) = self.first_string_arg(node) {
+                    let mut scope = self.scope.clone();
+                    scope.source =
+                        Some(ScopeSource::Path(expand_source_path(&dir, &self.base_dir)));
+                    return self.visit_with_scope(node, scope);
+                }
+            }
+            b"git" if has_block => {
+                if let Some(uri) = self.first_string_arg(node) {
+                    let mut scope = self.scope.clone();
+                    scope.source = Some(ScopeSource::Git(uri));
+                    return self.visit_with_scope(node, scope);
+                }
+            }
+            b"github" if has_block => {
+                if let Some(repo) = self.first_string_arg(node) {
+                    let mut scope = self.scope.clone();
+                    scope.source = Some(ScopeSource::Git(git_source_uri("github", &repo)));
+                    return self.visit_with_scope(node, scope);
+                }
+            }
+            b"source" if has_block => {
+                // A rubygems source block overrides any enclosing path/git source.
+                let mut scope = self.scope.clone();
+                scope.source = None;
+                return self.visit_with_scope(node, scope);
+            }
+            b"git_source" => {
+                for source_name in self.extract_block_names(node) {
+                    self.ctx.git_sources.insert(source_name);
+                }
+            }
+            b"eval_gemfile" => self.handle_eval_gemfile(node),
+            b"gemspec" => self.handle_gemspec(node),
+            _ => {}
         }
 
         ruby_prism::visit_call_node(self, node);
     }
+}
+
+/// 1-based line number of a byte offset.
+fn line_of(source: &[u8], offset: usize) -> usize {
+    memchr::memchr_iter(b'\n', &source[..offset.min(source.len())]).count() + 1
+}
+
+/// Expand a `path:` / `path "..." do` value like `File.expand_path(path, gemfile_root)`,
+/// including a leading `~`.
+fn expand_source_path(value: &str, base_dir: &Path) -> PathBuf {
+    let home_relative = if value == "~" {
+        Some("")
+    } else {
+        value.strip_prefix("~/")
+    };
+    let path = match (home_relative, std::env::var_os("HOME")) {
+        (Some(rest), Some(home)) => PathBuf::from(home).join(rest),
+        _ => PathBuf::from(value),
+    };
+    let path = if path.is_absolute() {
+        path
+    } else {
+        base_dir.join(path)
+    };
+    lexical_normalize(&path)
+}
+
+/// Locate a gem inside a path source. Bundler globs `{,*,*/*}.gemspec` below the
+/// source directory and picks the spec with the gem's name, so a gem may live in
+/// `dir` itself or in an immediate subdirectory (monorepo-style `path` blocks).
+fn resolve_path_gem_dir(dir: &Path, name: &str) -> PathBuf {
+    let spec_file = format!("{name}.gemspec");
+    if dir.join(&spec_file).is_file() {
+        return dir.to_path_buf();
+    }
+    let nested = dir.join(name);
+    if nested.join(&spec_file).is_file() {
+        return nested;
+    }
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        let mut subdirs: Vec<PathBuf> = entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.join(&spec_file).is_file())
+            .collect();
+        subdirs.sort();
+        if let Some(found) = subdirs.into_iter().next() {
+            return found;
+        }
+    }
+    let has_own_gemspec = gemspec_candidates_quiet(dir).is_some_and(|c| !c.is_empty());
+    if !has_own_gemspec && nested.is_dir() {
+        return nested;
+    }
+    dir.to_path_buf()
+}
+
+/// The URI Bundler's built-in git source shorthands expand to. Custom
+/// `git_source` blocks cannot be evaluated statically, so they keep `key:value`.
+fn git_source_uri(key: &str, value: &str) -> String {
+    let with_owner = || {
+        if value.contains('/') {
+            value.to_string()
+        } else {
+            format!("{value}/{value}")
+        }
+    };
+    match key {
+        "github" => format!("https://github.com/{}.git", with_owner()),
+        "gitlab" => format!("https://gitlab.com/{}.git", with_owner()),
+        "gist" => format!("https://gist.github.com/{value}.git"),
+        "bitbucket" => {
+            let (user, repo) = value.split_once('/').unwrap_or((value, value));
+            format!("https://{user}@bitbucket.org/{user}/{repo}.git")
+        }
+        _ => format!("{key}:{value}"),
+    }
+}
+
+/// Statically evaluate an `install_if` condition. Bundler calls anything callable
+/// and otherwise uses the value's truthiness; only literal bodies are decidable.
+fn eval_install_condition(node: &Node<'_>) -> InstallCondition {
+    fn literal(node: &Node<'_>) -> InstallCondition {
+        if node.as_true_node().is_some() {
+            InstallCondition::Always
+        } else if node.as_false_node().is_some() || node.as_nil_node().is_some() {
+            InstallCondition::Never
+        } else if let Some(stmts) = node.as_statements_node() {
+            let body: Vec<Node<'_>> = stmts.body().iter().collect();
+            match body.as_slice() {
+                [only] => literal(only),
+                _ => InstallCondition::Unknown,
+            }
+        } else if let Some(parens) = node.as_parentheses_node() {
+            parens
+                .body()
+                .map_or(InstallCondition::Never, |b| literal(&b))
+        } else {
+            InstallCondition::Unknown
+        }
+    }
+
+    if let Some(lambda) = node.as_lambda_node() {
+        // An empty body returns nil.
+        return lambda
+            .body()
+            .map_or(InstallCondition::Never, |b| literal(&b));
+    }
+    if let Some(call) = node.as_call_node() {
+        let callable = match call.name().as_slice() {
+            b"lambda" | b"proc" => call.receiver().is_none(),
+            b"new" => receiver_is_const(&call, b"Proc"),
+            _ => false,
+        };
+        if callable {
+            if let Some(block) = call.block().and_then(|b| b.as_block_node()) {
+                return block
+                    .body()
+                    .map_or(InstallCondition::Never, |b| literal(&b));
+            }
+        }
+        return InstallCondition::Unknown;
+    }
+    literal(node)
 }
 
 // --- Path expression evaluation (File.expand_path / __dir__ / __FILE__ / File.join) ---
@@ -624,7 +831,8 @@ struct ParsedGemspec {
     name: String,
     /// `spec.version` when it is a literal, `None` when it is computed at runtime.
     version: Option<String>,
-    development_deps: Vec<String>,
+    /// Development dependency names with the 1-based line that declared them.
+    development_deps: Vec<(String, usize)>,
 }
 
 impl ParsedGemspec {
@@ -663,8 +871,8 @@ fn canonical_gem_version(version: &str) -> String {
 /// List the gemspecs of a directory the way Bundler's `{,*}.gemspec` glob does:
 /// immediate entries only, no recursion, deterministic order.
 fn gemspec_candidates(spec_dir: &Path, gemfile_path: &Path) -> Option<Vec<PathBuf>> {
-    let entries = match std::fs::read_dir(spec_dir) {
-        Ok(e) => e,
+    match std::fs::read_dir(spec_dir) {
+        Ok(_) => gemspec_candidates_quiet(spec_dir),
         Err(e) => {
             eprintln!(
                 "Warning: gemspec directive in {} points at {} which could not be read: {}",
@@ -672,10 +880,14 @@ fn gemspec_candidates(spec_dir: &Path, gemfile_path: &Path) -> Option<Vec<PathBu
                 spec_dir.display(),
                 e
             );
-            return None;
+            None
         }
-    };
+    }
+}
 
+/// `{,*}.gemspec` listing without diagnostics; `None` when `dir` is unreadable.
+fn gemspec_candidates_quiet(spec_dir: &Path) -> Option<Vec<PathBuf>> {
+    let entries = std::fs::read_dir(spec_dir).ok()?;
     let mut candidates: Vec<PathBuf> = Vec::new();
     for entry in entries.flatten() {
         let file_name = entry.file_name();
@@ -813,42 +1025,49 @@ fn load_gemspec(spec_path: &Path, spec_dir: &Path) -> Option<ParsedGemspec> {
     })
 }
 
-/// Register the entries Bundler would add for a gemspec: the gem itself (as a path
-/// source) plus its development dependencies. Runtime dependencies are resolved
-/// transitively by Bundler and are intentionally not top-level gems.
+/// Register the entries Bundler (>= 2.6) adds for a gemspec: the gem itself (as a
+/// path source) in `:default` on all platforms, plus its development dependencies
+/// in `development_group` only. Runtime dependencies are resolved transitively by
+/// Bundler and are intentionally not top-level gems.
 fn register_gemspec(
     ctx: &mut ParseCtx,
     spec: ParsedGemspec,
     spec_dir: &Path,
-    self_groups: &[String],
-    dev_groups: &[String],
-    platforms: &[String],
+    development_group: &str,
+    gemfile_path: &Path,
+    line: usize,
 ) {
     debug_assert!(spec.path.is_file());
 
+    let declaration = |groups: Vec<String>, file: &Path, line: usize| GemDeclaration {
+        groups,
+        platforms: Vec::new(),
+        autorequire: true,
+        install_if: InstallCondition::Always,
+        file: Some(file.to_path_buf()),
+        line: Some(line),
+    };
+
+    let self_groups = vec!["default".to_string()];
     ctx.gems.push(PendingGem {
         entry: GemEntry {
             name: spec.name,
-            groups: self_groups.to_vec(),
-            platforms: platforms.to_vec(),
-            require_paths: Vec::new(),
-            module_names: Vec::new(),
-            require_false: false,
-            source: Some(crate::types::GemSource::Path(spec_dir.to_path_buf())),
+            groups: self_groups.clone(),
+            source: Some(GemSource::Path(spec_dir.to_path_buf())),
+            declarations: vec![declaration(self_groups, gemfile_path, line)],
+            ..GemEntry::default()
         },
         gemspec_dev_dep: false,
     });
 
-    for dep in spec.development_deps {
+    let dev_groups = vec![development_group.to_string()];
+    for (dep, dep_line) in spec.development_deps {
         ctx.gems.push(PendingGem {
             entry: GemEntry {
                 name: dep,
-                groups: dev_groups.to_vec(),
-                platforms: platforms.to_vec(),
-                require_paths: Vec::new(),
-                module_names: Vec::new(),
-                require_false: false,
-                source: None,
+                groups: dev_groups.clone(),
+                declarations: vec![declaration(dev_groups.clone(), &spec.path, dep_line)],
+                ..GemEntry::default()
             },
             gemspec_dev_dep: true,
         });
@@ -878,7 +1097,7 @@ struct GemspecVisitor<'s> {
     receiver_names: HashSet<Vec<u8>>,
     spec_name: Option<String>,
     spec_version: Option<String>,
-    development_deps: Vec<String>,
+    development_deps: Vec<(String, usize)>,
 }
 
 impl GemspecVisitor<'_> {
@@ -975,7 +1194,8 @@ impl Visit<'_> for GemspecVisitor<'_> {
                             // Runtime dependencies belong to the gem itself, not to the
                             // top-level Gemfile, so only development deps are recorded.
                             if is_dev {
-                                self.development_deps.push(dep);
+                                let line = line_of(self.source, node.location().start_offset());
+                                self.development_deps.push((dep, line));
                             }
                         }
                         None => eprintln!(
@@ -991,70 +1211,53 @@ impl Visit<'_> for GemspecVisitor<'_> {
     }
 }
 
-/// Merge duplicate gem declarations by name.
+/// Group declarations by gem name.
 ///
-/// Bundler always prefers an explicit Gemfile declaration over a duplicate coming
-/// from a gemspec's development dependencies (in either declaration order); two
-/// Gemfile declarations, or two gemspec development dependencies, are unioned.
-/// The position of the first occurrence is preserved.
+/// Bundler keeps every duplicate `gem` declaration as its own dependency and
+/// evaluates each one separately, so all declarations are retained on the entry.
+/// The one exception mirrors Bundler's "always prefer the dependency from the
+/// Gemfile": a Gemfile declaration replaces gemspec development dependencies of
+/// the same name (in either order). The position of the first kept occurrence
+/// is preserved.
 fn merge_duplicate_gems(gems: Vec<PendingGem>) -> Vec<GemEntry> {
+    let declared_in_gemfile: HashSet<String> = gems
+        .iter()
+        .filter(|p| !p.gemspec_dev_dep)
+        .map(|p| p.entry.name.clone())
+        .collect();
     let mut seen: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-    let mut result: Vec<PendingGem> = Vec::new();
+    let mut result: Vec<GemEntry> = Vec::new();
 
     for pending in gems {
-        let idx = match seen.get(&pending.entry.name) {
+        if pending.gemspec_dev_dep && declared_in_gemfile.contains(&pending.entry.name) {
+            continue;
+        }
+        let gem = pending.entry;
+        let idx = match seen.get(&gem.name) {
             Some(&idx) => idx,
             None => {
-                seen.insert(pending.entry.name.clone(), result.len());
-                result.push(pending);
+                seen.insert(gem.name.clone(), result.len());
+                result.push(gem);
                 continue;
             }
         };
 
         let existing = &mut result[idx];
-        match (existing.gemspec_dev_dep, pending.gemspec_dev_dep) {
-            // A later Gemfile declaration replaces the gemspec development dependency.
-            (true, false) => {
-                *existing = pending;
-                continue;
-            }
-            // An explicit Gemfile declaration already won; drop the gemspec dev dep.
-            (false, true) => continue,
-            _ => {}
-        }
-
-        let gem = pending.entry;
-        let existing = &mut existing.entry;
-        // groups: set union preserving order
-        for g in &gem.groups {
-            if !existing.groups.contains(g) {
-                existing.groups.push(g.clone());
+        existing.declarations.extend(gem.declarations);
+        for rp in gem.require_paths {
+            if !existing.require_paths.contains(&rp) {
+                existing.require_paths.push(rp);
             }
         }
-        // platforms: empty on either side means "all platforms" → result should be empty
-        if existing.platforms.is_empty() || gem.platforms.is_empty() {
-            existing.platforms.clear();
-        } else {
-            for p in &gem.platforms {
-                if !existing.platforms.contains(p) {
-                    existing.platforms.push(p.clone());
-                }
-            }
-        }
-        // require_paths: union preserving order
-        for rp in &gem.require_paths {
-            if !existing.require_paths.contains(rp) {
-                existing.require_paths.push(rp.clone());
-            }
-        }
-        // require_false: logical OR
-        existing.require_false = existing.require_false || gem.require_false;
         if existing.source.is_none() {
             existing.source = gem.source;
         }
     }
 
-    result.into_iter().map(|p| p.entry).collect()
+    for entry in &mut result {
+        entry.refresh_aggregates();
+    }
+    result
 }
 
 // --- Helper functions for extracting values from Prism AST nodes ---
@@ -1071,6 +1274,26 @@ fn extract_symbol_value(node: &Node<'_>, _source: &[u8]) -> Option<String> {
         return Some(String::from_utf8_lossy(s.unescaped()).to_string());
     }
     None
+}
+
+/// A symbol or string literal, as Bundler `to_sym`s group and platform names.
+fn extract_name(node: &Node<'_>, source: &[u8]) -> Option<String> {
+    extract_symbol_value(node, source).or_else(|| extract_string_value(node, source))
+}
+
+/// `:a`, `"a"` or `[:a, "b"]` → names; anything else yields nothing.
+fn extract_name_list(node: &Node<'_>, source: &[u8]) -> Vec<String> {
+    if let Some(name) = extract_name(node, source) {
+        return vec![name];
+    }
+    node.as_array_node()
+        .map(|arr| {
+            arr.elements()
+                .iter()
+                .filter_map(|el| extract_name(&el, source))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Extract a key name from a hash key node (symbol or string).
@@ -1104,6 +1327,23 @@ mod tests {
         assert_eq!(gems.len(), 1);
         assert_eq!(gems[0].name, "rails");
         assert_eq!(gems[0].groups, vec!["default"]);
+    }
+
+    #[test]
+    fn parse_gemfile_falls_back_to_gems_rb() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("gems.rb"), "gem 'rails'\n").unwrap();
+        assert_eq!(default_gemfile_path(dir.path()), dir.path().join("gems.rb"));
+        assert_eq!(names(&parse_gemfile(dir.path())), vec!["rails"]);
+    }
+
+    #[test]
+    fn default_gemfile_path_prefers_gemfile_over_gems_rb() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("gems.rb"), "gem 'puma'\n").unwrap();
+        std::fs::write(dir.path().join("Gemfile"), "gem 'rails'\n").unwrap();
+        assert_eq!(default_gemfile_path(dir.path()), dir.path().join("Gemfile"));
+        assert_eq!(names(&parse_gemfile(dir.path())), vec!["rails"]);
     }
 
     #[test]
@@ -1281,12 +1521,304 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_gems_require_false_union() {
+    fn duplicate_gems_keep_every_declaration() {
+        // Previously require_false was OR'd across duplicates; Bundler requires the
+        // gem if *any* declaration autorequires it.
         let gems = parse_gems("gem 'x', require: false\ngem 'x', require: 'x/init'\n");
         assert_eq!(gems.iter().filter(|g| g.name == "x").count(), 1);
         let g = find_gem(&gems, "x");
-        assert!(g.require_false);
+        assert_eq!(g.declarations.len(), 2);
+        assert!(!g.declarations[0].autorequire);
+        assert!(g.declarations[1].autorequire);
+        assert!(!g.require_false);
         assert!(g.require_paths.contains(&"x/init".to_string()));
+    }
+
+    #[test]
+    fn duplicate_require_false_in_dev_group_does_not_hide_default_declaration() {
+        let gems = parse_gems("group :development do\n  gem 'd', require: false\nend\ngem 'd'\n");
+        let g = find_gem(&gems, "d");
+        assert!(g.bundler_autorequired(|group| group == "default"));
+        assert!(!g.bundler_autorequired(|group| group == "development"));
+    }
+
+    #[test]
+    fn duplicate_declarations_keep_their_own_platforms() {
+        let gems =
+            parse_gems("platforms :jruby do\n  gem 'm'\nend\ngroup :test do\n  gem 'm'\nend\n");
+        let mut g = find_gem(&gems, "m").clone();
+        assert_eq!(g.declarations[0].platforms, vec!["jruby"]);
+        assert_eq!(g.declarations[0].groups, vec!["default"]);
+        assert!(g.declarations[1].platforms.is_empty());
+        assert!(g.has_platform_constraints());
+        // On MRI only the :test declaration applies, so Bundler.require(:default)
+        // does not load it.
+        let mri: HashSet<String> = ["ruby", "mri"].iter().map(|s| s.to_string()).collect();
+        g.retain_declarations_for_platform(&mri);
+        assert_eq!(g.groups, vec!["test"]);
+        assert!(!g.bundler_autorequired(|group| group == "default"));
+    }
+
+    #[test]
+    fn declarations_record_file_and_line() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Gemfile"),
+            "source 'https://rubygems.org'\n\ngem 'rails'\neval_gemfile 'Gemfile.extra'\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("Gemfile.extra"), "\ngem 'puma'\n").unwrap();
+        let gems = parse_gemfile(dir.path());
+        let rails = &find_gem(&gems, "rails").declarations[0];
+        assert_eq!(
+            rails.file.as_deref(),
+            Some(dir.path().join("Gemfile").as_path())
+        );
+        assert_eq!(rails.line, Some(3));
+        let puma = &find_gem(&gems, "puma").declarations[0];
+        assert_eq!(
+            puma.file.as_deref(),
+            Some(dir.path().join("Gemfile.extra").as_path())
+        );
+        assert_eq!(puma.line, Some(2));
+    }
+
+    // ── string groups / platforms ──
+
+    #[test]
+    fn string_group_and_platform_names_are_accepted() {
+        let gems = parse_gems(
+            r#"gem "strgroup", group: "test"
+gem "strarr", groups: ["test", :ci]
+group "development" do
+  gem "strblock"
+end
+gem "strplat", platforms: "jruby"
+platforms "jruby" do
+  gem "strplatblock"
+end
+gem "strplatarr", platform: ["jruby", :windows]
+"#,
+        );
+        assert_eq!(find_gem(&gems, "strgroup").groups, vec!["test"]);
+        assert_eq!(find_gem(&gems, "strarr").groups, vec!["test", "ci"]);
+        assert_eq!(find_gem(&gems, "strblock").groups, vec!["development"]);
+        assert_eq!(find_gem(&gems, "strplat").platforms, vec!["jruby"]);
+        assert_eq!(find_gem(&gems, "strplatblock").platforms, vec!["jruby"]);
+        assert_eq!(
+            find_gem(&gems, "strplatarr").platforms,
+            vec!["jruby", "windows"]
+        );
+    }
+
+    #[test]
+    fn group_block_options_hash_is_not_a_group_name() {
+        let gems = parse_gems("group :docs, optional: true do\n  gem 'yard'\nend\n");
+        assert_eq!(find_gem(&gems, "yard").groups, vec!["docs"]);
+    }
+
+    #[test]
+    fn platform_option_wins_over_platforms_option() {
+        // Bundler: `opts["platform"] || opts["platforms"]`.
+        let gems = parse_gems("gem 'platboth', platforms: :ruby, platform: :jruby\n");
+        assert_eq!(find_gem(&gems, "platboth").platforms, vec!["jruby"]);
+    }
+
+    #[test]
+    fn groups_option_wins_over_group_option() {
+        // Bundler: `opts.delete("groups") || opts["group"]`.
+        let gems = parse_gems("gem 'x', groups: [:test], group: :development\n");
+        assert_eq!(find_gem(&gems, "x").groups, vec!["test"]);
+    }
+
+    // ── option parsing ──
+
+    #[test]
+    fn braced_options_hash_is_honored() {
+        let gems = parse_gems("gem 'braces', '>= 0', { require: false, group: :test }\n");
+        let g = find_gem(&gems, "braces");
+        assert!(g.require_false);
+        assert_eq!(g.groups, vec!["test"]);
+    }
+
+    #[test]
+    fn require_nil_disables_autorequire() {
+        let gems = parse_gems("gem 'reqnil', require: nil\ngem 'reqtrue', require: true\n");
+        assert!(find_gem(&gems, "reqnil").require_false);
+        assert!(!find_gem(&gems, "reqtrue").require_false);
+    }
+
+    #[test]
+    fn install_if_literal_conditions_are_evaluated() {
+        let gems = parse_gems(
+            r#"gem "never_opt", install_if: -> { false }
+gem "always_opt", install_if: -> { true }
+gem "nil_lambda", install_if: lambda { nil }
+gem "never_bool", install_if: false
+gem "unknown_opt", install_if: -> { RUBY_PLATFORM.include?("darwin") }
+install_if -> { false } do
+  gem "never_block"
+end
+install_if proc { true }, -> { ENV["X"] } do
+  gem "unknown_block"
+end
+"#,
+        );
+        let cond = |name: &str| find_gem(&gems, name).declarations[0].install_if;
+        assert_eq!(cond("never_opt"), InstallCondition::Never);
+        assert_eq!(cond("always_opt"), InstallCondition::Always);
+        assert_eq!(cond("nil_lambda"), InstallCondition::Never);
+        assert_eq!(cond("never_bool"), InstallCondition::Never);
+        assert_eq!(cond("unknown_opt"), InstallCondition::Unknown);
+        assert_eq!(cond("never_block"), InstallCondition::Never);
+        assert_eq!(cond("unknown_block"), InstallCondition::Unknown);
+        // Statically excluded declarations are never loaded by Bundler.require;
+        // unknown conditions are conservatively treated as possibly installed.
+        let default = |g: &str| g == "default";
+        assert!(!find_gem(&gems, "never_block").bundler_autorequired(default));
+        assert!(find_gem(&gems, "unknown_block").bundler_autorequired(default));
+    }
+
+    // ── sources ──
+
+    #[test]
+    fn git_source_shorthands_are_git_sources() {
+        let gems = parse_gems(
+            r#"git_source(:internal) { |repo| "https://git.example.test/#{repo}.git" }
+gem "gh", github: "rails/rails"
+gem "gh_short", github: "rack"
+gem "gi", gist: "abc123"
+gem "bb", bitbucket: "team/repo"
+gem "gl", gitlab: "group/project"
+gem "custom", internal: "tools/custom"
+gem "plain", git: "https://example.test/plain.git"
+"#,
+        );
+        let git = |name: &str| match &find_gem(&gems, name).source {
+            Some(GemSource::Git(uri)) => uri.clone(),
+            other => panic!("{name}: expected git source, got {other:?}"),
+        };
+        assert_eq!(git("gh"), "https://github.com/rails/rails.git");
+        assert_eq!(git("gh_short"), "https://github.com/rack/rack.git");
+        assert_eq!(git("gi"), "https://gist.github.com/abc123.git");
+        assert_eq!(git("bb"), "https://team@bitbucket.org/team/repo.git");
+        assert_eq!(git("gl"), "https://gitlab.com/group/project.git");
+        assert_eq!(git("custom"), "internal:tools/custom");
+        assert_eq!(git("plain"), "https://example.test/plain.git");
+    }
+
+    #[test]
+    fn unknown_option_key_is_not_a_git_source() {
+        let gems = parse_gems("gem 'x', internal: 'tools/x'\n");
+        assert_eq!(find_gem(&gems, "x").source, None);
+    }
+
+    #[test]
+    fn source_blocks_apply_to_enclosed_gems() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = dir.path().join("engines/foo_bar_engine");
+        std::fs::create_dir_all(engine.join("lib")).unwrap();
+        write_gemspec(
+            &engine.join("foo_bar_engine.gemspec"),
+            "  spec.name = 'foo_bar_engine'\n",
+        );
+        std::fs::write(
+            dir.path().join("Gemfile"),
+            r#"path "engines/foo_bar_engine" do
+  gem "foo_bar_engine"
+end
+path "engines" do
+  gem "foo_bar_engine_nested", require: false
+end
+git "https://example.test/x.git" do
+  gem "from_git"
+  source "https://rubygems.org" do
+    gem "from_rubygems"
+  end
+end
+github "org/repo" do
+  gem "from_github"
+  gem "explicit", path: "engines/foo_bar_engine"
+end
+gem "after_blocks"
+"#,
+        )
+        .unwrap();
+        let gems = parse_gemfile(dir.path());
+        assert_eq!(
+            find_gem(&gems, "foo_bar_engine").source,
+            Some(GemSource::Path(engine.clone()))
+        );
+        // No gemspec named foo_bar_engine_nested exists: fall back to the block dir.
+        assert_eq!(
+            find_gem(&gems, "foo_bar_engine_nested").source,
+            Some(GemSource::Path(dir.path().join("engines")))
+        );
+        assert_eq!(
+            find_gem(&gems, "from_git").source,
+            Some(GemSource::Git("https://example.test/x.git".to_string()))
+        );
+        assert_eq!(find_gem(&gems, "from_rubygems").source, None);
+        assert_eq!(
+            find_gem(&gems, "from_github").source,
+            Some(GemSource::Git(
+                "https://github.com/org/repo.git".to_string()
+            ))
+        );
+        assert_eq!(
+            find_gem(&gems, "explicit").source,
+            Some(GemSource::Path(engine))
+        );
+        assert_eq!(find_gem(&gems, "after_blocks").source, None);
+    }
+
+    #[test]
+    fn path_block_resolves_gem_in_subdirectory() {
+        // Bundler's path source globs `{,*,*/*}.gemspec`, so a monorepo `path` block
+        // finds `<dir>/<name>/<name>.gemspec`.
+        let dir = tempfile::tempdir().unwrap();
+        let engine = dir.path().join("engines/foo_bar_engine");
+        std::fs::create_dir_all(&engine).unwrap();
+        write_gemspec(
+            &engine.join("foo_bar_engine.gemspec"),
+            "  spec.name = 'foo_bar_engine'\n",
+        );
+        std::fs::write(
+            dir.path().join("Gemfile"),
+            "path 'engines' do\n  gem 'foo_bar_engine'\nend\ngem 'opt', path: 'engines'\n",
+        )
+        .unwrap();
+        let gems = parse_gemfile(dir.path());
+        assert_eq!(
+            find_gem(&gems, "foo_bar_engine").source,
+            Some(GemSource::Path(engine))
+        );
+    }
+
+    #[test]
+    fn path_option_expands_home_directory() {
+        let home = std::env::var_os("HOME").map(PathBuf::from).unwrap();
+        let gems = parse_gems("gem 'homegem', path: '~/src/homegem'\n");
+        assert_eq!(
+            find_gem(&gems, "homegem").source,
+            Some(GemSource::Path(home.join("src/homegem")))
+        );
+    }
+
+    #[test]
+    fn eval_gemfile_inherits_enclosing_source_block() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Gemfile"),
+            "git 'https://example.test/x.git' do\n  eval_gemfile 'Gemfile.git'\nend\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("Gemfile.git"), "gem 'inner'\n").unwrap();
+        let gems = parse_gemfile(dir.path());
+        assert_eq!(
+            find_gem(&gems, "inner").source,
+            Some(GemSource::Git("https://example.test/x.git".to_string()))
+        );
     }
 
     #[test]
@@ -2009,11 +2541,14 @@ spec.add_development_dependency 'rspec'
     }
 
     #[test]
-    fn gemspec_inside_group_block_inherits_group() {
+    fn gemspec_inside_group_block_ignores_enclosing_context() {
+        // Bundler >= 2.6: the gemspec gem is added via add_dependency, so enclosing
+        // group/platforms blocks do not apply; dev deps get only development_group.
+        // (This test previously asserted the pre-2.6 inheritance.)
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join("Gemfile"),
-            "group :engine do\n  gemspec\nend\n",
+            "group :ci do\n  platforms :jruby do\n    gemspec\n  end\nend\n",
         )
         .unwrap();
         write_gemspec(
@@ -2021,11 +2556,18 @@ spec.add_development_dependency 'rspec'
             "  spec.name = 'my_gem'\n  spec.add_development_dependency 'rspec'\n",
         );
         let gems = parse_gemfile(dir.path());
-        assert_eq!(find_gem(&gems, "my_gem").groups, vec!["engine"]);
+        let my_gem = find_gem(&gems, "my_gem");
+        assert_eq!(my_gem.groups, vec!["default"]);
+        assert!(my_gem.platforms.is_empty());
+        let rspec = find_gem(&gems, "rspec");
+        assert_eq!(rspec.groups, vec!["development"]);
+        assert!(rspec.platforms.is_empty());
         assert_eq!(
-            find_gem(&gems, "rspec").groups,
-            vec!["engine", "development"]
+            rspec.declarations[0].file.as_deref(),
+            Some(dir.path().join("foo.gemspec").as_path())
         );
+        assert_eq!(rspec.declarations[0].line, Some(3));
+        assert_eq!(my_gem.declarations[0].line, Some(3));
     }
 
     #[test]

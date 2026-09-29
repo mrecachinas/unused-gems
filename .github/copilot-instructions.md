@@ -25,7 +25,7 @@ Parse Gemfile (ruby-prism AST)
   → Scan scripts (Makefile, Dockerfile, CI configs)
   → [lazy] Only unresolved gems: discover module names → re-match
   → Apply ignore file (.unused_gems.yml)
-  → Parse Gemfile.lock (transitive dep counts)
+  → Parse Gemfile.lock / gems.locked (transitive dep counts)
   → Output (text/json/github) or diff against baseline
 ```
 
@@ -40,7 +40,7 @@ Parse Gemfile (ruby-prism AST)
 
 ## Key Conventions
 
-**Error handling:** No custom error types or error crates. Graceful degradation — missing gems, bad caches, etc. are logged via `eprintln!` and skipped. Only a missing Gemfile is fatal (`exit(1)`). Exit code is 0 if no unused gems found, 1 otherwise.
+**Error handling:** No custom error types or error crates. Graceful degradation — missing gems, bad caches, etc. are logged via `eprintln!` and skipped. Only a missing Gemfile (or gems.rb) is fatal. Exit code is 0 if no unused gems found, 1 otherwise.
 
 **Performance patterns:**
 - Byte-level scanning with `memchr::memmem::Finder` instead of regex in hot paths (scanner.rs)
@@ -54,7 +54,11 @@ Parse Gemfile (ruby-prism AST)
 
 **Bundler.require handling:** When `Bundler.require(*Rails.groups)` is detected, only `:default` group gems are marked `BundlerRequired`. Dev/test-only gems without direct code references are reported as `Unused`.
 
-**Gemspec parsing:** Root gemspecs are only parsed when a bare `gemspec` directive (without `path:`) is present in the Gemfile. Gemspecs with explicit `path:` args are parsed from those directories.
+**Gemspec parsing:** Root gemspecs are only parsed when a bare `gemspec` directive (without `path:`) is present in the Gemfile. Gemspecs with explicit `path:` args are parsed from those directories. Gemspec entries follow Bundler ≥ 2.6: the gem itself is `:default` on all platforms and development dependencies are only in `development_group`, ignoring enclosing `group`/`platforms` blocks.
+
+**Per-declaration semantics:** Duplicate `gem` declarations are not merged away — each is a `GemDeclaration` (groups, platforms, autorequire, `install_if`, file:line) on `GemEntry.declarations`; `groups`/`platforms`/`require_false` are aggregates. Bundler.require status is decided per declaration (`GemEntry::bundler_autorequired`), and declarations for other platforms are dropped in main.rs before matching.
+
+**Gemfile discovery:** `Gemfile`, then `gems.rb`; each Gemfile's lockfile is `gems.locked` (for `gems.rb`) or `<gemfile>.lock`.
 
 **Module organization:** Flat structure under `src/`, function-based design (no traits). Shared state uses `Arc<Mutex<>>` (e.g., file cache in scanner).
 
