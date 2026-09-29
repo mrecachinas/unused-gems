@@ -1519,8 +1519,6 @@ fn scan_bundler_require(
     bundler_groups: &mut Vec<String>,
     bundler_require_all: &mut bool,
 ) {
-    static GROUP_SYM_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r":(\w+)").unwrap());
-
     let finder = memmem::Finder::new(b"Bundler.require");
     let mut pos = 0;
     while let Some(idx) = finder.find(&bytes[pos..]) {
@@ -1538,31 +1536,13 @@ fn scan_bundler_require(
         }
         let rest_owned =
             strip_inline_comment(std::str::from_utf8(&bytes[after..end]).unwrap_or(""));
-        let rest = rest_owned.trim();
-        let rest_inner = rest.strip_prefix('(').map(|s| s.trim()).unwrap_or(rest);
-        let is_empty_call = rest.is_empty() || rest == "(" || rest == "()" || rest == "( )" || {
-            let r = rest_inner.trim_start();
-            let r = r.strip_prefix(')').map(|s| s.trim()).unwrap_or(r);
-            rest.starts_with('(') && r.is_empty()
-        };
-        if rest.contains("Rails.groups") {
-            push_rails_group_conditions(rest, bundler_groups);
-            *bundler_require_all = true;
-        } else if rest.contains("Rails.env") {
-            *bundler_require_all = true;
-        } else {
-            if is_empty_call || rest_inner.starts_with('*') {
-                bundler_groups.push("default".to_string());
-                if let Some(var) = splat_var_name(rest_inner) {
-                    if push_rails_groups_for_splat_var(bytes, var, bundler_groups) {
-                        *bundler_require_all = true;
-                    }
-                }
-            }
-            for g in GROUP_SYM_RE.captures_iter(rest) {
-                bundler_groups.push(g[1].to_string());
-            }
-        }
+        apply_bundler_require_args(
+            rest_owned.trim(),
+            bytes,
+            &[],
+            bundler_groups,
+            bundler_require_all,
+        );
         pos = abs + 1;
     }
 }
@@ -1850,7 +1830,6 @@ fn scan_bundler_require_filtered(
     bundler_groups: &mut Vec<String>,
     bundler_require_all: &mut bool,
 ) {
-    static GROUP_SYM_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r":(\w+)").unwrap());
     let mut pos = 0;
     while let Some(idx) = BUNDLER_REQUIRE_FINDER.find(&bytes[pos..]) {
         let abs = pos + idx;
@@ -1874,38 +1853,95 @@ fn scan_bundler_require_filtered(
         // does not capture `:test` from the comment. We must respect string
         // literals so a `#` inside `"..."` / `'...'` doesn't terminate.
         let rest_owned = strip_inline_comment(raw);
-        let rest = rest_owned.trim();
-        let rest_inner = rest.strip_prefix('(').map(|s| s.trim()).unwrap_or(rest);
-
-        // Fix #1: `Bundler.require`, `Bundler.require()`, `Bundler.require( )`
-        // and `Bundler.require(\n)` all mean "auto-require the :default group".
-        // Detect the "no args" form before falling through to group extraction.
-        let is_empty_call = rest.is_empty() || rest == "(" || rest == "()" || rest == "( )" || {
-            let r = rest_inner.trim_start();
-            let r = r.strip_prefix(')').map(|s| s.trim()).unwrap_or(r);
-            rest.starts_with('(') && r.is_empty()
-        };
-
-        if rest.contains("Rails.groups") {
-            push_rails_group_conditions(rest, bundler_groups);
-            *bundler_require_all = true;
-        } else if rest.contains("Rails.env") {
-            *bundler_require_all = true;
-        } else {
-            if is_empty_call || rest_inner.starts_with('*') {
-                bundler_groups.push("default".to_string());
-                if let Some(var) = splat_var_name(rest_inner) {
-                    if push_rails_groups_for_splat_var(bytes, var, bundler_groups) {
-                        *bundler_require_all = true;
-                    }
-                }
-            }
-            for g in GROUP_SYM_RE.captures_iter(rest) {
-                bundler_groups.push(g[1].to_string());
-            }
-        }
+        apply_bundler_require_args(
+            rest_owned.trim(),
+            bytes,
+            mask,
+            bundler_groups,
+            bundler_require_all,
+        );
         pos = abs + 1;
     }
+}
+
+/// Interpret the argument text following `Bundler.require` (inline comment
+/// already stripped). Explicit group symbols are always recorded, including
+/// alongside `Rails.env` (`Bundler.require(:default, :assets, Rails.env)`);
+/// `Rails.groups(...)` conditions are recorded separately and are not treated
+/// as unconditional groups.
+fn apply_bundler_require_args(
+    rest: &str,
+    bytes: &[u8],
+    mask: &[u8],
+    bundler_groups: &mut Vec<String>,
+    bundler_require_all: &mut bool,
+) {
+    static GROUP_SYM_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?:^|[^:\w]):(\w+)").unwrap());
+    let rest_inner = rest.strip_prefix('(').map(|s| s.trim()).unwrap_or(rest);
+
+    // Fix #1: `Bundler.require`, `Bundler.require()`, `Bundler.require( )`
+    // and `Bundler.require(\n)` all mean "auto-require the :default group".
+    let is_empty_call = rest.is_empty() || rest == "(" || rest == "()" || rest == "( )" || {
+        let r = rest_inner.trim_start();
+        let r = r.strip_prefix(')').map(|s| s.trim()).unwrap_or(r);
+        rest.starts_with('(') && r.is_empty()
+    };
+
+    if rest.contains("Rails.groups") {
+        push_rails_group_conditions(rest, bundler_groups);
+        *bundler_require_all = true;
+    } else if rest.contains("Rails.env") {
+        *bundler_require_all = true;
+    } else if is_empty_call || rest_inner.starts_with('*') {
+        bundler_groups.push("default".to_string());
+        if let Some(var) = splat_var_name(rest_inner) {
+            if push_rails_groups_for_splat_var(bytes, mask, var, bundler_groups) {
+                *bundler_require_all = true;
+            }
+        }
+    }
+    let explicit = strip_rails_groups_calls(rest);
+    for g in GROUP_SYM_RE.captures_iter(&explicit) {
+        bundler_groups.push(g[1].to_string());
+    }
+}
+
+/// Remove `Rails.groups(...)` calls (balanced parentheses) so their
+/// conditional hash keys are not mistaken for unconditional group symbols.
+fn strip_rails_groups_calls(source: &str) -> std::borrow::Cow<'_, str> {
+    const CALL: &str = "Rails.groups";
+    if !source.contains(CALL) {
+        return std::borrow::Cow::Borrowed(source);
+    }
+    let mut out = String::with_capacity(source.len());
+    let mut rest = source;
+    while let Some(index) = rest.find(CALL) {
+        out.push_str(&rest[..index]);
+        let after = &rest[index + CALL.len()..];
+        let args = after.trim_start();
+        rest = if args.starts_with('(') {
+            let mut depth = 0usize;
+            let mut close = args.len();
+            for (offset, ch) in args.char_indices() {
+                match ch {
+                    '(' => depth += 1,
+                    ')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            close = offset + 1;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            &args[close..]
+        } else {
+            after
+        };
+    }
+    out.push_str(rest);
+    std::borrow::Cow::Owned(out)
 }
 
 fn splat_var_name(rest_inner: &str) -> Option<&str> {
@@ -1919,15 +1955,27 @@ fn splat_var_name(rest_inner: &str) -> Option<&str> {
 
 fn push_rails_groups_for_splat_var(
     bytes: &[u8],
+    mask: &[u8],
     var: &str,
     bundler_groups: &mut Vec<String>,
 ) -> bool {
     let mut aliases_rails_groups = false;
+    let mut line_start = 0;
     for line in bytes.split(|&b| b == b'\n') {
+        let offset = line_start;
+        line_start += line.len() + 1;
         let Ok(line) = std::str::from_utf8(line) else {
             continue;
         };
-        if !line.contains(var) || !line.contains("Rails.groups") {
+        if !line.contains(var) {
+            continue;
+        }
+        // Skip commented-out or quoted assignments such as
+        // `# groups = Rails.groups(assets: %w(development))`.
+        let Some(call) = line.find("Rails.groups") else {
+            continue;
+        };
+        if is_skipped(mask, offset + call) {
             continue;
         }
         aliases_rails_groups = true;
@@ -1940,7 +1988,7 @@ fn push_rails_group_conditions(source: &str, bundler_groups: &mut Vec<String>) {
     static CONDITION_RE: Lazy<Regex> = Lazy::new(|| {
         Regex::new(
             r#"(?x)
-            (\w+)\s*:\s*
+            :?(\w+)\s*(?::|=>)\s*
             (?:
                 %w\[([^\]]*)\] |
                 %w\(([^)]*)\) |
@@ -3938,6 +3986,58 @@ require 'real_regex'
             .bundler_groups
             .contains(&"__rails_group_condition__:assets:development,test,profile".to_string()));
         assert!(!r.bundler_groups.contains(&"migrations".to_string()));
+    }
+
+    #[test]
+    fn rails_group_conditions_support_hash_rockets() {
+        let mut groups = Vec::new();
+        push_rails_group_conditions(
+            "Bundler.require(*Rails.groups(:assets => %w(development test)))",
+            &mut groups,
+        );
+        assert_eq!(
+            groups,
+            vec!["__rails_group_condition__:assets:development,test"]
+        );
+    }
+
+    #[test]
+    fn bundler_require_rails_env_keeps_explicit_groups() {
+        let input = b"Bundler.require(:default, :assets, Rails.env)\n";
+        let mask = build_skip_mask(input, true, LineCommentKind::Hash);
+        let mut groups = Vec::new();
+        let mut require_all = false;
+        scan_bundler_require_filtered(input, &mask, &mut groups, &mut require_all);
+        assert!(require_all);
+        assert_eq!(groups, vec!["default", "assets"]);
+    }
+
+    #[test]
+    fn bundler_require_rails_groups_hash_keys_are_not_plain_groups() {
+        let input = b"Bundler.require(:default, *Rails.groups(:assets => %w(development test)))\n";
+        let mask = build_skip_mask(input, true, LineCommentKind::Hash);
+        let mut groups = Vec::new();
+        let mut require_all = false;
+        scan_bundler_require_filtered(input, &mask, &mut groups, &mut require_all);
+        assert!(require_all);
+        assert_eq!(
+            groups,
+            vec![
+                "__rails_group_condition__:assets:development,test",
+                "default"
+            ]
+        );
+    }
+
+    #[test]
+    fn bundler_splat_var_ignores_commented_rails_groups_assignment() {
+        let input = b"groups = [:default]\n# groups = Rails.groups(assets: %w(development))\nBundler.require(*groups)\n";
+        let mask = build_skip_mask(input, true, LineCommentKind::Hash);
+        let mut groups = Vec::new();
+        let mut require_all = false;
+        scan_bundler_require_filtered(input, &mask, &mut groups, &mut require_all);
+        assert!(!require_all);
+        assert_eq!(groups, vec!["default"]);
     }
 
     #[test]
