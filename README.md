@@ -4,11 +4,11 @@ High-performance scanner for unused gems in Ruby projects, built in Rust with [r
 
 ## Features
 
-- **Gemfile parsing** via ruby-prism AST — handles `gem`, `group`, `platforms`, `require:`, `path:`, `git:`, `eval_gemfile` and `gemspec` directives
+- **Gemfile parsing** via ruby-prism AST — handles `gem`, `group`, `platforms`, `install_if`, `require:`, `path:`, `git:`/`github:`/custom `git_source`, `path`/`git`/`github`/`source` blocks, `eval_gemfile` and `gemspec` directives; `Gemfile` or `gems.rb`
 - **Parallel source scanning** with rayon — scans Ruby/ERB/HAML/YAML files concurrently
-- **Gem introspection** — discovers actual require paths and module names from installed gems
+- **Gem introspection** — discovers actual require paths and top-level module names from installed gems (rbenv, rvm, mise, asdf, chruby, GEM_PATH/GEM_HOME, BUNDLE_PATH, git checkouts), without letting namespace-extension folders or reopened constants claim other gems' usage
 - **Script/CI detection** — finds gem usage in Makefiles, Dockerfiles, CI configs
-- **Gemfile.lock analysis** — counts transitive dependency chains
+- **Lockfile analysis** — counts unique transitive dependencies from `Gemfile.lock` / `gems.locked`
 - **Monorepo support** — merge multiple explicit Gemfiles with one source scan
 - **Multiple output formats** — text, JSON, GitHub Actions annotations
 - **Diff mode** — compare against a baseline JSON to detect regressions
@@ -81,11 +81,11 @@ unused-gems --diff baseline.json /path/to/project
 # Fail only when a gem becomes unused or a newly added gem is unused
 unused-gems --diff baseline.json --fail-on new /path/to/project
 
-# Skip additional directories
-unused-gems --skip-dirs tmp,cache /path/to/project
+# Skip additional directories (names, or paths relative to the project root)
+unused-gems --skip-dirs tmp,cache,app/legacy /path/to/project
 
-# Treat the test group as active for Bundler.require(*Rails.groups)
-unused-gems --rails-env test /path/to/project
+# Treat the development and test groups as active for Bundler.require(*Rails.groups)
+unused-gems --rails-env development,test /path/to/project
 
 # Scan a monorepo with multiple Gemfiles
 unused-gems --gemfile engines/a/Gemfile --gemfile engines/b/Gemfile /path/to/project
@@ -99,15 +99,55 @@ unused-gems --gemfile engines/a/Gemfile --gemfile engines/b/Gemfile /path/to/pro
 -v, --verbose             Show file locations and require paths
 -q, --quiet               Suppress progress messages
     --no-cache            Disable file scan cache
-    --ignore-file <PATH>  Path to ignore file (default: .unused_gems.yml)
+    --ignore-file <PATH>  Ignore file; relative paths resolve against the scanned directory (default: .unused_gems.yml)
     --gemfile <PATH>      Gemfile path to analyze; repeat for monorepos
-    --diff <BASELINE>     Compare against previous JSON output
-    --skip-dirs <DIRS>    Additional directories to skip (comma-separated)
-    --rails-env <ENV>      Rails environment group considered active
+                          (default: Gemfile, then gems.rb)
+    --diff <BASELINE>     Compare against previous JSON output (text, json or github per -o)
+    --fail-on <POLICY>    none (always 0), any (default: 1 if unused), new (1 only for new unused in --diff)
+    --sarif               Emit SARIF JSON (ignored with --diff)
+    --skip-dirs <DIRS>    Additional directories to skip (comma-separated names or root-relative paths)
+    --rails-env <ENVS>    Rails environment group(s) considered active (comma-separated or repeated)
+    --allow-missing-gemfile  Exit 0 with a notice when the Gemfile is missing
 -h, --help                Print help
 ```
 
+## Exit codes
+
+| Code | Meaning |
+|------|---------|
+| `0` | No unused gems (or `--fail-on none`, or `--fail-on new` without new unused gems) |
+| `1` | Unused gems found (per `--fail-on`) |
+| `2` | Fatal error: invalid directory, missing Gemfile, unreadable or invalid `--diff` baseline, bad CLI arguments |
+
+`--fail-on new` only has an effect together with `--diff`; without it a warning is printed
+and the exit code is `0`. With `-o json`, `--diff` prints
+`{"schema_version": "1", "diff": {"newly_unused": [...], "no_longer_unused": [...],
+"status_changed": [...], "added": [...], "removed": [...]}, "new_unused_count": N}`; with
+`-o github` it emits a warning annotation per newly unused gem.
+
 ## Gemfile semantics
+
+The default Gemfile is `<dir>/Gemfile`, falling back to `<dir>/gems.rb`. Each analyzed
+Gemfile is paired with its own lockfile like Bundler does: `gems.locked` for `gems.rb`,
+otherwise `<gemfile>.lock` (so `--gemfile gemfiles/rails7.gemfile` reads
+`gemfiles/rails7.gemfile.lock`). Lockfiles of Gemfiles that are not analyzed are ignored.
+
+Every `gem` declaration is kept separately, as Bundler keeps each duplicate as its own
+dependency. A gem counts as loaded by `Bundler.require` when **any** declaration is in an
+active group, applies to the current platform (declarations for other platforms are
+dropped before matching) and has autorequire enabled (`require: false`, `require: nil`
+and `require: []` disable it). Group and platform names may be symbols or strings, the
+options hash may be braced (`gem "x", ">= 0", { require: false }`), `groups:` takes
+precedence over `group:` and `platform:` over `platforms:`. `install_if` conditions
+(option or block) are evaluated when they are literals such as `-> { false }`, `true` or
+`nil`: a statically false condition is never `Bundler.require`d; any other condition is
+treated as possibly true.
+
+A gem's source comes from `path:`, `git:`, the `github:`/`gitlab:`/`gist:`/`bitbucket:`
+shorthands, any custom `git_source(:name)` key, or an enclosing `path`/`git`/`github`
+block (`source` blocks reset it; `eval_gemfile` inherits it). Gems in a path source
+resolve to the directory itself or to the immediate subdirectory holding
+`<name>.gemspec`, following Bundler's `{,*,*/*}.gemspec` glob; `~` is expanded.
 
 `eval_gemfile` is evaluated inline at its declaration site, so gems appear in source
 order and inherit the enclosing `group`/`platforms` context. Relative paths resolve
@@ -124,10 +164,11 @@ immediate directory for `*.gemspec` (plus a bare `.gemspec`), matches `name:` ag
 parsed `spec.name` rather than the file name, selects deterministically, and warns when
 zero gemspecs are found or when the candidates cover more than one `[spec.name,
 spec.version]` pair (matching Bundler's grouping — two gemspecs for the same gem at
-different versions stay ambiguous, while equal versions collapse to one candidate). The gemspec's own `spec.name` is registered as
-a default-group path source; its **development** dependencies are added to the configured
-development group, while runtime dependencies are left to Bundler's transitive resolution
-rather than being reported as top-level gems. Matching Bundler, an explicit Gemfile
+different versions stay ambiguous, while equal versions collapse to one candidate). Following Bundler ≥ 2.6, the gemspec's own
+`spec.name` is registered as a `:default`-group, all-platform path source and its
+**development** dependencies are added only to the configured development group — even
+when `gemspec` sits inside a `group`/`platforms` block. Runtime dependencies are left to
+Bundler's transitive resolution rather than being reported as top-level gems. Matching Bundler, an explicit Gemfile
 declaration always wins over a duplicate gemspec development dependency, in either
 declaration order.
 
@@ -139,8 +180,8 @@ declaration order.
 | `scanner.rs` | Parallel source tree scanning with hand-rolled byte scanners |
 | `introspect.rs` | Discovers gem require paths and module names from installed gems or vendor/cache tarballs |
 | `matcher.rs` | Matches gems against scan results to determine usage |
-| `scripts.rs` | Scans Makefiles, Dockerfiles, CI configs for gem references |
-| `lockfile.rs` | Parses Gemfile.lock for transitive dependency counting |
+| `scripts.rs` | Scans Rake tasks, Makefiles, Dockerfiles, Procfiles, CI configs for gem executables run as commands |
+| `lockfile.rs` | Parses Gemfile.lock / gems.locked for transitive dependency counting |
 | `cache.rs` | Bincode file cache — skips re-scanning unchanged files |
 | `output.rs` | Text, JSON, GitHub Actions output formatters |
 | `diff.rs` | Baseline comparison mode |
@@ -166,7 +207,25 @@ adapters:
     custom_cache_store: custom-cache-gem
 ```
 
+`ignore` accepts a list of gem names (a single scalar name is also accepted). Missing
+explicit `--ignore-file` paths, malformed YAML and invalid entries produce warnings.
+
 Adapter entries map the value used in Rails config to the gem that provides it.
+
+Built-in mappings cover common database adapters (including `postgis`, `sqlserver`,
+`oracle_enhanced` and `cockroachdb`, which credit both the ActiveRecord adapter gem and
+its driver), static `url:` schemes in `config/database.yml` (`postgres://`, `mysql2://`,
+`sqlite3:`, `trilogy://`, or a literal default inside
+`<%= ENV.fetch("DATABASE_URL", "…") %>`), and unknown database adapters fall back to a
+gem named after the adapter or `activerecord-<adapter>-adapter`. Rails' built-in
+backends (`async`/`inline`/`test` cable adapters, `Disk`/`Mirror` storage services,
+`memory_store`/`file_store`/`null_store` caches) credit no gem.
+
+Rails system tests are recognised too: referencing `ActionDispatch::SystemTestCase`
+credits `capybara`, and `driven_by :selenium` (or `Capybara.default_driver =`/
+`javascript_driver = :selenium_*`, `:cuprite`, …) credits the driver gem. In JSON output
+this configuration evidence has `"type": "database_adapter"` (kept for compatibility)
+plus `kind` (`database`, `cable`, `storage`, `cache`, `system_test`) and `source` (file).
 
 ## Performance
 
@@ -174,9 +233,9 @@ Built with Rust for maximum performance:
 - **ruby-prism** for accurate Gemfile AST parsing (same parser as CRuby 3.3+)
 - **Hand-rolled byte scanners** with SIMD-accelerated `memchr` — no per-file regex overhead
 - **Parallel file walking** via `ignore` crate (scans generated sources even when gitignored)
-- **Bincode file cache** — unchanged files skip scanning on repeat runs
+- **Bincode file cache** — unchanged files skip scanning on repeat runs (entries for removed files are pruned; the cache is replaced atomically)
 - **Zero-alloc hot path** — extension checks, comment detection all avoid heap allocation
-- **vendor/cache support** — extracts gemspec metadata from packed `.gem` tarballs
+- **vendor/cache support** — lists require paths from packed `.gem` tarballs (size-bounded, only for gems that aren't installed)
 
 On github/github (~53K Ruby files): **~2.8s** (vs scc line counting at 1.85s).
 

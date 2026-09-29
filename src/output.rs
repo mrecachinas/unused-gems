@@ -7,7 +7,6 @@ use crate::types::{Evidence, GemResult, GemStatus};
 struct Categories<'a> {
     unused: Vec<(&'a str, &'a GemResult)>,
     bundler_required: Vec<(&'a str, &'a GemResult)>,
-    require_false: Vec<(&'a str, &'a GemResult)>,
     used: Vec<(&'a str, &'a GemResult)>,
     ignored: Vec<(&'a str, &'a GemResult)>,
     platform_excluded: Vec<(&'a str, &'a GemResult)>,
@@ -17,7 +16,6 @@ fn categorize(results: &HashMap<String, GemResult>) -> Categories<'_> {
     let mut cats = Categories {
         unused: Vec::new(),
         bundler_required: Vec::new(),
-        require_false: Vec::new(),
         used: Vec::new(),
         ignored: Vec::new(),
         platform_excluded: Vec::new(),
@@ -27,7 +25,6 @@ fn categorize(results: &HashMap<String, GemResult>) -> Categories<'_> {
         match info.status {
             GemStatus::Unused => cats.unused.push((name.as_str(), info)),
             GemStatus::BundlerRequired => cats.bundler_required.push((name.as_str(), info)),
-            GemStatus::RequireFalse => cats.require_false.push((name.as_str(), info)),
             GemStatus::Used => cats.used.push((name.as_str(), info)),
             GemStatus::Ignored => cats.ignored.push((name.as_str(), info)),
             GemStatus::PlatformExcluded => cats.platform_excluded.push((name.as_str(), info)),
@@ -36,7 +33,6 @@ fn categorize(results: &HashMap<String, GemResult>) -> Categories<'_> {
 
     cats.unused.sort_by_key(|(n, _)| *n);
     cats.bundler_required.sort_by_key(|(n, _)| *n);
-    cats.require_false.sort_by_key(|(n, _)| *n);
     cats.used.sort_by_key(|(n, _)| *n);
     cats.ignored.sort_by_key(|(n, _)| *n);
     cats.platform_excluded.sort_by_key(|(n, _)| *n);
@@ -86,17 +82,6 @@ pub fn print_results_text(
         println!();
     }
 
-    if !cats.require_false.is_empty() {
-        println!(
-            "💤 Lazy-loaded / require: false ({})",
-            cats.require_false.len()
-        );
-        println!();
-        let names: Vec<&str> = cats.require_false.iter().map(|(n, _)| *n).collect();
-        println!("  {}", names.join(", "));
-        println!();
-    }
-
     if !cats.platform_excluded.is_empty() {
         println!("ℹ️  Platform-excluded ({})", cats.platform_excluded.len());
         println!();
@@ -106,7 +91,7 @@ pub fn print_results_text(
     }
 
     if !cats.ignored.is_empty() {
-        println!("🔇 Ignored via .unused_gems.yml ({})", cats.ignored.len());
+        println!("🔇 Ignored via ignore file ({})", cats.ignored.len());
         println!();
         let names: Vec<&str> = cats.ignored.iter().map(|(n, _)| *n).collect();
         println!("  {}", names.join(", "));
@@ -130,18 +115,19 @@ pub fn print_results_text(
                         } => println!("    → {} in {}", mod_name, file),
                         Evidence::Script { file } => println!("    → script ref in {}", file),
                         Evidence::BundlerRequire => println!("    → Bundler.require"),
-                        Evidence::DatabaseAdapter { adapter } => {
-                            println!("    → adapter: {} in config/database.yml", adapter)
-                        }
+                        Evidence::DatabaseAdapter {
+                            adapter,
+                            kind,
+                            source,
+                        } => println!("    → {}: {} in {}", adapter_label(kind), adapter, source),
                     }
                 }
                 println!();
             }
         } else {
             let names: Vec<&str> = cats.used.iter().map(|(n, _)| *n).collect();
-            for chunk in names.chunks(4) {
-                let row: Vec<String> = chunk.iter().map(|n| format!("{:<28}", n)).collect();
-                println!("  {}", row.join(""));
+            for row in format_name_grid(&names, terminal_width()) {
+                println!("{}", row);
             }
             println!();
         }
@@ -165,12 +151,11 @@ pub fn print_results_text(
         }
     };
     println!(
-        "{} gems: {} used, {} unused, {} bundler.require, {} lazy{}",
+        "{} gems: {} used, {} unused, {} bundler.require{}",
         total,
         cats.used.len(),
         cats.unused.len(),
         cats.bundler_required.len(),
-        cats.require_false.len(),
         extra,
     );
 
@@ -234,9 +219,10 @@ pub fn print_results_json(
 
 pub fn print_results_sarif(
     results: &HashMap<String, GemResult>,
-    _dir: &Path,
+    dir: &Path,
     _lock_deps: &HashMap<String, Vec<String>>,
 ) -> usize {
+    let line_nums = gemfile_line_numbers(dir);
     let mut sarif_results = Vec::new();
     let mut sorted: Vec<(&String, &GemResult)> = results.iter().collect();
     sorted.sort_by_key(|(n, _)| n.as_str());
@@ -245,15 +231,16 @@ pub fn print_results_sarif(
         if info.status != GemStatus::Unused {
             continue;
         }
+        let (file, line) = gem_location(Some(info), name, dir, &line_nums);
+        let mut physical = serde_json::json!({ "artifactLocation": { "uri": file } });
+        if let Some(line) = line {
+            physical["region"] = serde_json::json!({ "startLine": line });
+        }
         sarif_results.push(serde_json::json!({
             "ruleId": "unused-gem",
             "level": "warning",
             "message": { "text": format!("Gem '{}' appears unused", name) },
-            "locations": [{
-                "physicalLocation": {
-                    "artifactLocation": { "uri": "Gemfile" }
-                }
-            }]
+            "locations": [{ "physicalLocation": physical }]
         }));
     }
 
@@ -305,10 +292,7 @@ pub fn print_results_github(
             continue;
         }
 
-        let location = match line_nums.get(name) {
-            Some(line) => format!("file=Gemfile,line={}", line),
-            None => "file=Gemfile".to_string(),
-        };
+        let location = annotation_location(&gem_location(Some(info), name, dir, &line_nums));
 
         let level = if info.status == GemStatus::Unused {
             "warning"
@@ -350,13 +334,64 @@ pub fn print_results_github(
             _ => continue,
         };
 
-        println!("::{} {}::{}", level, location, msg);
+        println!("::{} {}::{}", level, location, escape_data(&msg));
         if info.status == GemStatus::Unused {
             unused_count += 1;
         }
     }
 
     unused_count
+}
+
+fn adapter_label(kind: &str) -> &'static str {
+    match kind {
+        "database" => "database adapter",
+        "cable" => "cable adapter",
+        "storage" => "storage service",
+        "cache" => "cache store",
+        "system_test" => "system test",
+        _ => "adapter",
+    }
+}
+
+fn terminal_width() -> usize {
+    std::env::var("COLUMNS")
+        .ok()
+        .and_then(|columns| columns.trim().parse::<usize>().ok())
+        .filter(|&columns| columns > 0)
+        .unwrap_or(100)
+}
+
+/// Lay names out in columns sized to the longest name (+2 spaces), fitting
+/// as many columns as `width` allows (at least one), indented by two spaces.
+fn format_name_grid(names: &[&str], width: usize) -> Vec<String> {
+    const INDENT: usize = 2;
+    let longest = names.iter().map(|n| n.chars().count()).max().unwrap_or(0);
+    let column_width = longest + 2;
+    let columns = (width.saturating_sub(INDENT) / column_width).max(1);
+    names
+        .chunks(columns)
+        .map(|row| {
+            let mut line = " ".repeat(INDENT);
+            for name in row {
+                line.push_str(&format!("{:<column_width$}", name));
+            }
+            line.trim_end().to_string()
+        })
+        .collect()
+}
+
+/// Escape a GitHub Actions workflow command message.
+pub(crate) fn escape_data(value: &str) -> String {
+    value
+        .replace('%', "%25")
+        .replace('\r', "%0D")
+        .replace('\n', "%0A")
+}
+
+/// Escape a GitHub Actions workflow command property value.
+pub(crate) fn escape_property(value: &str) -> String {
+    escape_data(value).replace(':', "%3A").replace(',', "%2C")
 }
 
 fn summarize_evidence(evidence: &[Evidence]) -> String {
@@ -370,7 +405,7 @@ fn summarize_evidence(evidence: &[Evidence]) -> String {
             Evidence::Module { .. } => module_count += 1,
             Evidence::Script { .. } => script_count += 1,
             Evidence::BundlerRequire => parts.push("bundler_require".to_string()),
-            Evidence::DatabaseAdapter { adapter } => parts.push(format!("adapter:{}", adapter)),
+            Evidence::DatabaseAdapter { adapter, .. } => parts.push(format!("adapter:{}", adapter)),
         }
     }
     if require_count > 0 {
@@ -385,7 +420,41 @@ fn summarize_evidence(evidence: &[Evidence]) -> String {
     parts.join(", ")
 }
 
-fn gemfile_line_numbers(dir: &Path) -> HashMap<String, usize> {
+/// Where a gem is declared, relative to `dir`: its first declaration's recorded
+/// file:line (Gemfile, gems.rb, eval_gemfile, gemspec), else the root Gemfile line.
+pub(crate) fn gem_location(
+    info: Option<&GemResult>,
+    name: &str,
+    dir: &Path,
+    line_nums: &HashMap<String, usize>,
+) -> (String, Option<usize>) {
+    let declared = info.and_then(|info| {
+        info.gem
+            .declarations
+            .iter()
+            .find_map(|d| Some((d.file.as_ref()?, d.line?)))
+    });
+    match declared {
+        Some((file, line)) => (
+            file.strip_prefix(dir)
+                .unwrap_or(file)
+                .to_string_lossy()
+                .replace('\\', "/"),
+            Some(line),
+        ),
+        None => ("Gemfile".to_string(), line_nums.get(name).copied()),
+    }
+}
+
+/// `file=…[,line=…]` properties for a GitHub workflow command.
+pub(crate) fn annotation_location((file, line): &(String, Option<usize>)) -> String {
+    match line {
+        Some(line) => format!("file={},line={}", escape_property(file), line),
+        None => format!("file={}", escape_property(file)),
+    }
+}
+
+pub(crate) fn gemfile_line_numbers(dir: &Path) -> HashMap<String, usize> {
     let gemfile_path = dir.join("Gemfile");
     let content = match std::fs::read_to_string(gemfile_path) {
         Ok(c) => c,
@@ -418,7 +487,35 @@ mod tests {
             module_names: Vec::new(),
             require_false: false,
             source: None,
+            declarations: Vec::new(),
         }
+    }
+
+    #[test]
+    fn gem_location_prefers_recorded_declaration_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let (name, mut result) = make_result("nokogiri", GemStatus::Unused, &["default"]);
+        let mut line_nums = HashMap::new();
+        line_nums.insert(name.clone(), 3);
+        assert_eq!(
+            gem_location(Some(&result), &name, dir.path(), &line_nums),
+            ("Gemfile".to_string(), Some(3))
+        );
+        result.gem.declarations.push(crate::types::GemDeclaration {
+            groups: vec!["default".to_string()],
+            platforms: Vec::new(),
+            autorequire: true,
+            install_if: crate::types::InstallCondition::Always,
+            file: Some(dir.path().join("gems.rb")),
+            line: Some(7),
+        });
+        let location = gem_location(Some(&result), &name, dir.path(), &line_nums);
+        assert_eq!(location, ("gems.rb".to_string(), Some(7)));
+        assert_eq!(annotation_location(&location), "file=gems.rb,line=7");
+        assert_eq!(
+            annotation_location(&("a,b:c".to_string(), None)),
+            "file=a%2Cb%3Ac"
+        );
     }
 
     fn make_result(name: &str, status: GemStatus, groups: &[&str]) -> (String, GemResult) {
@@ -449,11 +546,6 @@ mod tests {
             make_result("rails", GemStatus::Used, &["default"]),
             make_result("unused-gem", GemStatus::Unused, &["default"]),
             make_result("dotenv", GemStatus::BundlerRequired, &["default"]),
-            {
-                let mut r = make_result("bootsnap", GemStatus::RequireFalse, &["default"]);
-                r.1.gem.require_false = true;
-                r
-            },
             make_result("debug", GemStatus::Ignored, &["development"]),
         ]
         .into_iter()
@@ -539,7 +631,6 @@ mod tests {
         assert_eq!(cats.unused.len(), 1);
         assert_eq!(cats.used.len(), 1);
         assert_eq!(cats.bundler_required.len(), 1);
-        assert_eq!(cats.require_false.len(), 1);
         assert_eq!(cats.ignored.len(), 1);
     }
 
@@ -564,6 +655,8 @@ mod tests {
             Evidence::BundlerRequire,
             Evidence::DatabaseAdapter {
                 adapter: "pg".into(),
+                kind: "database".into(),
+                source: "config/database.yml".into(),
             },
         ];
         let s = summarize_evidence(&evidence);
@@ -604,7 +697,6 @@ mod tests {
         assert_eq!(GemStatus::Used.to_string(), "used");
         assert_eq!(GemStatus::Unused.to_string(), "unused");
         assert_eq!(GemStatus::BundlerRequired.to_string(), "bundler_required");
-        assert_eq!(GemStatus::RequireFalse.to_string(), "require_false");
         assert_eq!(GemStatus::Ignored.to_string(), "ignored");
     }
 
@@ -692,20 +784,6 @@ mod tests {
     }
 
     #[test]
-    fn text_output_only_require_false() {
-        let results: HashMap<String, GemResult> = [{
-            let mut r = make_result("bootsnap", GemStatus::RequireFalse, &["default"]);
-            r.1.gem.require_false = true;
-            r
-        }]
-        .into_iter()
-        .collect();
-        let lock_deps = HashMap::new();
-        let count = print_results_text(&results, false, &lock_deps);
-        assert_eq!(count, 0);
-    }
-
-    #[test]
     fn text_output_only_ignored() {
         let results: HashMap<String, GemResult> =
             [make_result("debug", GemStatus::Ignored, &["development"])]
@@ -749,6 +827,8 @@ mod tests {
                     Evidence::BundlerRequire,
                     Evidence::DatabaseAdapter {
                         adapter: "pg".into(),
+                        kind: "database".into(),
+                        source: "config/database.yml".into(),
                     },
                 ],
                 gem: make_gem_entry("rails", &["default"]),
@@ -776,5 +856,52 @@ mod tests {
         let lock_deps = HashMap::new();
         let count = print_results_text(&results, false, &lock_deps);
         assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn name_grid_separates_long_names() {
+        let names = [
+            "opentelemetry-instrumentation-graphql",
+            "opentelemetry-instrumentation-mysql2",
+            "pg",
+        ];
+        let rows = format_name_grid(&names, 100);
+        assert_eq!(rows.len(), 2);
+        assert!(rows[0].contains("opentelemetry-instrumentation-graphql  opentelemetry"));
+        assert_eq!(rows[1], "  pg");
+        for row in &rows {
+            assert!(!row.ends_with(' '));
+        }
+    }
+
+    #[test]
+    fn name_grid_uses_at_least_one_column() {
+        let names = ["a-very-long-gem-name-that-exceeds-the-width"];
+        let rows = format_name_grid(&names, 10);
+        assert_eq!(rows, vec!["  a-very-long-gem-name-that-exceeds-the-width"]);
+        let short = ["a", "b", "c"];
+        assert_eq!(format_name_grid(&short, 100), vec!["  a  b  c"]);
+    }
+
+    #[test]
+    fn adapter_evidence_serializes_kind_and_source() {
+        let evidence = Evidence::DatabaseAdapter {
+            adapter: "redis".into(),
+            kind: "cable".into(),
+            source: "config/cable.yml".into(),
+        };
+        let json = serde_json::to_value(&evidence).unwrap();
+        assert_eq!(json["type"], "database_adapter");
+        assert_eq!(json["adapter"], "redis");
+        assert_eq!(json["kind"], "cable");
+        assert_eq!(json["source"], "config/cable.yml");
+        assert_eq!(adapter_label("cable"), "cable adapter");
+        assert_eq!(adapter_label("cache"), "cache store");
+    }
+
+    #[test]
+    fn github_annotation_escaping() {
+        assert_eq!(escape_data("a%b\r\nc: d, e"), "a%25b%0D%0Ac: d, e");
+        assert_eq!(escape_property("a:b,c%\n"), "a%3Ab%2Cc%25%0A");
     }
 }

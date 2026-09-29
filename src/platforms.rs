@@ -1,6 +1,11 @@
 use std::collections::HashSet;
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
+
+/// Upper bound on the `ruby` platform probe; a hung shim (rbenv/asdf/mise
+/// prompting, a broken wrapper) must not stall the whole scan.
+const RUBY_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug)]
 pub struct RuntimePlatform {
@@ -83,11 +88,7 @@ fn ruby_probe_command(project_dir: &Path) -> Command {
 }
 
 fn probe_ruby_platform(project_dir: &Path) -> Option<RuntimePlatform> {
-    let output = ruby_probe_command(project_dir).output().ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let stdout = String::from_utf8(output.stdout).ok()?;
+    let stdout = run_with_timeout(ruby_probe_command(project_dir), RUBY_PROBE_TIMEOUT)?;
     let mut lines = stdout.lines();
     let engine = lines.next()?;
     let ruby_platform = lines.next()?;
@@ -97,6 +98,51 @@ fn probe_ruby_platform(project_dir: &Path) -> Option<RuntimePlatform> {
         dsl_tokens: derive_platform_tokens(engine, ruby_platform, version),
         gem_platform: (!gem_platform.is_empty()).then(|| gem_platform.to_string()),
     })
+}
+
+/// Run `command`, returning its stdout when it exits successfully within
+/// `timeout`. On timeout the child is killed and `None` is returned so callers
+/// fall back gracefully.
+fn run_with_timeout(mut command: Command, timeout: Duration) -> Option<String> {
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let mut stdout = child.stdout.take()?;
+    // Drain stdout concurrently so a chatty child can never block on a full pipe.
+    let reader = std::thread::spawn(move || {
+        let mut buf = String::new();
+        std::io::Read::read_to_string(&mut stdout, &mut buf).ok()?;
+        Some(buf)
+    });
+
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Ok(None) => {
+                eprintln!(
+                    "Warning: `ruby` platform probe timed out after {}s — using fallback platform",
+                    timeout.as_secs_f32()
+                );
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    };
+    let output = reader.join().ok()??;
+    status.success().then_some(output)
 }
 
 pub fn derive_platform_tokens(engine: &str, ruby_platform: &str, version: &str) -> HashSet<String> {
@@ -165,7 +211,7 @@ fn bundler_version_suffix(version: &str) -> Option<String> {
     let suffix = format!("{major}{minor}");
     const VALID: &[&str] = &[
         "18", "19", "20", "21", "22", "23", "24", "25", "26", "27", "30", "31", "32", "33", "34",
-        "40", "41",
+        "35", "40", "41",
     ];
     VALID.contains(&suffix.as_str()).then_some(suffix)
 }
@@ -240,9 +286,47 @@ mod tests {
     #[test]
     fn does_not_generate_unknown_future_version_tokens() {
         assert_eq!(
-            derive_platform_tokens("ruby", "x86_64-linux", "3.5.0"),
+            derive_platform_tokens("ruby", "x86_64-linux", "3.6.0"),
             set(&["ruby", "mri"])
         );
+    }
+
+    #[test]
+    fn maps_ruby_35_tokens_known_to_bundler_2_7() {
+        // Bundler 2.7's CurrentRuby::ALL_RUBY_VERSIONS covers 18..27 and 30..35;
+        // Bundler 4 replaces 35 with 40..41. Accept the union.
+        assert_eq!(
+            derive_platform_tokens("ruby", "x86_64-linux", "3.5.0"),
+            set(&["ruby", "ruby_35", "mri", "mri_35"])
+        );
+        assert_eq!(
+            derive_platform_tokens("ruby", "x86_64-linux", "4.0.1"),
+            set(&["ruby", "ruby_40", "mri", "mri_40"])
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_with_timeout_kills_hung_probe() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "sleep 30"]);
+        let start = Instant::now();
+        assert_eq!(run_with_timeout(command, Duration::from_millis(200)), None);
+        assert!(start.elapsed() < Duration::from_secs(5));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_with_timeout_returns_stdout_of_fast_command() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "echo ruby; echo x86_64-linux"]);
+        assert_eq!(
+            run_with_timeout(command, Duration::from_secs(5)).as_deref(),
+            Some("ruby\nx86_64-linux\n")
+        );
+        let mut failing = Command::new("sh");
+        failing.args(["-c", "echo partial; exit 3"]);
+        assert_eq!(run_with_timeout(failing, Duration::from_secs(5)), None);
     }
 
     #[test]

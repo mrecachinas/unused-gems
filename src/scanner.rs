@@ -29,6 +29,8 @@ static REQUIRE_FINDER: Lazy<memmem::Finder<'static>> =
 static AUTOLOAD_FINDER: Lazy<memmem::Finder<'static>> =
     Lazy::new(|| memmem::Finder::new(b"autoload"));
 static GEM_DOT_FINDER: Lazy<memmem::Finder<'static>> = Lazy::new(|| memmem::Finder::new(b"Gem."));
+static ATTACHED_FINDER: Lazy<memmem::Finder<'static>> =
+    Lazy::new(|| memmem::Finder::new(b"_attached"));
 static BUNDLER_REQUIRE_FINDER: Lazy<memmem::Finder<'static>> =
     Lazy::new(|| memmem::Finder::new(b"Bundler.require"));
 const RAILS_GROUP_CONDITION_PREFIX: &str = "__rails_group_condition__:";
@@ -335,11 +337,24 @@ fn set_mask(mask: &mut [u8], start: usize, end: usize, value: bool) {
 
 type PercentEndCache = HashMap<(usize, bool), Option<usize>>;
 type InterpolationEndCache = HashMap<usize, Option<usize>>;
+/// (heredoc delimiter, search end) → earliest body start known to have no
+/// terminator line before the search end.
+type HeredocMissCache = HashMap<(Vec<u8>, usize), usize>;
 
 #[cfg(test)]
 type LexicalScanSteps = usize;
 #[cfg(not(test))]
 type LexicalScanSteps = ();
+
+/// Memoization shared by one lexical masking pass so malformed input stays
+/// linear instead of re-scanning to EOF for every unterminated opener.
+#[derive(Default)]
+struct LexCache {
+    percent_ends: PercentEndCache,
+    interpolation_ends: InterpolationEndCache,
+    heredoc_misses: HeredocMissCache,
+    steps: LexicalScanSteps,
+}
 
 #[inline]
 fn count_lexical_scan_step(steps: &mut LexicalScanSteps) {
@@ -453,9 +468,7 @@ fn expose_interpolations(
     mask: &mut [u8],
     start: usize,
     end: usize,
-    percent_ends: &mut PercentEndCache,
-    interpolation_ends: &mut InterpolationEndCache,
-    lexical_steps: &mut LexicalScanSteps,
+    cache: &mut LexCache,
 ) {
     let mut i = start;
     while i + 1 < end {
@@ -464,77 +477,20 @@ fn expose_interpolations(
             continue;
         }
         if bytes[i] == b'#' && bytes[i + 1] == b'{' {
-            if let Some(close) =
-                find_interpolation_end_cached(bytes, i + 2, end, interpolation_ends, lexical_steps)
-            {
+            if let Some(close) = find_interpolation_end_cached(
+                bytes,
+                i + 2,
+                end,
+                &mut cache.interpolation_ends,
+                &mut cache.steps,
+            ) {
                 set_mask(mask, i + 2, close, false);
-                mask_ruby_range_cached(
-                    bytes,
-                    mask,
-                    i + 2,
-                    close,
-                    percent_ends,
-                    interpolation_ends,
-                    lexical_steps,
-                );
+                mask_ruby_range_cached(bytes, mask, i + 2, close, cache);
                 i = close + 1;
                 continue;
             }
         }
         i += 1;
-    }
-}
-
-fn expose_template_attributes(bytes: &[u8], mask: &mut [u8], start: usize, end: usize) {
-    let mut i = start;
-    while i < end {
-        if matches!(bytes[i], b'{' | b'(') {
-            let open = bytes[i];
-            let close = if open == b'{' { b'}' } else { b')' };
-            if let Some(attribute_end) = find_delimited_end(bytes, i + 1, end, open, close, false) {
-                set_mask(mask, i + 1, attribute_end, false);
-                i = attribute_end + 1;
-                continue;
-            }
-        }
-        i += 1;
-    }
-}
-
-fn expose_template_assignments(bytes: &[u8], mask: &mut [u8], start: usize, end: usize) {
-    let mut i = start;
-    while i < end {
-        if bytes[i] != b'='
-            || bytes.get(i.wrapping_sub(1)) == Some(&b'=')
-            || bytes.get(i + 1) == Some(&b'=')
-            || bytes.get(i + 1) == Some(&b'>')
-        {
-            i += 1;
-            continue;
-        }
-        let mut expression_start = i + 1;
-        while expression_start < end && matches!(bytes[expression_start], b' ' | b'\t') {
-            expression_start += 1;
-        }
-        if expression_start >= end {
-            break;
-        }
-        let inline_output = i == start
-            || bytes[i - 1].is_ascii_whitespace()
-            || bytes.get(i + 1).is_some_and(u8::is_ascii_whitespace);
-        let expression_end = if inline_output {
-            end
-        } else {
-            let mut expression_end = expression_start;
-            while expression_end < end
-                && !matches!(bytes[expression_end], b' ' | b'\t' | b',' | b')' | b'}')
-            {
-                expression_end += 1;
-            }
-            expression_end
-        };
-        set_mask(mask, expression_start, expression_end, false);
-        i = expression_end;
     }
 }
 
@@ -566,87 +522,451 @@ fn apply_template_mask(bytes: &[u8], mask: &mut [u8], kind: TemplateKind) {
                 pos = close + 2;
             }
         }
-        TemplateKind::Haml | TemplateKind::Slim => {
-            mask.fill(1);
-            let mut line_start = 0;
-            let mut ruby_filter_indent = None;
-            while line_start < bytes.len() {
-                let eol = memchr::memchr(b'\n', &bytes[line_start..])
-                    .map(|n| line_start + n)
-                    .unwrap_or(bytes.len());
-                let mut ws = line_start;
-                while ws < eol && matches!(bytes[ws], b' ' | b'\t') {
-                    ws += 1;
+        TemplateKind::Haml | TemplateKind::Slim => apply_indented_template_mask(bytes, mask, kind),
+    }
+}
+
+/// An indented block owned by a previous template line.
+#[derive(Copy, Clone, PartialEq, Eq)]
+enum TemplateBlock {
+    /// `:ruby` / `ruby:` filter body.
+    Ruby,
+    /// Other filters and Slim `|` text blocks: text with `#{}` interpolation.
+    Text,
+    /// `-#` (Haml) / `/` (Slim) comment bodies.
+    Comment,
+}
+
+/// Slim embedded engines whose bodies are not Slim markup.
+const SLIM_EMBEDDED_ENGINES: &[&[u8]] = &[
+    b"javascript",
+    b"css",
+    b"sass",
+    b"scss",
+    b"less",
+    b"coffee",
+    b"markdown",
+    b"textile",
+    b"rdoc",
+    b"creole",
+    b"wiki",
+    b"mediawiki",
+    b"org",
+    b"erb",
+];
+
+/// Haml and Slim: expose Ruby code (`=`/`-` lines, tag attributes, tag output
+/// after `=`, `:ruby` filters, multi-line continuations) and `#{}`
+/// interpolation in text; everything else stays masked.
+fn apply_indented_template_mask(bytes: &[u8], mask: &mut [u8], kind: TemplateKind) {
+    mask.fill(1);
+    let len = bytes.len();
+    let mut line_start = 0;
+    let mut block: Option<(usize, TemplateBlock)> = None;
+    let mut ruby_continues = false;
+    while line_start < len {
+        let eol = memchr::memchr(b'\n', &bytes[line_start..])
+            .map(|n| line_start + n)
+            .unwrap_or(len);
+        let mut ws = line_start;
+        while ws < eol && matches!(bytes[ws], b' ' | b'\t') {
+            ws += 1;
+        }
+        let indent = ws - line_start;
+        let content_end = if eol > ws && bytes[eol - 1] == b'\r' {
+            eol - 1
+        } else {
+            eol
+        };
+        let next_line = |pos: usize| {
+            memchr::memchr(b'\n', &bytes[pos..])
+                .map(|n| pos + n + 1)
+                .unwrap_or(len)
+        };
+
+        if let Some((block_indent, block_kind)) = block {
+            if ws == content_end || indent > block_indent {
+                match block_kind {
+                    TemplateBlock::Ruby => set_mask(mask, ws, content_end, false),
+                    TemplateBlock::Text => expose_text_interpolations(bytes, mask, ws, content_end),
+                    TemplateBlock::Comment => {}
                 }
-                let indent = ws - line_start;
-                let content_end = if eol > ws && bytes[eol - 1] == b'\r' {
-                    eol - 1
-                } else {
-                    eol
-                };
-                if let Some(filter_indent) = ruby_filter_indent {
-                    if ws == content_end || indent > filter_indent {
-                        set_mask(mask, ws, content_end, false);
-                        line_start = if eol < bytes.len() { eol + 1 } else { eol };
-                        continue;
-                    }
-                    ruby_filter_indent = None;
-                }
-                let filter_line = &bytes[ws..content_end];
-                if (kind == TemplateKind::Haml && filter_line == b":ruby")
-                    || (kind == TemplateKind::Slim && filter_line == b"ruby:")
-                {
-                    ruby_filter_indent = Some(indent);
-                    line_start = if eol < bytes.len() { eol + 1 } else { eol };
-                    continue;
-                }
-                let is_haml_comment = kind == TemplateKind::Haml
-                    && ws + 1 < eol
-                    && bytes[ws] == b'-'
-                    && bytes[ws + 1] == b'#';
-                let is_slim_comment = kind == TemplateKind::Slim && ws < eol && bytes[ws] == b'/';
-                if !is_haml_comment && !is_slim_comment {
-                    let executable = match kind {
-                        TemplateKind::Haml => ws < eol && matches!(bytes[ws], b'=' | b'-' | b'~'),
-                        TemplateKind::Slim => ws < eol && matches!(bytes[ws], b'=' | b'-'),
-                        _ => false,
-                    };
-                    if executable {
-                        set_mask(mask, ws + 1, content_end, false);
+                line_start = next_line(line_start);
+                continue;
+            }
+            block = None;
+        }
+        if ruby_continues {
+            // Include the preceding newline so literals spanning lines stay whole.
+            set_mask(mask, line_start.saturating_sub(1), content_end, false);
+            ruby_continues = ruby_line_continues(bytes, ws, content_end, kind);
+            line_start = next_line(line_start);
+            continue;
+        }
+        let content = &bytes[ws..content_end];
+        if content.is_empty() {
+            line_start = next_line(line_start);
+            continue;
+        }
+
+        let mut resume = line_start;
+        match kind {
+            TemplateKind::Haml => {
+                if content.starts_with(b"-#") {
+                    block = Some((indent, TemplateBlock::Comment));
+                } else if let Some(filter) = content.strip_prefix(b":") {
+                    let kind = if filter == b"ruby" {
+                        TemplateBlock::Ruby
                     } else {
-                        let tag_line = match kind {
-                            TemplateKind::Haml => {
-                                ws < content_end && matches!(bytes[ws], b'%' | b'.' | b'#')
-                            }
-                            TemplateKind::Slim => {
-                                ws < content_end && bytes[ws].is_ascii_alphabetic()
-                            }
-                            _ => false,
-                        };
-                        if tag_line {
-                            expose_template_attributes(bytes, mask, ws, content_end);
-                            expose_template_assignments(bytes, mask, ws, content_end);
-                        }
-                    }
-                    let mut i = line_start;
-                    while i + 1 < content_end {
-                        if bytes[i] == b'\\' {
-                            i = (i + 2).min(content_end);
-                            continue;
-                        }
-                        if bytes[i] == b'#' && bytes[i + 1] == b'{' {
-                            if let Some(close) = find_interpolation_end(bytes, i + 2, content_end) {
-                                set_mask(mask, i + 2, close, false);
-                                i = close + 1;
-                                continue;
-                            }
-                        }
-                        i += 1;
-                    }
+                        TemplateBlock::Text
+                    };
+                    block = Some((indent, kind));
+                } else if let Some(code) = haml_script_start(bytes, ws, content_end) {
+                    set_mask(mask, code, content_end, false);
+                    ruby_continues = ruby_line_continues(bytes, code, content_end, kind);
+                } else if is_haml_tag_start(content) {
+                    let (end, continues) = parse_haml_tag(bytes, mask, ws);
+                    resume = end;
+                    ruby_continues = continues;
                 }
-                line_start = if eol < bytes.len() { eol + 1 } else { eol };
+            }
+            TemplateKind::Slim => {
+                if content[0] == b'/' {
+                    block = Some((indent, TemplateBlock::Comment));
+                } else if content[0] == b'|' || content[0] == b'\'' {
+                    block = Some((indent, TemplateBlock::Text));
+                } else if content == b"ruby:" {
+                    block = Some((indent, TemplateBlock::Ruby));
+                } else if content
+                    .strip_suffix(b":")
+                    .is_some_and(|engine| SLIM_EMBEDDED_ENGINES.contains(&engine))
+                {
+                    block = Some((indent, TemplateBlock::Text));
+                } else if matches!(content[0], b'=' | b'-') {
+                    let mut code = ws + 1;
+                    while code < content_end && matches!(bytes[code], b'=' | b'<' | b'>' | b'\'') {
+                        code += 1;
+                    }
+                    set_mask(mask, code, content_end, false);
+                    ruby_continues = ruby_line_continues(bytes, code, content_end, kind);
+                } else if is_slim_tag_start(content) {
+                    let (end, continues) = parse_slim_tag(bytes, mask, ws);
+                    resume = end;
+                    ruby_continues = continues;
+                }
+            }
+            _ => {}
+        }
+        if block != Some((indent, TemplateBlock::Comment)) {
+            expose_text_interpolations(bytes, mask, line_start, content_end);
+        }
+        line_start = next_line(resume.max(line_start));
+    }
+}
+
+fn expose_text_interpolations(bytes: &[u8], mask: &mut [u8], start: usize, end: usize) {
+    let mut i = start;
+    while i + 1 < end {
+        if bytes[i] == b'\\' {
+            i = (i + 2).min(end);
+            continue;
+        }
+        if bytes[i] == b'#' && bytes[i + 1] == b'{' {
+            if let Some(close) = find_interpolation_end(bytes, i + 2, end) {
+                set_mask(mask, i + 2, close, false);
+                i = close + 1;
+                continue;
             }
         }
+        i += 1;
+    }
+}
+
+/// Whether Ruby code ending at `end` continues on the next line: Haml and Slim
+/// both continue after a trailing `,`; Slim also after a trailing `\`.
+fn ruby_line_continues(bytes: &[u8], start: usize, end: usize, kind: TemplateKind) -> bool {
+    let code = bytes[start..end].trim_ascii_end();
+    match code.last() {
+        Some(b',') => true,
+        Some(b'\\') => kind == TemplateKind::Slim,
+        _ => false,
+    }
+}
+
+/// Start of the Ruby code on a Haml script line (`= x`, `- x`, `~ x`,
+/// `!= x`, `&= x`); `==`, `!==` and `&==` are interpolated text.
+fn haml_script_start(bytes: &[u8], ws: usize, end: usize) -> Option<usize> {
+    let rest = &bytes[ws..end];
+    let indicator = match rest {
+        [b'!' | b'&', b'=', b'=', ..] | [b'=', b'=', ..] => return None,
+        [b'!' | b'&', b'=', ..] => 2,
+        [b'=' | b'-' | b'~', ..] => 1,
+        _ => return None,
+    };
+    Some(ws + indicator)
+}
+
+#[inline]
+fn is_template_name_char(b: u8) -> bool {
+    is_word_char(b) || b == b'-'
+}
+
+fn is_haml_tag_start(content: &[u8]) -> bool {
+    match content {
+        [b'%', next, ..] => is_template_name_char(*next),
+        [b'.' | b'#', next, ..] => is_template_name_char(*next),
+        _ => false,
+    }
+}
+
+fn is_slim_tag_start(content: &[u8]) -> bool {
+    match content {
+        [first, ..] if first.is_ascii_alphabetic() => true,
+        [b'.' | b'#', next, ..] => is_template_name_char(*next),
+        _ => false,
+    }
+}
+
+/// Skip `.class` / `#id` shortcuts (and a tag name when `tag_prefix` is set).
+fn skip_tag_and_shortcuts(bytes: &[u8], mut i: usize, end: usize, tag_prefix: Option<u8>) -> usize {
+    if tag_prefix.is_none_or(|prefix| bytes.get(i) == Some(&prefix)) {
+        if tag_prefix.is_some() {
+            i += 1;
+        }
+        // Namespaced names (`svg:rect`) keep inner colons; a trailing `:` is
+        // Slim's inline nesting.
+        while i < end
+            && (is_template_name_char(bytes[i])
+                || (bytes[i] == b':' && bytes.get(i + 1).is_some_and(|&b| is_word_char(b))))
+        {
+            i += 1;
+        }
+    }
+    while i + 1 < end && matches!(bytes[i], b'.' | b'#') && is_template_name_char(bytes[i + 1]) {
+        i += 1;
+        while i < end && is_template_name_char(bytes[i]) {
+            i += 1;
+        }
+    }
+    i
+}
+
+fn line_content_end(bytes: &[u8], pos: usize) -> usize {
+    let eol = memchr::memchr(b'\n', &bytes[pos..])
+        .map(|n| pos + n)
+        .unwrap_or(bytes.len());
+    if eol > pos && bytes[eol - 1] == b'\r' {
+        eol - 1
+    } else {
+        eol
+    }
+}
+
+/// Closing bracket for a template attribute group opened at `open_pos`,
+/// skipping quoted strings; attribute groups may span lines.
+fn find_template_group_end(bytes: &[u8], open_pos: usize) -> Option<usize> {
+    const MAX_LINES: usize = 64;
+    let open = bytes[open_pos];
+    let close = match open {
+        b'(' => b')',
+        b'[' => b']',
+        _ => b'}',
+    };
+    let mut depth = 0usize;
+    let mut lines = 0;
+    let mut i = open_pos;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => {
+                i += 2;
+                continue;
+            }
+            quote @ (b'\'' | b'"') => {
+                i += 1;
+                while i < bytes.len() && bytes[i] != quote && bytes[i] != b'\n' {
+                    i += if bytes[i] == b'\\' { 2 } else { 1 };
+                }
+                if bytes.get(i) != Some(&quote) {
+                    continue;
+                }
+            }
+            b'\n' => {
+                lines += 1;
+                if lines > MAX_LINES {
+                    return None;
+                }
+            }
+            b if b == open => depth += 1,
+            b if b == close => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Expose an attribute group at `open_pos`; returns the position after it.
+fn expose_attribute_group(bytes: &[u8], mask: &mut [u8], open_pos: usize) -> usize {
+    match find_template_group_end(bytes, open_pos) {
+        Some(close) => {
+            set_mask(mask, open_pos + 1, close, false);
+            close + 1
+        }
+        None => {
+            let end = line_content_end(bytes, open_pos);
+            set_mask(mask, open_pos + 1, end, false);
+            end
+        }
+    }
+}
+
+/// Parse a Haml tag line (`%tag.cls#id{...}(...)[...]= code`) starting at
+/// `ws`. Returns the last consumed position and whether Ruby continues on
+/// the next line. Text after the tag stays masked.
+fn parse_haml_tag(bytes: &[u8], mask: &mut [u8], ws: usize) -> (usize, bool) {
+    let mut end = line_content_end(bytes, ws);
+    let mut i = skip_tag_and_shortcuts(bytes, ws, end, Some(b'%'));
+    while i < end && matches!(bytes[i], b'{' | b'(' | b'[') {
+        i = expose_attribute_group(bytes, mask, i);
+        end = line_content_end(bytes, i);
+    }
+    while i < end && matches!(bytes[i], b'<' | b'>') {
+        i += 1;
+    }
+    if let Some(code) = haml_script_start(bytes, i, end) {
+        set_mask(mask, code, end, false);
+        return (
+            end,
+            ruby_line_continues(bytes, code, end, TemplateKind::Haml),
+        );
+    }
+    (end, false)
+}
+
+/// Parse a Slim tag line following Slim's own grammar: tag and shortcuts,
+/// then either a wrapped attribute group or `name=value` attributes (code
+/// values are Ruby, quoted values are text), then `:` inline nesting, `=`
+/// output, or text.
+fn parse_slim_tag(bytes: &[u8], mask: &mut [u8], ws: usize) -> (usize, bool) {
+    let mut end = line_content_end(bytes, ws);
+    let mut i = ws;
+    loop {
+        i = if bytes[i].is_ascii_alphabetic() {
+            skip_tag_and_shortcuts(bytes, i, end, None)
+        } else {
+            skip_tag_and_shortcuts(bytes, i, end, Some(b'*'))
+        };
+        while i < end && matches!(bytes[i], b'<' | b'>' | b'\'') {
+            i += 1;
+        }
+        let group = skip_whitespace_inline(bytes, i);
+        if group < end && matches!(bytes[group], b'(' | b'[' | b'{') {
+            i = expose_attribute_group(bytes, mask, group);
+            end = line_content_end(bytes, i);
+        } else {
+            i = parse_slim_plain_attributes(bytes, mask, i, end);
+        }
+        let next = skip_whitespace_inline(bytes, i);
+        if next < end && bytes[next] == b':' {
+            let child = skip_whitespace_inline(bytes, next + 1);
+            if child < end && is_slim_tag_start(&bytes[child..end]) {
+                i = child;
+                continue;
+            }
+            return (end, false);
+        }
+        if next < end && bytes[next] == b'=' {
+            let mut code = next + 1;
+            while code < end && matches!(bytes[code], b'=' | b'<' | b'>' | b'\'') {
+                code += 1;
+            }
+            set_mask(mask, code, end, false);
+            return (
+                end,
+                ruby_line_continues(bytes, code, end, TemplateKind::Slim),
+            );
+        }
+        return (end, false);
+    }
+}
+
+/// Unwrapped Slim attributes: `name = value` pairs until something that is
+/// not an attribute. Code values end at whitespace outside brackets.
+fn parse_slim_plain_attributes(bytes: &[u8], mask: &mut [u8], mut i: usize, end: usize) -> usize {
+    loop {
+        let name_start = skip_whitespace_inline(bytes, i);
+        let mut name_end = name_start;
+        while name_end < end
+            && !bytes[name_end].is_ascii_whitespace()
+            && !matches!(
+                bytes[name_end],
+                b'"' | b'\'' | b'<' | b'>' | b'/' | b'=' | b'(' | b')' | b'[' | b']' | b'{' | b'}'
+            )
+        {
+            name_end += 1;
+        }
+        if name_end == name_start || bytes[name_start] == b':' {
+            return i;
+        }
+        let eq = skip_whitespace_inline(bytes, name_end);
+        if eq >= end || bytes[eq] != b'=' {
+            return i;
+        }
+        let mut value = eq + 1;
+        if value < end && bytes[value] == b'=' {
+            value += 1;
+        }
+        value = skip_whitespace_inline(bytes, value);
+        if value >= end {
+            return i;
+        }
+        if matches!(bytes[value], b'"' | b'\'') {
+            let quote = bytes[value];
+            let mut close = value + 1;
+            while close < end && bytes[close] != quote {
+                close += if bytes[close] == b'\\' { 2 } else { 1 };
+            }
+            i = (close + 1).min(end);
+            continue;
+        }
+        let mut code_end = value;
+        let mut depth = 0usize;
+        let mut delims = (0u8, 0u8);
+        while code_end < end {
+            let b = bytes[code_end];
+            if depth == 0 && b.is_ascii_whitespace() {
+                break;
+            }
+            if matches!(b, b'"' | b'\'') {
+                code_end += 1;
+                while code_end < end && bytes[code_end] != b {
+                    code_end += if bytes[code_end] == b'\\' { 2 } else { 1 };
+                }
+            } else if depth == 0 && matches!(b, b'(' | b'[' | b'{') {
+                delims = (
+                    b,
+                    match b {
+                        b'(' => b')',
+                        b'[' => b']',
+                        _ => b'}',
+                    },
+                );
+                depth = 1;
+            } else if depth > 0 && b == delims.0 {
+                depth += 1;
+            } else if depth > 0 && b == delims.1 {
+                depth -= 1;
+            }
+            code_end += 1;
+        }
+        let code_end = code_end.min(end);
+        set_mask(mask, value, code_end, false);
+        i = code_end;
     }
 }
 
@@ -666,10 +986,31 @@ fn previous_significant(bytes: &[u8], mask: &[u8], start: usize, mut i: usize) -
     None
 }
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum LiteralStart {
+    /// Division / modulo operator.
+    Operator,
+    /// Unambiguous value position (after an operator, keyword or `(`).
+    Value,
+    /// `ident /x` or `ident %(x)`: probably a command argument, but it may be a
+    /// division by a local variable, so such literals must close on one line.
+    CommandArgument,
+}
+
 fn is_regex_start(bytes: &[u8], mask: &[u8], start: usize, i: usize) -> bool {
+    literal_start(bytes, mask, start, i) != LiteralStart::Operator
+}
+
+fn literal_start(bytes: &[u8], mask: &[u8], start: usize, i: usize) -> LiteralStart {
+    use LiteralStart::*;
     let Some(prev) = previous_significant(bytes, mask, start, i) else {
-        return true;
+        return Value;
     };
+    // `:/` (and `:%`) directly after a colon is an operator symbol, e.g.
+    // `reduce(:/)`, not the start of a literal.
+    if bytes[prev] == b':' && prev + 1 == i && (prev == start || bytes[prev - 1] != b':') {
+        return Operator;
+    }
     if matches!(
         bytes[prev],
         b'=' | b'('
@@ -691,14 +1032,18 @@ fn is_regex_start(bytes: &[u8], mask: &[u8], start: usize, i: usize) -> bool {
             | b'<'
             | b'>'
     ) {
-        return true;
+        return Value;
     }
     if !is_word_char(bytes[prev]) {
-        return false;
+        return Operator;
     }
     let mut word_start = prev;
     while word_start > start && is_word_char(bytes[word_start - 1]) {
         word_start -= 1;
+    }
+    // `def /(other)` / `def %(other)` define operator methods.
+    if &bytes[word_start..=prev] == b"def" {
+        return Operator;
     }
     if matches!(
         &bytes[word_start..=prev],
@@ -716,12 +1061,17 @@ fn is_regex_start(bytes: &[u8], mask: &[u8], start: usize, i: usize) -> bool {
             | b"do"
             | b"case"
     ) {
-        return true;
+        return Value;
     }
-    prev + 1 < i
+    if prev + 1 < i
         && i + 1 < bytes.len()
         && bytes[prev].is_ascii_lowercase()
         && !bytes[i + 1].is_ascii_whitespace()
+    {
+        CommandArgument
+    } else {
+        Operator
+    }
 }
 
 fn find_delimited_end(
@@ -778,10 +1128,14 @@ fn find_percent_literal_end(
     open: u8,
     close: u8,
     regex: bool,
-    percent_ends: &mut PercentEndCache,
-    interpolation_ends: &mut InterpolationEndCache,
-    lexical_steps: &mut LexicalScanSteps,
+    cache: &mut LexCache,
 ) -> Option<usize> {
+    let LexCache {
+        percent_ends,
+        interpolation_ends,
+        steps: lexical_steps,
+        ..
+    } = cache;
     let cache_key = (open_pos, regex);
     if let Some(cached) = percent_ends.get(&cache_key) {
         return *cached;
@@ -881,7 +1235,25 @@ fn find_percent_literal_end(
     None
 }
 
-fn parse_heredoc(bytes: &[u8], abs: usize, end: usize) -> Option<(usize, usize, bool)> {
+/// A heredoc opener parsed by `parse_heredoc`.
+struct Heredoc {
+    delim_end: usize,
+    body_start: usize,
+    /// End of the terminator line's content (exclusive).
+    body_end: usize,
+    interpolated: bool,
+}
+
+/// Parse a heredoc opener at `abs` (pointing at `<<`). `body_start` overrides
+/// where the body begins, for the second of several heredocs opened on one
+/// line (`foo(<<~A, <<~B)`).
+fn parse_heredoc(
+    bytes: &[u8],
+    abs: usize,
+    end: usize,
+    body_start: Option<usize>,
+    cache: &mut LexCache,
+) -> Option<Heredoc> {
     if abs > 0
         && !matches!(
             bytes[abs - 1],
@@ -916,10 +1288,21 @@ fn parse_heredoc(bytes: &[u8], abs: usize, end: usize) -> Option<(usize, usize, 
         i += 1;
     }
     let line_end = memchr::memchr(b'\n', &bytes[i..end]).map(|n| i + n)?;
-    let body_start = line_end + 1;
+    let body_start = body_start.unwrap_or(line_end + 1);
     let delim = &bytes[delim_start..delim_end];
+    // Terminator lines found at or after P are also found from any later
+    // start, so a failed search from P rules out every later body start.
+    let miss_key = (delim.to_vec(), end);
+    if cache
+        .heredoc_misses
+        .get(&miss_key)
+        .is_some_and(|&no_terminator_from| body_start >= no_terminator_from)
+    {
+        return None;
+    }
     let mut line_start = body_start;
     while line_start < end {
+        count_lexical_scan_step(&mut cache.steps);
         let eol = memchr::memchr(b'\n', &bytes[line_start..end])
             .map(|n| line_start + n)
             .unwrap_or(end);
@@ -933,29 +1316,27 @@ fn parse_heredoc(bytes: &[u8], abs: usize, end: usize) -> Option<(usize, usize, 
             content += 1;
         }
         if content + delim.len() == content_end && &bytes[content..content_end] == delim {
-            return Some((delim_end, content_end, quote != Some(b'\'')));
+            return Some(Heredoc {
+                delim_end,
+                body_start,
+                body_end: content_end,
+                interpolated: quote != Some(b'\''),
+            });
         }
         line_start = if eol < end { eol + 1 } else { eol };
     }
+    cache
+        .heredoc_misses
+        .entry(miss_key)
+        .and_modify(|no_terminator_from| {
+            *no_terminator_from = (*no_terminator_from).min(body_start)
+        })
+        .or_insert(body_start);
     None
 }
 
 fn mask_ruby_range(bytes: &[u8], mask: &mut [u8], start: usize, end: usize) {
-    let mut percent_ends = PercentEndCache::new();
-    let mut interpolation_ends = InterpolationEndCache::new();
-    #[cfg(test)]
-    let mut lexical_steps = 0;
-    #[cfg(not(test))]
-    let mut lexical_steps = ();
-    mask_ruby_range_cached(
-        bytes,
-        mask,
-        start,
-        end,
-        &mut percent_ends,
-        &mut interpolation_ends,
-        &mut lexical_steps,
-    );
+    mask_ruby_range_cached(bytes, mask, start, end, &mut LexCache::default());
 }
 
 fn mask_ruby_range_cached(
@@ -963,38 +1344,45 @@ fn mask_ruby_range_cached(
     mask: &mut [u8],
     start: usize,
     end: usize,
-    percent_ends: &mut PercentEndCache,
-    interpolation_ends: &mut InterpolationEndCache,
-    lexical_steps: &mut LexicalScanSteps,
+    cache: &mut LexCache,
 ) {
+    // (opener line end, where the next heredoc body on that line starts)
+    let mut pending_heredoc_body: Option<(usize, usize)> = None;
     let mut i = start;
     while i < end {
+        // Heredoc bodies were already lexed (with their interpolations) when
+        // the opener was parsed; resume after the last terminator.
+        if let Some((opener_line_end, next_body)) = pending_heredoc_body {
+            if i > opener_line_end {
+                pending_heredoc_body = None;
+                if i < next_body {
+                    i = next_body;
+                    continue;
+                }
+            }
+        }
         if mask[i] != 0 {
             i += 1;
             continue;
         }
         let line_start = i == 0 || bytes[i - 1] == b'\n';
-        if line_start && bytes[i..end].starts_with(b"=begin") {
-            let after = i + 6;
-            if after == end || bytes[after].is_ascii_whitespace() {
-                let block_end = memmem::find(&bytes[after..end], b"\n=end")
-                    .map(|n| {
-                        let end_marker = after + n + 5;
-                        memchr::memchr(b'\n', &bytes[end_marker..end])
-                            .map(|tail| end_marker + tail)
-                            .unwrap_or(end)
-                    })
-                    .unwrap_or(end);
-                set_mask(mask, i, block_end, true);
-                i = block_end;
-                continue;
-            }
+        if line_start && is_embedded_doc_marker(bytes, i, end, b"=begin") {
+            let block_end = find_embedded_doc_end(bytes, i + 6, end);
+            set_mask(mask, i, block_end, true);
+            i = block_end;
+            continue;
+        }
+        if line_start && is_data_marker(bytes, i, end) {
+            // Everything after `__END__` is DATA, not code.
+            set_mask(mask, i, end, true);
+            break;
         }
         match bytes[i] {
             b'?' if i + 1 < end && !bytes[i + 1].is_ascii_whitespace() => {
-                i += if bytes[i + 1] == b'\\' { 3 } else { 2 };
-                i = i.min(end);
+                i += char_literal_len(bytes, mask, start, i, end);
             }
+            // Punctuation globals such as `$"` (loaded features), `$'`, `$/`.
+            b'$' if i + 1 < end && is_special_global_char(bytes[i + 1]) => i += 2,
             b'#' => {
                 let eol = memchr::memchr(b'\n', &bytes[i..end])
                     .map(|n| i + n)
@@ -1007,7 +1395,14 @@ fn mask_ruby_range_cached(
                 let content_start = i + 1;
                 let mut close = content_start;
                 let mut found_close = false;
+                // A literal never extends into bytes already masked (e.g. template
+                // text between ERB tags, or heredoc bodies).
+                let mut stop = end;
                 while close < end {
+                    if mask[close] != 0 {
+                        stop = close;
+                        break;
+                    }
                     if bytes[close] == b'\\' {
                         close = (close + 2).min(end);
                     } else if quote == b'"'
@@ -1019,8 +1414,8 @@ fn mask_ruby_range_cached(
                             bytes,
                             close + 2,
                             end,
-                            interpolation_ends,
-                            lexical_steps,
+                            &mut cache.interpolation_ends,
+                            &mut cache.steps,
                         )
                         .map(|interpolation_end| interpolation_end + 1)
                         .unwrap_or(end);
@@ -1034,23 +1429,59 @@ fn mask_ruby_range_cached(
                 let literal_end = if found_close {
                     close
                 } else {
-                    memchr::memchr(b'\n', &bytes[content_start..end])
+                    memchr::memchr(b'\n', &bytes[content_start..stop])
                         .map(|offset| content_start + offset)
-                        .unwrap_or(end)
+                        .unwrap_or(stop)
                 };
                 set_mask(mask, content_start, literal_end, true);
                 if quote == b'"' {
-                    expose_interpolations(
-                        bytes,
-                        mask,
-                        content_start,
-                        literal_end,
-                        percent_ends,
-                        interpolation_ends,
-                        lexical_steps,
-                    );
+                    expose_interpolations(bytes, mask, content_start, literal_end, cache);
                 }
                 i = if found_close { close + 1 } else { literal_end };
+            }
+            // Bare `%(...)` literals behave like `%Q(...)`; only in value
+            // position, so `x % (y)` / `a %[b]` style modulo is left alone.
+            b'%' if i + 1 < end
+                && matches!(bytes[i + 1], b'(' | b'[' | b'{' | b'<' | b'|')
+                && is_regex_start(bytes, mask, start, i) =>
+            {
+                let open = bytes[i + 1];
+                let close = match open {
+                    b'(' => b')',
+                    b'[' => b']',
+                    b'{' => b'}',
+                    b'<' => b'>',
+                    _ => open,
+                };
+                let content_start = i + 2;
+                let line_end = memchr::memchr(b'\n', &bytes[content_start..end])
+                    .map(|offset| content_start + offset)
+                    .unwrap_or(end);
+                // `ident %(x)` may be a modulo by a local variable: bound it.
+                let limit = if literal_start(bytes, mask, start, i) == LiteralStart::Value {
+                    end
+                } else {
+                    line_end
+                };
+                if let Some(literal_end) = find_percent_literal_end(
+                    bytes,
+                    i + 1,
+                    content_start,
+                    limit,
+                    open,
+                    close,
+                    false,
+                    cache,
+                ) {
+                    set_mask(mask, content_start, literal_end, true);
+                    expose_interpolations(bytes, mask, content_start, literal_end, cache);
+                    i = literal_end + 1;
+                } else if limit == end {
+                    set_mask(mask, content_start, line_end, true);
+                    i = line_end;
+                } else {
+                    i += 1;
+                }
             }
             b'%' if i + 2 < end
                 && is_percent_literal_type(bytes[i + 1])
@@ -1078,21 +1509,11 @@ fn mask_ruby_range_cached(
                     open,
                     close,
                     bytes[i + 1] == b'r',
-                    percent_ends,
-                    interpolation_ends,
-                    lexical_steps,
+                    cache,
                 ) {
                     set_mask(mask, content_start, literal_end, true);
                     if matches!(bytes[i + 1], b'Q' | b'r' | b'W' | b'I' | b'x') {
-                        expose_interpolations(
-                            bytes,
-                            mask,
-                            content_start,
-                            literal_end,
-                            percent_ends,
-                            interpolation_ends,
-                            lexical_steps,
-                        );
+                        expose_interpolations(bytes, mask, content_start, literal_end, cache);
                     }
                     i = literal_end + 1;
                 } else {
@@ -1104,47 +1525,171 @@ fn mask_ruby_range_cached(
                 }
             }
             b'/' if is_regex_start(bytes, mask, start, i) => {
-                if let Some(regex_end) = find_delimited_end(bytes, i + 1, end, b'/', b'/', true) {
+                let regex_end = if literal_start(bytes, mask, start, i) == LiteralStart::Value {
+                    find_delimited_end(bytes, i + 1, end, b'/', b'/', true)
+                } else {
+                    find_regex_literal_end(bytes, i, end)
+                };
+                if let Some(regex_end) = regex_end {
                     set_mask(mask, i + 1, regex_end, true);
-                    expose_interpolations(
-                        bytes,
-                        mask,
-                        i + 1,
-                        regex_end,
-                        percent_ends,
-                        interpolation_ends,
-                        lexical_steps,
-                    );
+                    expose_interpolations(bytes, mask, i + 1, regex_end, cache);
                     i = regex_end + 1;
                 } else {
                     i += 1;
                 }
             }
             b'<' if i + 1 < end && bytes[i + 1] == b'<' => {
-                if let Some((delim_end, heredoc_end, interpolated)) = parse_heredoc(bytes, i, end) {
-                    let line_end = memchr::memchr(b'\n', &bytes[delim_end..end])
-                        .map(|n| delim_end + n)
-                        .unwrap_or(end);
-                    let body_start = (line_end + 1).min(end);
-                    set_mask(mask, i + 2, delim_end, true);
-                    set_mask(mask, body_start, heredoc_end, true);
-                    if interpolated {
+                let line_end = memchr::memchr(b'\n', &bytes[i..end])
+                    .map(|n| i + n)
+                    .unwrap_or(end);
+                let body_start = pending_heredoc_body
+                    .filter(|&(opener_line_end, _)| opener_line_end == line_end)
+                    .map(|(_, next_body)| next_body);
+                if let Some(heredoc) = parse_heredoc(bytes, i, end, body_start, cache) {
+                    set_mask(mask, i + 2, heredoc.delim_end, true);
+                    set_mask(mask, heredoc.body_start, heredoc.body_end, true);
+                    if heredoc.interpolated {
                         expose_interpolations(
                             bytes,
                             mask,
-                            body_start,
-                            heredoc_end,
-                            percent_ends,
-                            interpolation_ends,
-                            lexical_steps,
+                            heredoc.body_start,
+                            heredoc.body_end,
+                            cache,
                         );
                     }
+                    let next_body = memchr::memchr(b'\n', &bytes[heredoc.body_end..end])
+                        .map(|n| heredoc.body_end + n + 1)
+                        .unwrap_or(end);
+                    pending_heredoc_body = Some((line_end, next_body));
                 }
                 i += 2;
             }
-            _ => i += 1,
+            _ => {
+                i += 1;
+                // Bytes that cannot start a token are skipped in bulk; stop at a
+                // newline so line-start markers are still checked.
+                if bytes[i - 1] != b'\n' {
+                    while i < end && !LEX_TOKEN_START[bytes[i] as usize] {
+                        i += 1;
+                    }
+                }
+            }
         }
     }
+}
+
+/// Bytes handled by a `mask_ruby_range_cached` match arm (plus `\n`).
+static LEX_TOKEN_START: [bool; 256] = {
+    let mut table = [false; 256];
+    let tokens = b"?$#'\"%/<\n";
+    let mut i = 0;
+    while i < tokens.len() {
+        table[tokens[i] as usize] = true;
+        i += 1;
+    }
+    table
+};
+
+/// `=begin` / `=end` markers must start a line and be followed by whitespace
+/// or EOL (`=ending` is not `=end`).
+fn is_embedded_doc_marker(bytes: &[u8], i: usize, end: usize, marker: &[u8]) -> bool {
+    bytes[i..end].starts_with(marker)
+        && bytes
+            .get(i + marker.len())
+            .is_none_or(|b| i + marker.len() >= end || b.is_ascii_whitespace())
+}
+
+/// End (exclusive, at the newline) of an `=begin` block whose body starts at
+/// `from`, or `end` when the block is unterminated.
+fn find_embedded_doc_end(bytes: &[u8], mut from: usize, end: usize) -> usize {
+    while let Some(n) = memmem::find(&bytes[from..end], b"\n=end") {
+        let marker = from + n + 1;
+        if is_embedded_doc_marker(bytes, marker, end, b"=end") {
+            return memchr::memchr(b'\n', &bytes[marker..end])
+                .map(|tail| marker + tail)
+                .unwrap_or(end);
+        }
+        from = marker;
+    }
+    end
+}
+
+/// A line consisting exactly of `__END__` (optionally followed by `\r`).
+fn is_data_marker(bytes: &[u8], i: usize, end: usize) -> bool {
+    const MARKER: &[u8] = b"__END__";
+    if !bytes[i..end].starts_with(MARKER) {
+        return false;
+    }
+    let rest = &bytes[i + MARKER.len()..end];
+    rest.is_empty() || rest.starts_with(b"\n") || rest.starts_with(b"\r\n") || rest == b"\r"
+}
+
+/// Punctuation that forms a special global variable after `$`.
+#[inline]
+fn is_special_global_char(b: u8) -> bool {
+    matches!(
+        b,
+        b'\''
+            | b'"'
+            | b'`'
+            | b'!'
+            | b'@'
+            | b'&'
+            | b'+'
+            | b'~'
+            | b'='
+            | b'/'
+            | b'\\'
+            | b','
+            | b';'
+            | b'.'
+            | b'<'
+            | b'>'
+            | b'*'
+            | b'$'
+            | b'?'
+            | b':'
+    )
+}
+
+/// Number of bytes to advance at a `?` (never 0). `?a`, `?'` and `?\n` are
+/// character literals; `empty?`, `c ?'a':'b'` and `x ?y:z` are method-name
+/// suffixes or ternaries, where the `?` alone is consumed so a following
+/// quote still opens a string.
+fn char_literal_len(bytes: &[u8], mask: &[u8], start: usize, i: usize, end: usize) -> usize {
+    let after_word = i > start && mask[i - 1] == 0 && is_word_char(bytes[i - 1]);
+    if after_word {
+        return 1;
+    }
+    if bytes[i + 1] == b'\\' {
+        return 3.min(end - i);
+    }
+    if i + 2 < end && is_word_char(bytes[i + 2]) {
+        return 1;
+    }
+    2
+}
+
+/// Closing `/` of a regex literal in command-argument position (`x /2`). The
+/// literal must close on the same line unless it is an extended (`/x`) regex,
+/// so a division by a local variable never masks the following lines.
+fn find_regex_literal_end(bytes: &[u8], open: usize, end: usize) -> Option<usize> {
+    let line_end = memchr::memchr(b'\n', &bytes[open..end])
+        .map(|n| open + n)
+        .unwrap_or(end);
+    if let Some(close) = find_delimited_end(bytes, open + 1, line_end, b'/', b'/', true) {
+        return Some(close);
+    }
+    if line_end == end {
+        return None;
+    }
+    let close = find_delimited_end(bytes, open + 1, end, b'/', b'/', true)?;
+    let flags = bytes[close + 1..end]
+        .iter()
+        .take_while(|b| b.is_ascii_alphabetic())
+        .copied()
+        .collect::<Vec<u8>>();
+    flags.contains(&b'x').then_some(close)
 }
 
 fn mask_non_ruby(bytes: &[u8], mask: &mut [u8], line_kind: LineCommentKind) {
@@ -1227,19 +1772,9 @@ fn build_skip_mask(bytes: &[u8], is_ruby: bool, line_kind: LineCommentKind) -> V
 #[cfg(test)]
 fn build_ruby_skip_mask_with_lexical_steps(bytes: &[u8]) -> (Vec<u8>, usize) {
     let mut mask = vec![0; bytes.len()];
-    let mut percent_ends = PercentEndCache::new();
-    let mut interpolation_ends = InterpolationEndCache::new();
-    let mut lexical_steps = 0;
-    mask_ruby_range_cached(
-        bytes,
-        &mut mask,
-        0,
-        bytes.len(),
-        &mut percent_ends,
-        &mut interpolation_ends,
-        &mut lexical_steps,
-    );
-    (mask, lexical_steps)
+    let mut cache = LexCache::default();
+    mask_ruby_range_cached(bytes, &mut mask, 0, bytes.len(), &mut cache);
+    (mask, cache.steps)
 }
 
 fn build_skip_mask_for_template(
@@ -1387,8 +1922,8 @@ fn scan_autoloads(bytes: &[u8], results: &mut Vec<String>) {
     }
 }
 
-/// Scan for `Gem.bin_path('name')` or `Gem.activate_bin_path('name')`
-/// Matches regex: `Gem\.(?:activate_)?bin_path\s*\(\s*['"]([^'"]+)['"]`
+/// Scan for `Gem.bin_path('name')` or `Gem.activate_bin_path 'name'`
+/// Matches regex: `Gem\.(?:activate_)?bin_path\s*\(?\s*['"]([^'"]+)['"]`
 #[cfg(test)]
 fn scan_gem_bin(bytes: &[u8], results: &mut Vec<String>) {
     let finder = memmem::Finder::new(b"Gem.");
@@ -1405,14 +1940,12 @@ fn scan_gem_bin(bytes: &[u8], results: &mut Vec<String>) {
             pos = abs + 1;
             continue;
         }
+        // Optional `(`: `Gem.activate_bin_path "x", "y"` is common in binstubs.
         i = skip_whitespace(bytes, i);
-        // Expect (
-        if i >= bytes.len() || bytes[i] != b'(' {
-            pos = abs + 1;
-            continue;
+        if i < bytes.len() && bytes[i] == b'(' {
+            i += 1;
+            i = skip_whitespace(bytes, i);
         }
-        i += 1;
-        i = skip_whitespace(bytes, i);
         if let Some((s, _end)) = extract_quoted(bytes, i) {
             if let Ok(name) = std::str::from_utf8(s) {
                 results.push(name.to_string());
@@ -1511,8 +2044,6 @@ fn scan_bundler_require(
     bundler_groups: &mut Vec<String>,
     bundler_require_all: &mut bool,
 ) {
-    static GROUP_SYM_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r":(\w+)").unwrap());
-
     let finder = memmem::Finder::new(b"Bundler.require");
     let mut pos = 0;
     while let Some(idx) = finder.find(&bytes[pos..]) {
@@ -1530,31 +2061,13 @@ fn scan_bundler_require(
         }
         let rest_owned =
             strip_inline_comment(std::str::from_utf8(&bytes[after..end]).unwrap_or(""));
-        let rest = rest_owned.trim();
-        let rest_inner = rest.strip_prefix('(').map(|s| s.trim()).unwrap_or(rest);
-        let is_empty_call = rest.is_empty() || rest == "(" || rest == "()" || rest == "( )" || {
-            let r = rest_inner.trim_start();
-            let r = r.strip_prefix(')').map(|s| s.trim()).unwrap_or(r);
-            rest.starts_with('(') && r.is_empty()
-        };
-        if rest.contains("Rails.groups") {
-            push_rails_group_conditions(rest, bundler_groups);
-            *bundler_require_all = true;
-        } else if rest.contains("Rails.env") {
-            *bundler_require_all = true;
-        } else {
-            if is_empty_call || rest_inner.starts_with('*') {
-                bundler_groups.push("default".to_string());
-                if let Some(var) = splat_var_name(rest_inner) {
-                    if push_rails_groups_for_splat_var(bytes, var, bundler_groups) {
-                        *bundler_require_all = true;
-                    }
-                }
-            }
-            for g in GROUP_SYM_RE.captures_iter(rest) {
-                bundler_groups.push(g[1].to_string());
-            }
-        }
+        apply_bundler_require_args(
+            rest_owned.trim(),
+            bytes,
+            &[],
+            bundler_groups,
+            bundler_require_all,
+        );
         pos = abs + 1;
     }
 }
@@ -1665,13 +2178,12 @@ fn scan_gem_bin_filtered(bytes: &[u8], mask: &[u8], results: &mut Vec<String>) {
             pos = abs + 1;
             continue;
         }
+        // Optional `(`: `Gem.activate_bin_path "x", "y"` is common in binstubs.
         i = skip_whitespace(bytes, i);
-        if i >= bytes.len() || bytes[i] != b'(' {
-            pos = abs + 1;
-            continue;
+        if i < bytes.len() && bytes[i] == b'(' {
+            i += 1;
+            i = skip_whitespace(bytes, i);
         }
-        i += 1;
-        i = skip_whitespace(bytes, i);
         if let Some((s, _end)) = extract_quoted(bytes, i) {
             if let Ok(name) = std::str::from_utf8(s) {
                 results.push(name.to_string());
@@ -1681,12 +2193,103 @@ fn scan_gem_bin_filtered(bytes: &[u8], mask: &[u8], results: &mut Vec<String>) {
     }
 }
 
+/// Small, fast non-cryptographic hasher (FxHash) for short per-file keys.
+/// Inputs are local source files, so HashDoS resistance is not needed.
+#[derive(Default, Clone, Copy)]
+struct FxHasher {
+    hash: u64,
+}
+
+impl FxHasher {
+    #[inline]
+    fn add(&mut self, word: u64) {
+        const SEED: u64 = 0x51_7c_c1_b7_27_22_0a_95;
+        self.hash = (self.hash.rotate_left(5) ^ word).wrapping_mul(SEED);
+    }
+}
+
+impl std::hash::Hasher for FxHasher {
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        let (chunks, rest) = bytes.as_chunks::<8>();
+        for chunk in chunks {
+            self.add(u64::from_le_bytes(*chunk));
+        }
+        if !rest.is_empty() {
+            let mut word = [0u8; 8];
+            word[..rest.len()].copy_from_slice(rest);
+            self.add(u64::from_le_bytes(word));
+        }
+    }
+
+    #[inline]
+    fn write_usize(&mut self, value: usize) {
+        self.add(value as u64);
+    }
+
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.hash
+    }
+}
+
+/// Per-file set of unique constant names, borrowed from the file bytes so
+/// repeated occurrences never allocate.
+type FileModuleSet<'a> = HashSet<&'a [u8], std::hash::BuildHasherDefault<FxHasher>>;
+
+/// Merge a file's unique constant names into a module map. When `keep_list` is
+/// set the owned names are also returned (reused for the file's cache entry).
+fn merge_file_modules(
+    names: FileModuleSet<'_>,
+    modules: &mut HashMap<String, HashSet<Arc<str>>>,
+    rel_path: &Arc<str>,
+    keep_list: bool,
+) -> Vec<String> {
+    let mut owned = Vec::with_capacity(if keep_list { names.len() } else { 0 });
+    for name in names {
+        // Constant names are ASCII by construction; middleware strings may not be.
+        let Ok(name) = std::str::from_utf8(name) else {
+            continue;
+        };
+        if let Some(files) = modules.get_mut(name) {
+            files.insert(Arc::clone(rel_path));
+        } else {
+            let mut files = HashSet::with_capacity(1);
+            files.insert(Arc::clone(rel_path));
+            modules.insert(name.to_string(), files);
+        }
+        if keep_list {
+            owned.push(name.to_string());
+        }
+    }
+    owned
+}
+
+#[cfg(test)]
 fn scan_modules_filtered_into(
     bytes: &[u8],
     mask: &[u8],
     modules: &mut HashMap<String, HashSet<Arc<str>>>,
     rel_path: &Arc<str>,
 ) {
+    let mut names = FileModuleSet::default();
+    collect_module_names(bytes, mask, &mut names);
+    merge_file_modules(names, modules, rel_path, false);
+}
+
+/// An uppercase word at `i` is not a constant reference when it names an
+/// instance/class/global variable (`@Beta`, `@@Beta`, `$Alpha`) or a symbol
+/// (`:Beta`; `::Beta` is a top-level constant).
+#[inline]
+fn can_start_constant(bytes: &[u8], i: usize) -> bool {
+    match i.checked_sub(1).map(|prev| bytes[prev]) {
+        Some(b'@' | b'$') => false,
+        Some(b':') => i >= 2 && bytes[i - 2] == b':',
+        _ => true,
+    }
+}
+
+fn collect_module_names<'a>(bytes: &'a [u8], mask: &[u8], names: &mut FileModuleSet<'a>) {
     let mut i = 0;
     let len = bytes.len();
     while i < len {
@@ -1698,8 +2301,7 @@ fn scan_modules_filtered_into(
             break;
         }
         if i == 0 || !is_word_char(bytes[i - 1]) {
-            if is_skipped(mask, i) {
-                // Skip rest of masked region (just advance by 1 — mask is per-byte)
+            if is_skipped(mask, i) || !can_start_constant(bytes, i) {
                 i += 1;
                 continue;
             }
@@ -1744,16 +2346,11 @@ fn scan_modules_filtered_into(
                 }
                 continue;
             }
-            if match_end > start {
-                let slice = &bytes[start..match_end];
-                if let Ok(name) = std::str::from_utf8(slice) {
-                    // Use entry().or_default() to avoid double lookup;
-                    // rel_path is an Arc<str> so the clone is a refcount bump.
-                    modules
-                        .entry(name.to_string())
-                        .or_default()
-                        .insert(Arc::clone(rel_path));
-                }
+            // `Alpha: 1` is a hash key / keyword label, not a constant.
+            let is_label =
+                bytes.get(match_end) == Some(&b':') && bytes.get(match_end + 1) != Some(&b':');
+            if match_end > start && !is_label {
+                names.insert(&bytes[start..match_end]);
             }
             if i <= match_end {
                 i = match_end;
@@ -1771,7 +2368,6 @@ fn scan_bundler_require_filtered(
     bundler_groups: &mut Vec<String>,
     bundler_require_all: &mut bool,
 ) {
-    static GROUP_SYM_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r":(\w+)").unwrap());
     let mut pos = 0;
     while let Some(idx) = BUNDLER_REQUIRE_FINDER.find(&bytes[pos..]) {
         let abs = pos + idx;
@@ -1795,38 +2391,95 @@ fn scan_bundler_require_filtered(
         // does not capture `:test` from the comment. We must respect string
         // literals so a `#` inside `"..."` / `'...'` doesn't terminate.
         let rest_owned = strip_inline_comment(raw);
-        let rest = rest_owned.trim();
-        let rest_inner = rest.strip_prefix('(').map(|s| s.trim()).unwrap_or(rest);
-
-        // Fix #1: `Bundler.require`, `Bundler.require()`, `Bundler.require( )`
-        // and `Bundler.require(\n)` all mean "auto-require the :default group".
-        // Detect the "no args" form before falling through to group extraction.
-        let is_empty_call = rest.is_empty() || rest == "(" || rest == "()" || rest == "( )" || {
-            let r = rest_inner.trim_start();
-            let r = r.strip_prefix(')').map(|s| s.trim()).unwrap_or(r);
-            rest.starts_with('(') && r.is_empty()
-        };
-
-        if rest.contains("Rails.groups") {
-            push_rails_group_conditions(rest, bundler_groups);
-            *bundler_require_all = true;
-        } else if rest.contains("Rails.env") {
-            *bundler_require_all = true;
-        } else {
-            if is_empty_call || rest_inner.starts_with('*') {
-                bundler_groups.push("default".to_string());
-                if let Some(var) = splat_var_name(rest_inner) {
-                    if push_rails_groups_for_splat_var(bytes, var, bundler_groups) {
-                        *bundler_require_all = true;
-                    }
-                }
-            }
-            for g in GROUP_SYM_RE.captures_iter(rest) {
-                bundler_groups.push(g[1].to_string());
-            }
-        }
+        apply_bundler_require_args(
+            rest_owned.trim(),
+            bytes,
+            mask,
+            bundler_groups,
+            bundler_require_all,
+        );
         pos = abs + 1;
     }
+}
+
+/// Interpret the argument text following `Bundler.require` (inline comment
+/// already stripped). Explicit group symbols are always recorded, including
+/// alongside `Rails.env` (`Bundler.require(:default, :assets, Rails.env)`);
+/// `Rails.groups(...)` conditions are recorded separately and are not treated
+/// as unconditional groups.
+fn apply_bundler_require_args(
+    rest: &str,
+    bytes: &[u8],
+    mask: &[u8],
+    bundler_groups: &mut Vec<String>,
+    bundler_require_all: &mut bool,
+) {
+    static GROUP_SYM_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?:^|[^:\w]):(\w+)").unwrap());
+    let rest_inner = rest.strip_prefix('(').map(|s| s.trim()).unwrap_or(rest);
+
+    // Fix #1: `Bundler.require`, `Bundler.require()`, `Bundler.require( )`
+    // and `Bundler.require(\n)` all mean "auto-require the :default group".
+    let is_empty_call = rest.is_empty() || rest == "(" || rest == "()" || rest == "( )" || {
+        let r = rest_inner.trim_start();
+        let r = r.strip_prefix(')').map(|s| s.trim()).unwrap_or(r);
+        rest.starts_with('(') && r.is_empty()
+    };
+
+    if rest.contains("Rails.groups") {
+        push_rails_group_conditions(rest, bundler_groups);
+        *bundler_require_all = true;
+    } else if rest.contains("Rails.env") {
+        *bundler_require_all = true;
+    } else if is_empty_call || rest_inner.starts_with('*') {
+        bundler_groups.push("default".to_string());
+        if let Some(var) = splat_var_name(rest_inner) {
+            if push_rails_groups_for_splat_var(bytes, mask, var, bundler_groups) {
+                *bundler_require_all = true;
+            }
+        }
+    }
+    let explicit = strip_rails_groups_calls(rest);
+    for g in GROUP_SYM_RE.captures_iter(&explicit) {
+        bundler_groups.push(g[1].to_string());
+    }
+}
+
+/// Remove `Rails.groups(...)` calls (balanced parentheses) so their
+/// conditional hash keys are not mistaken for unconditional group symbols.
+fn strip_rails_groups_calls(source: &str) -> std::borrow::Cow<'_, str> {
+    const CALL: &str = "Rails.groups";
+    if !source.contains(CALL) {
+        return std::borrow::Cow::Borrowed(source);
+    }
+    let mut out = String::with_capacity(source.len());
+    let mut rest = source;
+    while let Some(index) = rest.find(CALL) {
+        out.push_str(&rest[..index]);
+        let after = &rest[index + CALL.len()..];
+        let args = after.trim_start();
+        rest = if args.starts_with('(') {
+            let mut depth = 0usize;
+            let mut close = args.len();
+            for (offset, ch) in args.char_indices() {
+                match ch {
+                    '(' => depth += 1,
+                    ')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            close = offset + 1;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            &args[close..]
+        } else {
+            after
+        };
+    }
+    out.push_str(rest);
+    std::borrow::Cow::Owned(out)
 }
 
 fn splat_var_name(rest_inner: &str) -> Option<&str> {
@@ -1840,15 +2493,27 @@ fn splat_var_name(rest_inner: &str) -> Option<&str> {
 
 fn push_rails_groups_for_splat_var(
     bytes: &[u8],
+    mask: &[u8],
     var: &str,
     bundler_groups: &mut Vec<String>,
 ) -> bool {
     let mut aliases_rails_groups = false;
+    let mut line_start = 0;
     for line in bytes.split(|&b| b == b'\n') {
+        let offset = line_start;
+        line_start += line.len() + 1;
         let Ok(line) = std::str::from_utf8(line) else {
             continue;
         };
-        if !line.contains(var) || !line.contains("Rails.groups") {
+        if !line.contains(var) {
+            continue;
+        }
+        // Skip commented-out or quoted assignments such as
+        // `# groups = Rails.groups(assets: %w(development))`.
+        let Some(call) = line.find("Rails.groups") else {
+            continue;
+        };
+        if is_skipped(mask, offset + call) {
             continue;
         }
         aliases_rails_groups = true;
@@ -1861,7 +2526,7 @@ fn push_rails_group_conditions(source: &str, bundler_groups: &mut Vec<String>) {
     static CONDITION_RE: Lazy<Regex> = Lazy::new(|| {
         Regex::new(
             r#"(?x)
-            (\w+)\s*:\s*
+            :?(\w+)\s*(?::|=>)\s*
             (?:
                 %w\[([^\]]*)\] |
                 %w\(([^)]*)\) |
@@ -1934,12 +2599,19 @@ fn strip_inline_comment(s: &str) -> String {
 
 /// Scan for middleware string-literal references (e.g. `config.middleware.use "Bullet::Rack"`)
 /// and insert each quoted module name into `modules`.
+#[cfg(test)]
 fn scan_middleware_refs(
     bytes: &[u8],
     mask: &[u8],
     modules: &mut HashMap<String, HashSet<Arc<str>>>,
     rel_path: &Arc<str>,
 ) {
+    let mut names = FileModuleSet::default();
+    collect_middleware_refs(bytes, mask, &mut names);
+    merge_file_modules(names, modules, rel_path, false);
+}
+
+fn collect_middleware_refs<'a>(bytes: &'a [u8], mask: &[u8], names: &mut FileModuleSet<'a>) {
     let has_candidate = memmem::find(bytes, b".middleware.").is_some()
         || memmem::find(bytes, b"middleware_stack").is_some()
         || memmem::find(bytes, b"Rack::Builder").is_some();
@@ -1966,52 +2638,248 @@ fn scan_middleware_refs(
             continue;
         }
 
-        // Extract all quoted string literals from the rest of the line.
-        // NOTE: we walk raw bytes here (not the mask) because string interiors
-        // are exactly what the middleware scanner cares about — masking them
-        // would defeat the purpose.
-        let mut i = line_start + candidate;
-        while i < eol {
-            if bytes[i] == b'"' || bytes[i] == b'\'' {
-                let quote = bytes[i];
-                let start = i + 1;
-                let mut end = start;
-                while end < eol && bytes[end] != quote {
-                    end += 1;
-                }
-                if end < eol {
-                    if let Ok(name) = std::str::from_utf8(&bytes[start..end]) {
-                        let name = name.trim();
-                        // Only insert if it looks like a module name (starts with uppercase)
-                        if !name.is_empty() && name.as_bytes()[0].is_ascii_uppercase() {
-                            modules
-                                .entry(name.to_string())
-                                .or_default()
-                                .insert(Arc::clone(rel_path));
-                        }
-                    }
-                    i = end + 1;
-                } else {
-                    break;
-                }
-            } else {
-                i += 1;
-            }
-        }
+        collect_middleware_call_strings(bytes, mask, line_start + candidate, eol, names);
         line_start = if eol < bytes.len() { eol + 1 } else { eol };
     }
 }
 
+/// Collect string-literal middleware names passed to middleware-stack calls
+/// between `from` and `eol`. Only the argument slots that name a middleware
+/// are considered (`use X, *args` → first; `insert_before pos, X` / `swap`
+/// → first two), and the walk stops at a comment, so strings in trailing
+/// conditions, constructor arguments or comments are ignored.
+fn collect_middleware_call_strings<'a>(
+    bytes: &'a [u8],
+    mask: &[u8],
+    from: usize,
+    eol: usize,
+    names: &mut FileModuleSet<'a>,
+) {
+    // (max middleware-naming args, current arg index, paren depth of the call)
+    let mut call: Option<(usize, usize, i32)> = None;
+    let mut at_arg_start = false;
+    let mut depth = 0i32;
+    let mut i = from;
+    while i < eol {
+        let b = bytes[i];
+        if is_skipped(mask, i) {
+            // A comment (string interiors are consumed with their quotes).
+            return;
+        }
+        if b == b'"' || b == b'\'' {
+            let start = i + 1;
+            let mut end = start;
+            while end < eol && bytes[end] != b {
+                end += if bytes[end] == b'\\' { 2 } else { 1 };
+            }
+            if end >= eol {
+                return;
+            }
+            if let Some((max_args, arg, _)) = call {
+                if at_arg_start && arg < max_args {
+                    let name = bytes[start..end].trim_ascii();
+                    if name.first().is_some_and(u8::is_ascii_uppercase) {
+                        names.insert(name);
+                    }
+                }
+            }
+            at_arg_start = false;
+            i = end + 1;
+            continue;
+        }
+        if is_word_char(b) && (i == 0 || !is_word_char(bytes[i - 1])) {
+            let mut word_end = i;
+            while word_end < eol && is_word_char(bytes[word_end]) {
+                word_end += 1;
+            }
+            let max_args = match &bytes[i..word_end] {
+                b"use" | b"unshift" | b"push" | b"append" | b"prepend" => Some(1),
+                b"insert" | b"insert_before" | b"insert_after" | b"swap" | b"move_before"
+                | b"move_after" => Some(2),
+                _ => None,
+            };
+            if let Some(max_args) = max_args.filter(|_| bytes.get(word_end) != Some(&b':')) {
+                call = Some((max_args, 0, depth));
+                at_arg_start = true;
+            } else {
+                at_arg_start = false;
+            }
+            i = word_end;
+            continue;
+        }
+        match b {
+            b'<' if bytes.get(i + 1) == Some(&b'<') => {
+                call = Some((1, 0, depth));
+                at_arg_start = true;
+                i += 2;
+                continue;
+            }
+            b' ' | b'\t' | b'\r' => {}
+            b'(' if at_arg_start && call.is_some_and(|(_, arg, d)| arg == 0 && d == depth) => {
+                depth += 1;
+                if let Some(call) = call.as_mut() {
+                    call.2 = depth;
+                }
+            }
+            b'(' | b'[' | b'{' => {
+                depth += 1;
+                at_arg_start = false;
+            }
+            b')' | b']' | b'}' => {
+                if call.is_some_and(|(_, _, d)| d == depth) {
+                    call = None;
+                }
+                depth -= 1;
+                at_arg_start = false;
+            }
+            b',' => {
+                if let Some(call) = call.as_mut().filter(|call| call.2 == depth) {
+                    call.1 += 1;
+                    at_arg_start = true;
+                } else {
+                    at_arg_start = false;
+                }
+            }
+            _ => at_arg_start = false,
+        }
+        i += 1;
+    }
+}
+
+/// Collect Active Storage service names from attachment declarations such as
+/// `has_one_attached :avatar, service: :amazon` (including multi-line calls and
+/// lambdas like `service: ->(u) { u.eu? ? :europe : :usa }`). Only unmasked
+/// code is considered, so comments and string contents are ignored.
+fn collect_attachment_services(bytes: &[u8], mask: &[u8], services: &mut Vec<String>) {
+    const MAX_STATEMENT_LINES: usize = 20;
+    let finder = &*ATTACHED_FINDER;
+    let mut pos = 0;
+    while let Some(idx) = finder.find(&bytes[pos..]) {
+        let hit = pos + idx;
+        pos = hit + 1;
+        let start = if hit >= 7 && &bytes[hit - 7..hit] == b"has_one" {
+            hit - 7
+        } else if hit >= 8 && &bytes[hit - 8..hit] == b"has_many" {
+            hit - 8
+        } else {
+            continue;
+        };
+        let after = hit + b"_attached".len();
+        if is_skipped(mask, start)
+            || (start > 0 && (is_word_char(bytes[start - 1]) || bytes[start - 1] == b':'))
+            || bytes.get(after).is_some_and(|&b| is_word_char(b))
+        {
+            continue;
+        }
+
+        // Walk the call's argument list until the statement ends.
+        let mut i = after;
+        let mut depth = 0i32;
+        let mut lines = 0;
+        let mut last_significant = 0u8;
+        let mut service_depth: Option<i32> = None;
+        while i < bytes.len() {
+            let b = bytes[i];
+            if is_skipped(mask, i) {
+                i += 1;
+                continue;
+            }
+            match b {
+                b'\n' => {
+                    if depth <= 0
+                        && !matches!(last_significant, b',' | b'\\' | b'(' | b'{' | b'[' | b':')
+                    {
+                        break;
+                    }
+                    lines += 1;
+                    if lines > MAX_STATEMENT_LINES {
+                        break;
+                    }
+                }
+                b'(' | b'[' | b'{' => depth += 1,
+                b')' | b']' | b'}' => {
+                    depth -= 1;
+                    if depth < 0 {
+                        break;
+                    }
+                    if service_depth.is_some_and(|d| depth < d) {
+                        service_depth = None;
+                    }
+                }
+                b',' if service_depth == Some(depth) => service_depth = None,
+                b';' if depth == 0 => break,
+                b'd' if depth == 0
+                    && bytes[i..].starts_with(b"do")
+                    && !is_word_char(bytes[i - 1])
+                    && !bytes.get(i + 2).is_some_and(|&c| is_word_char(c)) =>
+                {
+                    break;
+                }
+                b's' if service_depth.is_none()
+                    && bytes[i..].starts_with(b"service")
+                    && !is_word_char(bytes[i - 1]) =>
+                {
+                    let key_end = i + b"service".len();
+                    let label =
+                        bytes.get(key_end) == Some(&b':') && bytes.get(key_end + 1) != Some(&b':');
+                    let rocket = bytes[i - 1] == b':' && {
+                        let arrow = skip_whitespace_inline(bytes, key_end);
+                        bytes[arrow..].starts_with(b"=>")
+                    };
+                    if label || rocket {
+                        service_depth = Some(depth);
+                        last_significant = b':';
+                        i = if label {
+                            key_end + 1
+                        } else {
+                            skip_whitespace_inline(bytes, key_end) + 2
+                        };
+                        let value = skip_whitespace_inline(bytes, i);
+                        if let Some((name, _)) = extract_quoted(bytes, value) {
+                            if let Ok(name) = std::str::from_utf8(name) {
+                                services.push(name.to_string());
+                            }
+                        }
+                        continue;
+                    }
+                }
+                b':' if service_depth.is_some()
+                    && bytes.get(i + 1).is_some_and(|&c| is_word_char(c))
+                    && !is_word_char(bytes[i - 1])
+                    && bytes[i - 1] != b':' =>
+                {
+                    let sym_start = i + 1;
+                    let mut sym_end = sym_start;
+                    while sym_end < bytes.len() && is_word_char(bytes[sym_end]) {
+                        sym_end += 1;
+                    }
+                    if let Ok(name) = std::str::from_utf8(&bytes[sym_start..sym_end]) {
+                        services.push(name.to_string());
+                    }
+                    last_significant = b'_';
+                    i = sym_end;
+                    continue;
+                }
+                _ => {}
+            }
+            if !b.is_ascii_whitespace() {
+                last_significant = b;
+            }
+            i += 1;
+        }
+    }
+}
+
+#[inline]
+fn skip_whitespace_inline(bytes: &[u8], mut i: usize) -> usize {
+    while i < bytes.len() && matches!(bytes[i], b' ' | b'\t') {
+        i += 1;
+    }
+    i
+}
+
 /// Type alias for cache update entries collected during the walk
-pub type CacheUpdate = (
-    String,
-    std::time::SystemTime,
-    u64,
-    Vec<String>,
-    Vec<String>,
-    Vec<String>,
-    bool,
-);
+pub type CacheUpdate = crate::cache::CacheUpdate;
 
 type ScriptFileList = Vec<(String, Vec<u8>)>;
 type ModuleMap = Vec<HashMap<String, HashSet<Arc<str>>>>;
@@ -2056,6 +2924,19 @@ pub fn scan_source_tree_with_threads_and_explicit_skips(
     let skip_set: HashSet<String> = skip_dirs.iter().map(|s| s.to_string()).collect();
     let explicit_skip_set: HashSet<String> =
         explicit_skip_dirs.iter().map(|s| s.to_string()).collect();
+    // Entries with a path separator (`app/legacy`) match the directory's path
+    // relative to the scan root rather than its name.
+    let path_skips: Vec<std::path::PathBuf> = skip_dirs
+        .iter()
+        .chain(explicit_skip_dirs)
+        .filter(|skip| skip.contains('/') || skip.contains('\\'))
+        .map(|skip| {
+            let skip = skip.trim_end_matches(['/', '\\']);
+            let skip = skip.strip_prefix("./").unwrap_or(skip);
+            std::path::PathBuf::from(skip)
+        })
+        .collect();
+    let walk_root = dir.to_path_buf();
     let dir_str = dir.to_string_lossy().to_string();
     let use_cache = cache.is_enabled();
 
@@ -2070,10 +2951,21 @@ pub fn scan_source_tree_with_threads_and_explicit_skips(
         .git_ignore(false)
         .git_global(false)
         .git_exclude(false)
-        .follow_links(false)
+        // Symlinked files and directories are scanned like regular ones; the
+        // walker reports symlink loops as errors, which are skipped.
+        .follow_links(true)
         .hidden(false)
         .filter_entry(move |entry| {
             if entry.file_type().is_some_and(|ft| ft.is_dir()) {
+                if !path_skips.is_empty() {
+                    let rel = entry
+                        .path()
+                        .strip_prefix(&walk_root)
+                        .unwrap_or(entry.path());
+                    if path_skips.iter().any(|skip| skip.as_path() == rel) {
+                        return false;
+                    }
+                }
                 let name = entry.file_name().to_string_lossy();
                 let is_vendor_bundle = name == "bundle"
                     && entry
@@ -2203,52 +3095,51 @@ pub fn scan_source_tree_with_threads_and_explicit_skips(
                         if let Some(entry) = cache_hit {
                             // Cache hit: reconstruct FileResult + modules without rescanning.
                             let rel: Arc<str> = Arc::from(rel_path_cow.as_ref());
-                            // Clone modules so we can both (a) insert into local_modules and
-                            // (b) reinsert the original entry back into the cache map.
-                            let entry_modules = entry.modules.clone();
-                            for m in entry_modules {
-                                flush_buf
-                                    .local_modules
-                                    .entry(m)
-                                    .or_default()
-                                    .insert(Arc::clone(&rel));
+                            for m in &entry.modules {
+                                if let Some(files) = flush_buf.local_modules.get_mut(m.as_str()) {
+                                    files.insert(Arc::clone(&rel));
+                                } else {
+                                    flush_buf
+                                        .local_modules
+                                        .insert(m.clone(), HashSet::from([Arc::clone(&rel)]));
+                                }
                             }
                             // Build FileResult by cloning small Vec<String>s; reinsert
                             // owned entry back into cache so durability is preserved.
                             let file_result = FileResult {
                                 rel_path: rel.to_string(),
                                 requires: entry.requires.clone(),
+                                modules: Vec::new(),
                                 bundler_groups: entry.bundler_groups.clone(),
                                 bundler_require_all: entry.bundler_require_all,
+                                storage_services: entry.storage_services.clone(),
                             };
                             cache_shared.reinsert(rel.to_string(), entry);
                             flush_buf.buf.push(file_result);
                         } else {
                             // Cache miss: scan file
 
-                            if let Some(file_result) =
-                                scan_file(&path_str, &dir_ref, &mut flush_buf.local_modules)
-                            {
-                                // Collect new modules added by this file for cache
+                            if let Some(mut file_result) = scan_file_with(
+                                &path_str,
+                                &dir_ref,
+                                &mut flush_buf.local_modules,
+                                use_cache,
+                            ) {
+                                // The file's own unique module list doubles as its
+                                // cache entry (no scan of the thread-wide map).
+                                let file_modules = std::mem::take(&mut file_result.modules);
                                 if use_cache {
                                     if let Some(ref md) = metadata {
-                                        let rel_for_filter: Arc<str> =
-                                            Arc::from(file_result.rel_path.as_str());
-                                        let new_modules: Vec<String> = flush_buf
-                                            .local_modules
-                                            .iter()
-                                            .filter(|(_, files)| files.contains(&rel_for_filter))
-                                            .map(|(name, _)| name.clone())
-                                            .collect();
-                                        flush_buf.cache_buf.push((
-                                            file_result.rel_path.clone(),
-                                            cache_timestamp,
-                                            md.len(),
-                                            file_result.requires.clone(),
-                                            new_modules,
-                                            file_result.bundler_groups.clone(),
-                                            file_result.bundler_require_all,
-                                        ));
+                                        flush_buf.cache_buf.push(CacheUpdate {
+                                            rel_path: file_result.rel_path.clone(),
+                                            mtime: cache_timestamp,
+                                            size: md.len(),
+                                            requires: file_result.requires.clone(),
+                                            modules: file_modules,
+                                            bundler_groups: file_result.bundler_groups.clone(),
+                                            bundler_require_all: file_result.bundler_require_all,
+                                            storage_services: file_result.storage_services.clone(),
+                                        });
                                     }
                                 }
                                 flush_buf.buf.push(file_result);
@@ -2289,8 +3180,10 @@ pub fn scan_source_tree_with_threads_and_explicit_skips(
     let mut modules: HashMap<String, HashSet<String>> = HashMap::new();
     let mut bundler_groups: HashSet<String> = HashSet::new();
     let mut bundler_require_all = false;
+    let mut storage_services: HashSet<String> = HashSet::new();
 
     for r in all_results {
+        storage_services.extend(r.storage_services);
         for req in &r.requires {
             requires
                 .entry(req.clone())
@@ -2336,6 +3229,7 @@ pub fn scan_source_tree_with_threads_and_explicit_skips(
             bundler_groups,
             bundler_require_all,
             script_files: all_script_files,
+            storage_services,
         },
         all_cache_updates,
     )
@@ -2406,8 +3300,10 @@ fn is_scannable(_path: &str, full_path: &Path) -> bool {
         {
             return true;
         }
-        // Extensionless files with Ruby shebang
-        if full_path.extension().is_none() && full_path.is_file() {
+        // Extensionless files with Ruby shebang. The walker only passes regular
+        // files, so no extra stat is needed; names that are never executable
+        // Ruby scripts are rejected before opening the file.
+        if full_path.extension().is_none() && may_be_ruby_script_name(name_bytes) {
             if let Ok(mut f) = std::fs::File::open(full_path) {
                 use std::io::Read;
                 let mut buf = [0u8; 64];
@@ -2427,23 +3323,78 @@ fn is_scannable(_path: &str, full_path: &Path) -> bool {
     false
 }
 
+/// Extensionless names that are never Ruby scripts even though they cannot be
+/// ruled out by extension (placeholders, docs, and DSL files without shebangs).
+const NON_SCRIPT_FILENAMES: &[&str] = &[
+    "Gemfile",
+    "Makefile",
+    "Dockerfile",
+    "Brewfile",
+    "Podfile",
+    "Fastfile",
+    "Appfile",
+    "Dangerfile",
+    "Steepfile",
+    "Containerfile",
+    "Justfile",
+];
+
+/// Cheap name filter applied before opening an extensionless file to look for
+/// a Ruby shebang: skips dotfiles (`.keep`, `.gitkeep`), all-caps docs
+/// (`LICENSE`, `README`, `VERSION`) and well-known non-script names.
+fn may_be_ruby_script_name(name: &[u8]) -> bool {
+    if name.is_empty() || name[0] == b'.' {
+        return false;
+    }
+    let all_caps = name
+        .iter()
+        .all(|&b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_' || b == b'-');
+    if all_caps {
+        return false;
+    }
+    !NON_SCRIPT_FILENAMES.iter().any(|f| f.as_bytes() == name)
+}
+
 // (FileContent enum removed — plain read() is faster for single sequential reads)
 
+#[cfg(test)]
 fn scan_file(
     path: &str,
     dir: &str,
     thread_modules: &mut HashMap<String, HashSet<Arc<str>>>,
 ) -> Option<FileResult> {
-    // Plain read() is faster than mmap for single sequential reads (no VMA/TLB overhead)
-    let bytes = std::fs::read(path).ok()?;
-    scan_file_bytes(path, dir, &bytes, thread_modules)
+    scan_file_with(path, dir, thread_modules, true)
 }
 
+/// `keep_module_list` fills `FileResult::modules` with the file's unique
+/// constant names (needed only when the result is written to the cache).
+fn scan_file_with(
+    path: &str,
+    dir: &str,
+    thread_modules: &mut HashMap<String, HashSet<Arc<str>>>,
+    keep_module_list: bool,
+) -> Option<FileResult> {
+    // Plain read() is faster than mmap for single sequential reads (no VMA/TLB overhead)
+    let bytes = std::fs::read(path).ok()?;
+    scan_file_bytes_with(path, dir, &bytes, thread_modules, keep_module_list)
+}
+
+#[allow(dead_code)]
 fn scan_file_bytes(
     path: &str,
     dir: &str,
     bytes: &[u8],
     thread_modules: &mut HashMap<String, HashSet<Arc<str>>>,
+) -> Option<FileResult> {
+    scan_file_bytes_with(path, dir, bytes, thread_modules, true)
+}
+
+fn scan_file_bytes_with(
+    path: &str,
+    dir: &str,
+    bytes: &[u8],
+    thread_modules: &mut HashMap<String, HashSet<Arc<str>>>,
+    keep_module_list: bool,
 ) -> Option<FileResult> {
     if bytes.is_empty() {
         return None;
@@ -2494,6 +3445,11 @@ fn scan_file_bytes(
     let mut requires = Vec::new();
     let mut bundler_groups = Vec::new();
     let mut bundler_require_all = false;
+    let mut storage_services = Vec::new();
+
+    if is_ruby && ATTACHED_FINDER.find(bytes).is_some() {
+        collect_attachment_services(bytes, &mask, &mut storage_services);
+    }
 
     if has_ruby_scan_tokens {
         scan_requires_filtered(bytes, &mask, &mut requires);
@@ -2505,15 +3461,20 @@ fn scan_file_bytes(
     // files — YAML keys/values like `UserNotFound:` would otherwise be
     // extracted as module references. The explicit YAML regex extractors
     // below still pick up rubocop/plugins/inherit_gem/require: entries.
+    let mut file_modules = Vec::new();
     if !is_yaml {
-        scan_modules_filtered_into(bytes, &mask, thread_modules, &rel_path_arc);
-        scan_middleware_refs(bytes, &mask, thread_modules, &rel_path_arc);
+        let mut names = FileModuleSet::default();
+        collect_module_names(bytes, &mask, &mut names);
+        collect_middleware_refs(bytes, &mask, &mut names);
+        file_modules = merge_file_modules(names, thread_modules, &rel_path_arc, keep_module_list);
     }
 
     // YAML config patterns (keep regex — rarely hit, complex multiline patterns).
     // Fix #8: use regex::bytes::Regex to avoid the String::from_utf8_lossy
     // allocation; patterns are byte-compatible.
-    if is_yaml
+    if is_yaml && is_rubocop_config(full_path) {
+        rubocop_config_gems(bytes, &mut requires);
+    } else if is_yaml
         && (memmem::find(bytes, b"rubocop").is_some()
             || memmem::find(bytes, b"require:").is_some()
             || memmem::find(bytes, b"plugins:").is_some()
@@ -2553,9 +3514,159 @@ fn scan_file_bytes(
     Some(FileResult {
         rel_path,
         requires,
+        modules: file_modules,
         bundler_groups,
         bundler_require_all,
+        storage_services,
     })
+}
+
+/// `.rubocop.yml`, `.rubocop_todo.yml`, `rubocop-*.yml`, `.standard.yml`, ...
+fn is_rubocop_config(path: &Path) -> bool {
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    name.contains("rubocop") || name.starts_with(".standard")
+}
+
+/// Extract gem names referenced by a RuboCop/Standard config: `require:` and
+/// `plugins:` (a string, a list of strings, or a list of single-key maps) and
+/// the keys of `inherit_gem:`. Invalid YAML (e.g. ERB) falls back to a
+/// tolerant line-based reader.
+fn rubocop_config_gems(bytes: &[u8], gems: &mut Vec<String>) {
+    use serde_yaml::Value;
+
+    fn push_names(value: &Value, gems: &mut Vec<String>) {
+        match value {
+            Value::String(name) => gems.push(name.clone()),
+            Value::Sequence(items) => {
+                for item in items {
+                    match item {
+                        Value::String(name) => gems.push(name.clone()),
+                        Value::Mapping(map) => push_keys(map, gems),
+                        _ => {}
+                    }
+                }
+            }
+            Value::Mapping(map) => push_keys(map, gems),
+            _ => {}
+        }
+    }
+
+    fn push_keys(map: &serde_yaml::Mapping, gems: &mut Vec<String>) {
+        gems.extend(map.keys().filter_map(Value::as_str).map(str::to_string));
+    }
+
+    match serde_yaml::from_slice::<Value>(bytes) {
+        Ok(Value::Mapping(config)) => {
+            for key in ["require", "plugins"] {
+                if let Some(value) = config.get(key) {
+                    push_names(value, gems);
+                }
+            }
+            if let Some(Value::Mapping(inherited)) = config.get("inherit_gem") {
+                push_keys(inherited, gems);
+            }
+        }
+        Ok(_) => {}
+        Err(_) => rubocop_config_gems_fallback(bytes, gems),
+    }
+}
+
+/// Line-based reader for RuboCop configs that are not valid YAML.
+fn rubocop_config_gems_fallback(bytes: &[u8], gems: &mut Vec<String>) {
+    fn strip_comment(value: &str) -> &str {
+        let value = value.trim();
+        if value.starts_with('#') {
+            return "";
+        }
+        value.split(" #").next().unwrap_or("").trim()
+    }
+    fn unquote(value: &str) -> &str {
+        value.trim().trim_matches(|c| c == '\'' || c == '"').trim()
+    }
+    fn push_flow(value: &str, keys_only: bool, gems: &mut Vec<String>) {
+        let inner = value
+            .trim_start_matches(['[', '{'])
+            .trim_end_matches([']', '}']);
+        for item in inner.split(',') {
+            let item = if keys_only || item.contains(": ") || item.trim_end().ends_with(':') {
+                item.split(':').next().unwrap_or("")
+            } else {
+                item
+            };
+            let item = unquote(item);
+            if !item.is_empty() {
+                gems.push(item.to_string());
+            }
+        }
+    }
+
+    let text = String::from_utf8_lossy(bytes);
+    let mut section: Option<&str> = None;
+    let mut child_indent: Option<usize> = None;
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let indent = line.len() - trimmed.len();
+        if indent == 0 {
+            child_indent = None;
+            section = ["require", "plugins", "inherit_gem"]
+                .into_iter()
+                .find(|key| {
+                    trimmed
+                        .strip_prefix(key)
+                        .is_some_and(|rest| rest.starts_with(':'))
+                });
+            let Some(key) = section else {
+                continue;
+            };
+            let value = strip_comment(&trimmed[key.len() + 1..]);
+            if value.starts_with('[') || value.starts_with('{') {
+                push_flow(value, key == "inherit_gem", gems);
+                section = None;
+            } else if !value.is_empty() {
+                if key != "inherit_gem" {
+                    gems.push(unquote(value).to_string());
+                }
+                section = None;
+            }
+            continue;
+        }
+        let Some(key) = section else {
+            continue;
+        };
+        let child_indent = *child_indent.get_or_insert(indent);
+        if indent != child_indent {
+            continue;
+        }
+        let entry = if key == "inherit_gem" {
+            trimmed.split(':').next().unwrap_or("")
+        } else if let Some(item) = trimmed.strip_prefix('-') {
+            let item = strip_comment(item);
+            if item.ends_with(':') || item.contains(": ") {
+                item.split(':').next().unwrap_or("")
+            } else {
+                item
+            }
+        } else {
+            continue;
+        };
+        let entry = unquote(entry);
+        if !entry.is_empty() {
+            gems.push(entry.to_string());
+        }
+    }
+    for cap in RUBOCOP_RE.captures_iter(bytes) {
+        if let Ok(name) = std::str::from_utf8(&cap[1]) {
+            if !gems.iter().any(|gem| gem == name) {
+                gems.push(name.to_string());
+            }
+        }
+    }
 }
 
 /// Classify a path into Ruby, YAML, and template dialects in one pass.
@@ -2836,6 +3947,118 @@ mod tests {
         );
     }
 
+    fn ruby_findings(input: &[u8]) -> (Vec<String>, HashSet<String>) {
+        let mask = build_skip_mask(input, true, LineCommentKind::Hash);
+        let mut requires = Vec::new();
+        scan_requires_filtered(input, &mask, &mut requires);
+        let mut modules = HashMap::new();
+        let path: Arc<str> = Arc::from("test.rb");
+        scan_modules_filtered_into(input, &mask, &mut modules, &path);
+        (requires, modules.into_keys().collect())
+    }
+
+    fn assert_alpha_and_beta_visible(input: &[u8]) {
+        let (requires, modules) = ruby_findings(input);
+        let text = String::from_utf8_lossy(input);
+        assert_eq!(requires, vec!["alpha"], "{text}");
+        assert!(modules.contains("Beta"), "{text}: {modules:?}");
+    }
+
+    #[test]
+    fn bare_percent_literals_are_strings() {
+        assert_alpha_and_beta_visible(
+            b"x = %(don't panic)\nrequire \"alpha\"\nBeta.call\ny = 'z'\n",
+        );
+        assert_alpha_and_beta_visible(b"x = %{it's}\nrequire \"alpha\"\nBeta.call\ny = 'z'\n");
+        assert_alpha_and_beta_visible(
+            b"x = %[it's]\ny = %<it's>\nz = %|it's|\nrequire \"alpha\"\nBeta.call\nw = 'z'\n",
+        );
+        let (_, modules) = ruby_findings(b"x = %(Gamma #{Beta})\n");
+        assert!(!modules.contains("Gamma"));
+        assert!(modules.contains("Beta"));
+        // Modulo stays an operator.
+        let (_, modules) = ruby_findings(b"x = 10 %(3)\ny = n % (Beta)\n");
+        assert!(modules.contains("Beta"));
+    }
+
+    #[test]
+    fn question_mark_before_quote_in_ternary_is_not_char_literal() {
+        assert_alpha_and_beta_visible(
+            b"c = true\nx = c ?'a':'b'\nrequire \"alpha\"\nBeta.call\ny = 'q'\n",
+        );
+        assert_alpha_and_beta_visible(b"ok = valid?'x'\nrequire \"alpha\"\nBeta.call\ny = 'q'\n");
+        // Real character literals still mask the quote character.
+        assert_alpha_and_beta_visible(b"q = ?'\nd = ?\"\nrequire \"alpha\"\nBeta.call\n");
+    }
+
+    #[test]
+    fn punctuation_globals_do_not_open_strings() {
+        assert_alpha_and_beta_visible(
+            b"$\".include?(1)\nrequire \"alpha\"\nBeta.call\nz = \"q\"\n",
+        );
+        assert_alpha_and_beta_visible(b"m = $'\nrequire \"alpha\"\nBeta.call\nz = 'q'\n");
+    }
+
+    #[test]
+    fn slash_operators_do_not_start_regexes() {
+        assert_alpha_and_beta_visible(
+            b"x = [4,2].reduce(:/)\nrequire \"alpha\"\nBeta.call\ny = 4 / 2\n",
+        );
+        assert_alpha_and_beta_visible(
+            b"class V\n  def /(o)\n    self\n  end\nend\nrequire \"alpha\"\nBeta.call\nz = 4 / 2\n",
+        );
+        assert_alpha_and_beta_visible(
+            b"x = 10\ny = x /2\nrequire \"alpha\"\nBeta.call\nz = 4/ 2\n",
+        );
+        // Real regexes (including multi-line extended ones) are still masked.
+        let (_, modules) =
+            ruby_findings(b"a = x.match /Static/\nb = /\n  Extended\n/x\nBeta.call\n");
+        assert!(!modules.contains("Static"));
+        assert!(!modules.contains("Extended"));
+        assert!(modules.contains("Beta"));
+    }
+
+    #[test]
+    fn data_section_after_end_marker_is_ignored() {
+        let (requires, modules) = ruby_findings(b"puts 1\n__END__\nrequire \"alpha\"\nBeta.call\n");
+        assert!(requires.is_empty());
+        assert!(!modules.contains("Beta"));
+        let (requires, _) = ruby_findings(b"puts 1\r\n__END__\r\nrequire \"alpha\"\r\n");
+        assert!(requires.is_empty());
+        // Not a marker when anything else is on the line.
+        assert_alpha_and_beta_visible(b"x = __END__x\nrequire \"alpha\"\nBeta.call\n");
+    }
+
+    #[test]
+    fn embedded_doc_end_marker_requires_word_boundary() {
+        let (_, modules) =
+            ruby_findings(b"x = 1\n=begin\nfoo\n=ending stuff\nBeta.call\n=end\nAfter.call\n");
+        assert!(!modules.contains("Beta"));
+        assert!(modules.contains("After"));
+        let (_, modules) = ruby_findings(b"=beginning\nBeta.call\n");
+        assert!(modules.contains("Beta"));
+    }
+
+    #[test]
+    fn erb_string_does_not_extend_into_template_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("x.erb");
+        std::fs::write(
+            &file,
+            "<p>it's</p>\n<%= %(don't) %>\n<%= Beta.x %>\n<p>isn't</p>\n<%= x ? 'a : 'b' %>\n<%= Alpha.y %>\n",
+        )
+        .unwrap();
+        let mut modules = HashMap::new();
+        scan_file(
+            file.to_str().unwrap(),
+            dir.path().to_str().unwrap(),
+            &mut modules,
+        )
+        .unwrap();
+        assert!(modules.contains_key("Beta"));
+        assert!(modules.contains_key("Alpha"));
+    }
+
     #[test]
     fn multiline_strings_mask_static_text_but_keep_interpolation_code() {
         let input = b"single = 'StaticSingle\nrequire \"single_fake\"'\ndouble = \"StaticDouble\n#{require \"double_dynamic\"; InterpolatedModule}\"\nrequire 'real'\n";
@@ -2906,6 +4129,38 @@ AfterPercentLiterals.call
         ] {
             assert!(modules.contains_key(visible), "{visible}");
         }
+    }
+
+    #[test]
+    fn unterminated_heredoc_openers_scan_linearly() {
+        fn steps_for(lines: usize) -> usize {
+            let mut input = b"items <<item\n".repeat(lines);
+            input.extend_from_slice(b"require 'after_shovels'\n");
+            let (mask, steps) = build_ruby_skip_mask_with_lexical_steps(&input);
+            let mut requires = Vec::new();
+            scan_requires_filtered(&input, &mask, &mut requires);
+            assert_eq!(requires, vec!["after_shovels"]);
+            steps
+        }
+        let small = steps_for(1_000);
+        let large = steps_for(2_000);
+        assert!(
+            large <= small * 3,
+            "doubling input must remain linear: {small} -> {large}"
+        );
+    }
+
+    #[test]
+    fn two_heredocs_on_one_line_have_sequential_bodies() {
+        let input = b"foo(<<~A, <<~'B')\n  #{Beta.x}\n  StaticA\nA\n  raw #{NotInterpolated}\nB\nAfter.call\n";
+        let mask = build_skip_mask(input, true, LineCommentKind::Hash);
+        let mut modules = HashMap::new();
+        let path: Arc<str> = Arc::from("test.rb");
+        scan_modules_filtered_into(input, &mask, &mut modules, &path);
+        assert!(modules.contains_key("Beta"), "{modules:?}");
+        assert!(modules.contains_key("After"));
+        assert!(!modules.contains_key("StaticA"));
+        assert!(!modules.contains_key("NotInterpolated"));
     }
 
     #[test]
@@ -3140,7 +4395,8 @@ require 'real_regex'
 
     #[test]
     fn non_ruby_module_comment_is_filtered() {
-        let input = b"# MyOldModule was removed\nMyNewModule:\n  key: value\n";
+        // (`MyNewModule:` would be a hash-key label, which is not a reference.)
+        let input = b"# MyOldModule was removed\nMyNewModule.configure\n  key: value\n";
         let _block_ranges: Vec<(usize, usize)> = Vec::new();
         let mut modules: HashMap<String, HashSet<Arc<str>>> = HashMap::new();
         {
@@ -3342,6 +4598,83 @@ require 'real_regex'
     }
 
     #[test]
+    fn rubocop_config_reference_forms() {
+        let cases: &[(&str, &[&str])] = &[
+            (
+                "inherit_gem:\n  rubocop-shopify: rubocop.yml\n",
+                &["rubocop-shopify"],
+            ),
+            (
+                "inherit_gem: { rubocop-rails-omakase: rubocop.yml }\n",
+                &["rubocop-rails-omakase"],
+            ),
+            (
+                "inherit_gem:\n  rubocop-github:\n    - config/default.yml\n",
+                &["rubocop-github"],
+            ),
+            (
+                "plugins: [standard-performance]\n",
+                &["standard-performance"],
+            ),
+            ("require: standard\n", &["standard"]),
+            ("plugins:\n  - \"rubocop-rails\"\n", &["rubocop-rails"]),
+            ("require:\n  - standard # comment\n", &["standard"]),
+            ("require:\n  - standard", &["standard"]),
+            (
+                "plugins:\n  - rubocop-rails:\n      foo: bar\n  - rubocop-rspec\n",
+                &["rubocop-rails", "rubocop-rspec"],
+            ),
+        ];
+        for (config, expected) in cases {
+            let mut gems = Vec::new();
+            rubocop_config_gems(config.as_bytes(), &mut gems);
+            assert_eq!(&gems, expected, "{config:?}");
+        }
+    }
+
+    #[test]
+    fn rubocop_config_invalid_yaml_uses_fallback() {
+        let config = b"<% if ENV['CI'] %>\ninherit_gem: { rubocop-rails-omakase: rubocop.yml }\n<% end %>\nplugins: [standard-performance, 'standard-rails']\nrequire:\n  - \"rubocop-rspec\" # comment\n  - rubocop-rake:\n      x: 1\nAllCops:\n  - rubocop-minitest\n";
+        assert!(serde_yaml::from_slice::<serde_yaml::Value>(config).is_err());
+        let mut gems = Vec::new();
+        rubocop_config_gems(config, &mut gems);
+        gems.sort();
+        assert_eq!(
+            gems,
+            vec![
+                "rubocop-minitest",
+                "rubocop-rails-omakase",
+                "rubocop-rake",
+                "rubocop-rspec",
+                "standard-performance",
+                "standard-rails",
+            ]
+        );
+    }
+
+    #[test]
+    fn scan_file_dot_rubocop_flow_inherit_gem() {
+        let dir = tempfile::tempdir().unwrap();
+        let yml = dir.path().join(".rubocop.yml");
+        std::fs::write(
+            &yml,
+            "inherit_gem: { rubocop-rails-omakase: rubocop.yml }\nplugins: [standard-performance]\n",
+        )
+        .unwrap();
+        let mut modules = HashMap::new();
+        let result = scan_file(
+            yml.to_str().unwrap(),
+            dir.path().to_str().unwrap(),
+            &mut modules,
+        )
+        .unwrap();
+        assert_eq!(
+            result.requires,
+            vec!["standard-performance", "rubocop-rails-omakase"]
+        );
+    }
+
+    #[test]
     fn scan_file_empty_file() {
         let dir = tempfile::tempdir().unwrap();
         let rb = dir.path().join("empty.rb");
@@ -3405,6 +4738,58 @@ require 'real_regex'
             .bundler_groups
             .contains(&"__rails_group_condition__:assets:development,test,profile".to_string()));
         assert!(!r.bundler_groups.contains(&"migrations".to_string()));
+    }
+
+    #[test]
+    fn rails_group_conditions_support_hash_rockets() {
+        let mut groups = Vec::new();
+        push_rails_group_conditions(
+            "Bundler.require(*Rails.groups(:assets => %w(development test)))",
+            &mut groups,
+        );
+        assert_eq!(
+            groups,
+            vec!["__rails_group_condition__:assets:development,test"]
+        );
+    }
+
+    #[test]
+    fn bundler_require_rails_env_keeps_explicit_groups() {
+        let input = b"Bundler.require(:default, :assets, Rails.env)\n";
+        let mask = build_skip_mask(input, true, LineCommentKind::Hash);
+        let mut groups = Vec::new();
+        let mut require_all = false;
+        scan_bundler_require_filtered(input, &mask, &mut groups, &mut require_all);
+        assert!(require_all);
+        assert_eq!(groups, vec!["default", "assets"]);
+    }
+
+    #[test]
+    fn bundler_require_rails_groups_hash_keys_are_not_plain_groups() {
+        let input = b"Bundler.require(:default, *Rails.groups(:assets => %w(development test)))\n";
+        let mask = build_skip_mask(input, true, LineCommentKind::Hash);
+        let mut groups = Vec::new();
+        let mut require_all = false;
+        scan_bundler_require_filtered(input, &mask, &mut groups, &mut require_all);
+        assert!(require_all);
+        assert_eq!(
+            groups,
+            vec![
+                "__rails_group_condition__:assets:development,test",
+                "default"
+            ]
+        );
+    }
+
+    #[test]
+    fn bundler_splat_var_ignores_commented_rails_groups_assignment() {
+        let input = b"groups = [:default]\n# groups = Rails.groups(assets: %w(development))\nBundler.require(*groups)\n";
+        let mask = build_skip_mask(input, true, LineCommentKind::Hash);
+        let mut groups = Vec::new();
+        let mut require_all = false;
+        scan_bundler_require_filtered(input, &mask, &mut groups, &mut require_all);
+        assert!(!require_all);
+        assert_eq!(groups, vec!["default"]);
     }
 
     #[test]
@@ -3528,6 +4913,22 @@ require 'real_regex'
     }
 
     #[test]
+    fn is_scannable_skips_placeholder_and_doc_names_without_opening() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in [".keep", ".gitkeep", "LICENSE", "README", "Makefile"] {
+            let path = dir.path().join(name);
+            std::fs::write(&path, "#!/usr/bin/env ruby\nrequire 'x'\n").unwrap();
+            assert!(!is_scannable(path.to_str().unwrap(), &path), "{name}");
+        }
+        let script = dir.path().join("setup");
+        std::fs::write(&script, "#!/usr/bin/env ruby\nrequire 'x'\n").unwrap();
+        assert!(is_scannable(script.to_str().unwrap(), &script));
+        assert!(may_be_ruby_script_name(b"console"));
+        assert!(!may_be_ruby_script_name(b".keep"));
+        assert!(!may_be_ruby_script_name(b"CHANGELOG"));
+    }
+
+    #[test]
     fn is_scannable_rejects_txt() {
         let dir = tempfile::tempdir().unwrap();
         let txt = dir.path().join("test.txt");
@@ -3636,6 +5037,60 @@ require 'real_regex'
     }
 
     #[test]
+    fn explicit_skip_dir_paths_match_relative_to_root() {
+        let dir = tempfile::tempdir().unwrap();
+        for sub in ["app/legacy", "app/legacy_v2", "lib/app/legacy"] {
+            let path = dir.path().join(sub);
+            std::fs::create_dir_all(&path).unwrap();
+            let gem = sub.replace('/', "_");
+            std::fs::write(path.join("a.rb"), format!("require '{gem}'\n")).unwrap();
+        }
+        let cache = Arc::new(crate::cache::FileCache::disabled());
+        for skip in ["app/legacy", "./app/legacy/"] {
+            let (results, _) = scan_source_tree_with_threads_and_explicit_skips(
+                dir.path(),
+                &[skip],
+                &[skip],
+                cache.clone(),
+                None,
+            );
+            assert!(!results.requires.contains_key("app_legacy"), "{skip}");
+            assert!(results.requires.contains_key("app_legacy_v2"), "{skip}");
+            assert!(results.requires.contains_key("lib_app_legacy"), "{skip}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scan_source_tree_follows_symlinks() {
+        let outer = tempfile::tempdir().unwrap();
+        let root = outer.path().join("project");
+        let shared = outer.path().join("shared");
+        std::fs::create_dir_all(root.join("app")).unwrap();
+        std::fs::create_dir_all(root.join("lib")).unwrap();
+        std::fs::create_dir_all(shared.join("lib")).unwrap();
+        std::fs::write(shared.join("a.rb"), "require 'alpha'\n").unwrap();
+        std::fs::write(shared.join("lib").join("b.rb"), "Beta.x\n").unwrap();
+        std::fs::write(root.join("lib").join("g_real.rb"), "Gamma.x\n").unwrap();
+        std::os::unix::fs::symlink(shared.join("a.rb"), root.join("app").join("a.rb")).unwrap();
+        std::os::unix::fs::symlink(shared.join("lib"), root.join("app").join("shared_lib"))
+            .unwrap();
+        std::os::unix::fs::symlink(
+            root.join("lib").join("g_real.rb"),
+            root.join("app").join("g_link.rb"),
+        )
+        .unwrap();
+        // A directory loop must not hang or crash the walk.
+        std::os::unix::fs::symlink(&root, root.join("lib").join("loop")).unwrap();
+
+        let cache = Arc::new(crate::cache::FileCache::disabled());
+        let (results, _) = scan_source_tree(&root, &default_skip_dirs(), cache);
+        assert!(results.requires.contains_key("alpha"));
+        assert!(results.modules.contains_key("Beta"));
+        assert!(results.modules["Gamma"].len() >= 2);
+    }
+
+    #[test]
     fn filtered_scanners_accept_multiline_calls() {
         let input = b"require(\n  'json'\n)\nautoload(\n  :Thing,\n  'thing'\n)\nGem.bin_path(\n  'rake'\n)\n";
         let mask = build_skip_mask(input, true, LineCommentKind::Hash);
@@ -3670,8 +5125,8 @@ require 'real_regex'
 
         // Apply cache updates
         let mut cache_mut = crate::cache::FileCache::load(dir.path());
-        for (rp, mt, sz, reqs, mods, bg, ba) in updates {
-            cache_mut.put(rp, mt, sz, &reqs, mods, &bg, ba);
+        for update in updates {
+            cache_mut.put(update);
         }
         cache_mut.save();
 
@@ -3691,8 +5146,8 @@ require 'real_regex'
         let cache = std::sync::Arc::new(crate::cache::FileCache::load(dir.path()));
         let (_, updates) = scan_source_tree(dir.path(), &[], cache);
         let mut cache = crate::cache::FileCache::load(dir.path());
-        for (rp, mt, sz, reqs, mods, bg, ba) in updates {
-            cache.put(rp, mt, sz, &reqs, mods, &bg, ba);
+        for update in updates {
+            cache.put(update);
         }
         cache.save();
 
@@ -3758,6 +5213,95 @@ require 'real_regex'
     fn default_walker_threads_is_capped_at_four() {
         assert!(default_walker_threads() >= 1);
         assert!(default_walker_threads() <= 4);
+    }
+
+    #[test]
+    fn attachment_services_are_collected_from_code_only() {
+        let input = b"class User\n  has_one_attached :avatar, service: :amazon, dependent: :purge\n  has_many_attached :docs,\n    service: ->(u) { u.eu? ? :europe : :usa }\n  has_one_attached :legacy, :service => :old_disk\n  has_one_attached :named, service: \"quoted\"\n  # has_one_attached :x, service: :commented\n  s = \"has_one_attached :y, service: :in_string\"\n  has_one_attached :plain\n  validates :name, service: :not_attachment\nend\n";
+        let mask = build_skip_mask(input, true, LineCommentKind::Hash);
+        let mut services = Vec::new();
+        collect_attachment_services(input, &mask, &mut services);
+        services.sort();
+        assert_eq!(
+            services,
+            vec!["amazon", "europe", "old_disk", "quoted", "usa"]
+        );
+    }
+
+    #[test]
+    fn attachment_services_survive_cache_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("user.rb"),
+            "has_one_attached :avatar, service: :amazon\n",
+        )
+        .unwrap();
+        let cache = Arc::new(crate::cache::FileCache::load(dir.path()));
+        let (first, updates) = scan_source_tree(dir.path(), &[], cache);
+        assert!(first.storage_services.contains("amazon"));
+        let mut cache = crate::cache::FileCache::load(dir.path());
+        for update in updates {
+            cache.put(update);
+        }
+        cache.save();
+
+        let cache = Arc::new(crate::cache::FileCache::load(dir.path()));
+        let (second, updates) = scan_source_tree(dir.path(), &[], cache);
+        assert!(
+            updates.is_empty(),
+            "second scan should be served from cache"
+        );
+        assert!(second.storage_services.contains("amazon"));
+    }
+
+    #[test]
+    fn scan_file_reports_unique_modules_per_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let rb = dir.path().join("a.rb");
+        std::fs::write(&rb, "Foo.a\nFoo.b\nBar::Baz.c\nFoo.d\n").unwrap();
+        let mut modules = HashMap::new();
+        let result = scan_file(
+            rb.to_str().unwrap(),
+            dir.path().to_str().unwrap(),
+            &mut modules,
+        )
+        .unwrap();
+        let mut own = result.modules.clone();
+        own.sort();
+        assert_eq!(own, vec!["Bar::Baz", "Foo"]);
+        assert_eq!(modules["Foo"].len(), 1);
+    }
+
+    #[test]
+    fn cold_cache_scan_is_not_quadratic_in_module_count() {
+        // Regression: on a cache miss the walker used to scan the entire
+        // per-thread module map to find the current file's modules, making a
+        // cold cached scan quadratic in the number of files.
+        let dir = tempfile::tempdir().unwrap();
+        let app = dir.path().join("app");
+        std::fs::create_dir_all(&app).unwrap();
+        for i in 0..1500 {
+            let body: String = (0..60).map(|j| format!("Const{i}x{j}.call\n")).collect();
+            std::fs::write(app.join(format!("f{i}.rb")), body).unwrap();
+        }
+        let started = std::time::Instant::now();
+        let disabled = Arc::new(crate::cache::FileCache::disabled());
+        let (uncached, _) = scan_source_tree_with_threads(dir.path(), &[], disabled, Some(1));
+        let uncached_time = started.elapsed();
+
+        let started = std::time::Instant::now();
+        let cache = Arc::new(crate::cache::FileCache::load(dir.path()));
+        let (cached, updates) = scan_source_tree_with_threads(dir.path(), &[], cache, Some(1));
+        let cached_time = started.elapsed();
+
+        assert_eq!(uncached.modules.len(), 90_000);
+        assert_eq!(cached.modules.len(), 90_000);
+        assert_eq!(updates.len(), 1500);
+        assert!(updates.iter().all(|update| update.modules.len() == 60));
+        assert!(
+            cached_time <= uncached_time * 4 + std::time::Duration::from_millis(500),
+            "cold cached scan {cached_time:?} vs uncached {uncached_time:?}"
+        );
     }
 
     // ── Filtered scanner edge cases ──
@@ -3882,10 +5426,16 @@ require 'real_regex'
     }
 
     #[test]
-    fn gem_bin_missing_paren() {
+    fn gem_bin_without_paren() {
         let mut results = Vec::new();
         scan_gem_bin(b"Gem.bin_path 'foo'\n", &mut results);
-        assert!(results.is_empty());
+        assert_eq!(results, vec!["foo"]);
+
+        let input = b"Gem.activate_bin_path \"beta\", \"b\"\nGem.bin_path(\"alpha\", \"a\")\n";
+        let mask = build_skip_mask(input, true, LineCommentKind::Hash);
+        let mut results = Vec::new();
+        scan_gem_bin_filtered(input, &mask, &mut results);
+        assert_eq!(results, vec!["beta", "alpha"]);
     }
 
     // ── scan_modules (unfiltered) ──
@@ -4152,6 +5702,95 @@ require 'real_regex'
             assert!(modules.contains_key(expected_module), "{name}");
             assert!(!modules.contains_key(static_module), "{name}");
         }
+    }
+
+    fn template_modules(name: &str, content: &str) -> HashSet<String> {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join(name);
+        std::fs::write(&file, content).unwrap();
+        let mut modules = HashMap::new();
+        scan_file(
+            file.to_str().unwrap(),
+            dir.path().to_str().unwrap(),
+            &mut modules,
+        );
+        modules.into_keys().collect()
+    }
+
+    #[test]
+    fn haml_and_slim_text_is_not_exposed_as_ruby() {
+        for (name, content) in [
+            (
+                "a.haml",
+                "%p Hello (it's me)\n= Beta.render\n%p= link_to 'x', y\n",
+            ),
+            (
+                "a.slim",
+                "p Hello (it's me)\n= Beta.render\np = link_to 'x', y\n",
+            ),
+        ] {
+            let modules = template_modules(name, content);
+            assert!(modules.contains("Beta"), "{name}: {modules:?}");
+        }
+        let modules = template_modules("b.haml", "%p See (Gamma docs) here {Delta}\n");
+        assert!(!modules.contains("Gamma"), "{modules:?}");
+        assert!(!modules.contains("Delta"), "{modules:?}");
+    }
+
+    #[test]
+    fn haml_and_slim_attributes_and_output_after_tags() {
+        let modules = template_modules(
+            "a.haml",
+            "%p{class: \"a\"}= Beta.x\n#main= Gamma.x\n%a.btn#go(href=Delta.path)[Epsilon] text\n%img/\n",
+        );
+        for expected in ["Beta", "Gamma", "Delta", "Epsilon"] {
+            assert!(modules.contains(expected), "{expected}: {modules:?}");
+        }
+        let modules = template_modules(
+            "a.slim",
+            "div class=Beta.cls\na(href=Gamma.path title=\"it's\") Text\nli: a href=Delta.path Link\n.box#id data-x=Epsilon.x Plain Text\n",
+        );
+        for expected in ["Beta", "Gamma", "Delta", "Epsilon"] {
+            assert!(modules.contains(expected), "{expected}: {modules:?}");
+        }
+        assert!(!modules.contains("Link"));
+        assert!(!modules.contains("Plain"));
+    }
+
+    #[test]
+    fn haml_and_slim_multiline_ruby() {
+        for (name, content) in [
+            ("a.haml", "= link_to \"x\",\n  Beta.path\n%p Static\n"),
+            ("a.slim", "= link_to \"x\",\n  Beta.path\np Static\n"),
+            ("b.slim", "= link_to \"x\", \\\n  Beta.path\np Static\n"),
+            ("b.haml", "%div{ a: 1,\n  b: Beta.x }\n%p Static\n"),
+            ("c.haml", "%p= link_to \"x\",\n  Beta.path\n%p Static\n"),
+            ("c.slim", "div(a=1\n  b=Beta.x)\np Static\n"),
+        ] {
+            let modules = template_modules(name, content);
+            assert!(modules.contains("Beta"), "{name}: {modules:?}");
+            assert!(!modules.contains("Static"), "{name}: {modules:?}");
+        }
+    }
+
+    #[test]
+    fn haml_and_slim_filters_and_comment_blocks_stay_masked() {
+        let modules = template_modules(
+            "a.haml",
+            ":javascript\n  var Beta = 1;\n  .Gamma { x }\n-#\n  %p= Delta.x\n= Epsilon.x\n",
+        );
+        assert!(!modules.contains("Beta"));
+        assert!(!modules.contains("Gamma"));
+        assert!(!modules.contains("Delta"));
+        assert!(modules.contains("Epsilon"));
+        let modules = template_modules(
+            "a.slim",
+            "javascript:\n  Beta = foo.bar\n/\n  p = Delta.x\n| Some text\n  Gamma = x\n= Epsilon.x\n",
+        );
+        assert!(!modules.contains("Beta"));
+        assert!(!modules.contains("Delta"));
+        assert!(!modules.contains("Gamma"));
+        assert!(modules.contains("Epsilon"));
     }
 
     #[test]
@@ -4493,6 +6132,64 @@ require 'real_regex'
             modules.contains_key("BatchLoader::Middleware"),
             "should detect string arg in insert_before"
         );
+    }
+
+    #[test]
+    fn middleware_only_takes_middleware_argument_slots() {
+        for (input, expected, unexpected) in [
+            (
+                &b"config.middleware.use Foo # was \"Beta::Rack\"\n"[..],
+                None,
+                "Beta::Rack",
+            ),
+            (
+                &b"config.middleware.use \"Beta::Rack\" if x == \"Alpha\"\n"[..],
+                Some("Beta::Rack"),
+                "Alpha",
+            ),
+            (
+                &b"config.middleware.use \"Beta::Rack\", \"Option\"\n"[..],
+                Some("Beta::Rack"),
+                "Option",
+            ),
+            (
+                &b"config.middleware.insert_before(\"Rack::Runtime\", \"Beta::Rack\", \"Arg\")\n"[..],
+                Some("Beta::Rack"),
+                "Arg",
+            ),
+        ] {
+            let mask = build_skip_mask(input, true, LineCommentKind::Hash);
+            let mut modules: HashMap<String, HashSet<Arc<str>>> = HashMap::new();
+            let rel: Arc<str> = Arc::from("test.rb");
+            scan_middleware_refs(input, &mask, &mut modules, &rel);
+            let text = String::from_utf8_lossy(input);
+            if let Some(expected) = expected {
+                assert!(modules.contains_key(expected), "{text}");
+            }
+            assert!(!modules.contains_key(unexpected), "{text}");
+        }
+    }
+
+    #[test]
+    fn symbols_labels_and_variables_are_not_constants() {
+        let (_, modules) = ruby_findings(
+            b"x = :Beta
+h = { Alpha: 1 }
+@Gamma = 1
+@@Delta = 2
+$Epsilon = 3
+foo(Zeta: 1)
+y = ::Top::Level
+z = Foo::Bar
+w = cond ? Eta : Theta
+",
+        );
+        for excluded in ["Beta", "Alpha", "Gamma", "Delta", "Epsilon", "Zeta"] {
+            assert!(!modules.contains(excluded), "{excluded}: {modules:?}");
+        }
+        for included in ["Top::Level", "Foo::Bar", "Eta", "Theta"] {
+            assert!(modules.contains(included), "{included}: {modules:?}");
+        }
     }
 
     #[test]

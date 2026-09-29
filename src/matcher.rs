@@ -4,22 +4,64 @@ use rayon::prelude::*;
 
 use crate::types::{Evidence, GemEntry, GemResult, GemStatus, ScanResults};
 
-/// Entry stored per top-level module segment: (lowercased_full_name, original_name, files).
-type ModuleEntry<'a> = (String, String, &'a HashSet<String>);
+/// Source module candidate: (original module name, files referencing it).
+type ModuleEntry<'a> = (&'a str, &'a HashSet<String>);
 
 /// Shared indexes built once from scan results and reused across all gem matching.
 struct MatchIndexes<'a> {
     requires: &'a HashMap<String, HashSet<String>>,
     prefix_map: HashMap<&'a str, Vec<(&'a str, &'a HashSet<String>)>>,
-    declared_require_paths: HashSet<String>,
-    /// Modules keyed by the lowercased top "::" segment of the module name.
+    declared_require_paths: HashSet<&'a str>,
+    /// Source modules keyed by the ASCII-lowercased top "::" segment. Only
+    /// populated for top segments that some gem's module pattern can match, so
+    /// a first pass without module patterns never walks the module map.
     modules_by_top: HashMap<String, Vec<ModuleEntry<'a>>>,
     bundler_groups: &'a HashSet<String>,
     bundler_require_all: bool,
 }
 
+fn lower_top_segment(name: &str) -> String {
+    name.split("::").next().unwrap_or(name).to_ascii_lowercase()
+}
+
+/// Index only the source modules whose top segment matches a wanted
+/// (lowercased) top segment. Lowercases into a stack buffer so the common
+/// non-matching module costs one hash lookup and no allocation.
+fn index_modules<'a>(
+    modules: &'a HashMap<String, HashSet<String>>,
+    wanted: HashSet<String>,
+) -> HashMap<String, Vec<ModuleEntry<'a>>> {
+    const BUF_LEN: usize = 128;
+    if wanted.is_empty() {
+        return HashMap::new();
+    }
+    let max_len = wanted.iter().map(String::len).max().unwrap_or(0);
+    let hits: Vec<(&String, ModuleEntry<'a>)> = modules
+        .par_iter()
+        .filter_map(|(name, files)| {
+            let top = name.split("::").next().unwrap_or(name);
+            if top.len() > max_len || top.len() > BUF_LEN {
+                return None;
+            }
+            let mut buf = [0u8; BUF_LEN];
+            let lowered = &mut buf[..top.len()];
+            lowered.copy_from_slice(top.as_bytes());
+            lowered.make_ascii_lowercase();
+            let key = std::str::from_utf8(lowered).ok()?;
+            wanted
+                .get(key)
+                .map(|wanted_key| (wanted_key, (name.as_str(), files)))
+        })
+        .collect();
+    let mut by_top: HashMap<String, Vec<ModuleEntry<'a>>> = HashMap::new();
+    for (key, entry) in hits {
+        by_top.entry(key.clone()).or_default().push(entry);
+    }
+    by_top
+}
+
 impl<'a> MatchIndexes<'a> {
-    fn build(gems: &[GemEntry], scan_results: &'a ScanResults) -> Self {
+    fn build(gems: &'a [GemEntry], indices: &[usize], scan_results: &'a ScanResults) -> Self {
         let requires = &scan_results.requires;
 
         let mut prefix_map: HashMap<&str, Vec<(&str, &HashSet<String>)>> = HashMap::new();
@@ -31,28 +73,20 @@ impl<'a> MatchIndexes<'a> {
                 .push((req_name.as_str(), files));
         }
 
-        let mut modules_by_top: HashMap<String, Vec<ModuleEntry>> = HashMap::new();
-        for (name, files) in &scan_results.modules {
-            let lowered = name.to_lowercase();
-            let top = lowered
-                .split("::")
-                .next()
-                .unwrap_or(lowered.as_str())
-                .to_string();
-            modules_by_top
-                .entry(top)
-                .or_default()
-                .push((lowered, name.clone(), files));
-        }
+        let wanted_tops: HashSet<String> = indices
+            .iter()
+            .flat_map(|&i| gems[i].module_names.iter())
+            .map(|pattern| lower_top_segment(pattern))
+            .collect();
 
         MatchIndexes {
             requires,
             prefix_map,
             declared_require_paths: gems
                 .iter()
-                .flat_map(|gem| gem.require_paths.iter().cloned())
+                .flat_map(|gem| gem.require_paths.iter().map(String::as_str))
                 .collect(),
-            modules_by_top,
+            modules_by_top: index_modules(&scan_results.modules, wanted_tops),
             bundler_groups: &scan_results.bundler_groups,
             bundler_require_all: scan_results.bundler_require_all,
         }
@@ -123,7 +157,7 @@ fn build_gem_result(gem_entry: &GemEntry, meta: &GemMeta, indexes: &MatchIndexes
     // multi-segment name (e.g. "aws::s3"), so we look up by ITS top segment,
     // then match the full pattern below.
     for mod_pattern in &gem_entry.module_names {
-        let mod_down = mod_pattern.to_lowercase();
+        let mod_down = mod_pattern.to_ascii_lowercase();
         // Skip very short module names that cause false positives (e.g., "Cli", "Api")
         // UNLESS they match the gem name exactly (e.g. "aws", "jwt", "csv"),
         // its de-punctuated form, or any of its hyphen segments (>= 2 chars).
@@ -142,13 +176,13 @@ fn build_gem_result(gem_entry: &GemEntry, meta: &GemMeta, indexes: &MatchIndexes
         };
         let mod_len = mod_down.len();
         let mod_bytes = mod_down.as_bytes();
-        for (name_down, original_name, files) in entries {
-            // Match either an exact module name or a `mod_down::...` descendant,
-            // without allocating a `mod_down + "::"` string each iteration.
-            let nb = name_down.as_bytes();
+        for (original_name, files) in entries {
+            // Match either an exact module name or a `mod_down::...` descendant
+            // (ASCII case-insensitive), without allocating per candidate.
+            let nb = original_name.as_bytes();
             let matches = if nb.len() == mod_len {
-                nb == mod_bytes
-            } else if nb.len() > mod_len + 2 && nb.starts_with(mod_bytes) {
+                nb.eq_ignore_ascii_case(mod_bytes)
+            } else if nb.len() > mod_len + 2 && nb[..mod_len].eq_ignore_ascii_case(mod_bytes) {
                 nb[mod_len] == b':' && nb[mod_len + 1] == b':'
             } else {
                 false
@@ -156,7 +190,7 @@ fn build_gem_result(gem_entry: &GemEntry, meta: &GemMeta, indexes: &MatchIndexes
             if matches {
                 for f in *files {
                     evidence.push(Evidence::Module {
-                        name: original_name.clone(),
+                        name: original_name.to_string(),
                         file: f.clone(),
                     });
                 }
@@ -166,16 +200,14 @@ fn build_gem_result(gem_entry: &GemEntry, meta: &GemMeta, indexes: &MatchIndexes
     }
 
     // Determine status
-    let is_bundler_required = indexes.bundler_require_all
-        && gem_entry.groups.iter().any(|g| g == "default")
-        || gem_entry
-            .groups
-            .iter()
-            .any(|g| indexes.bundler_groups.contains(g));
+    let is_bundler_required = gem_entry.bundler_autorequired(|group| {
+        (indexes.bundler_require_all && group == "default")
+            || indexes.bundler_groups.contains(group)
+    });
 
     let status = if !found_files.is_empty() {
         GemStatus::Used
-    } else if is_bundler_required && !gem_entry.require_false {
+    } else if is_bundler_required {
         evidence.push(Evidence::BundlerRequire);
         GemStatus::BundlerRequired
     } else {
@@ -203,7 +235,7 @@ pub fn match_gem_subset(
     indices: &[usize],
     scan_results: &ScanResults,
 ) -> HashMap<String, GemResult> {
-    let indexes = MatchIndexes::build(gems, scan_results);
+    let indexes = MatchIndexes::build(gems, indices, scan_results);
 
     // Precompute per-gem lowercased forms once (avoids repeated allocations
     // inside the parallel match loop and per inner pattern iteration).
@@ -246,6 +278,7 @@ mod tests {
             module_names: module_names.iter().map(|s| s.to_string()).collect(),
             require_false: false,
             source: None,
+            declarations: Vec::new(),
         }
     }
 
@@ -270,6 +303,7 @@ mod tests {
             bundler_groups: HashSet::new(),
             bundler_require_all: false,
             script_files: Vec::new(),
+            storage_services: HashSet::new(),
         }
     }
 
@@ -464,6 +498,34 @@ mod tests {
     fn module_match_case_insensitive() {
         let gems = vec![gem("graphql", &[], &["GraphQL"])];
         let scan = scan(&[], &[("Graphql", "app.rb")]);
+        let results = match_gem_usage(&gems, &scan);
+        assert_eq!(results["graphql"].status, GemStatus::Used);
+    }
+
+    #[test]
+    fn module_index_skipped_without_module_patterns() {
+        let gems = vec![gem("failbot", &["failbot"], &[])];
+        let scan = scan(&[], &[("Failbot", "a.rb"), ("Other::Thing", "b.rb")]);
+        let indexes = MatchIndexes::build(&gems, &[0], &scan);
+        assert!(indexes.modules_by_top.is_empty());
+    }
+
+    #[test]
+    fn module_index_only_keeps_wanted_top_segments() {
+        let gems = vec![gem("graphql", &[], &["GraphQL::Batch"])];
+        let scan = scan(
+            &[],
+            &[("Graphql::Batch::Loader", "a.rb"), ("Other::Thing", "b.rb")],
+        );
+        let indexes = MatchIndexes::build(&gems, &[0], &scan);
+        assert_eq!(indexes.modules_by_top.len(), 1);
+        assert_eq!(
+            indexes.modules_by_top["graphql"],
+            vec![(
+                "Graphql::Batch::Loader",
+                &scan.modules["Graphql::Batch::Loader"]
+            )]
+        );
         let results = match_gem_usage(&gems, &scan);
         assert_eq!(results["graphql"].status, GemStatus::Used);
     }

@@ -133,18 +133,35 @@ impl Lockfile {
     }
 }
 
-pub fn parse_gemfile_lock(dir: &Path) -> Lockfile {
-    parse_lockfile_path(&dir.join("Gemfile.lock"))
+/// The lockfile Bundler pairs with `gemfile`: `gems.locked` for `gems.rb`,
+/// otherwise `<gemfile>.lock` (e.g. `gemfiles/rails7.gemfile.lock`).
+pub fn lockfile_path_for(gemfile: &Path) -> PathBuf {
+    if gemfile.file_name().is_some_and(|name| name == "gems.rb") {
+        return gemfile.with_file_name("gems.locked");
+    }
+    let mut path = gemfile.as_os_str().to_owned();
+    path.push(".lock");
+    PathBuf::from(path)
 }
 
+pub fn parse_gemfile_lock(dir: &Path) -> Lockfile {
+    parse_lockfile_path(&lockfile_path_for(&crate::gemfile::default_gemfile_path(
+        dir,
+    )))
+}
+
+/// Parse and merge the lockfiles belonging to the analyzed Gemfiles only.
 pub fn parse_gemfile_locks(root_dir: &Path, gemfile_paths: &[PathBuf]) -> Lockfile {
-    let mut lockfiles = vec![root_dir.join("Gemfile.lock")];
+    let mut lockfiles: Vec<PathBuf> = Vec::new();
     for gemfile in gemfile_paths {
-        if let Some(parent) = gemfile.parent() {
-            let lockfile = parent.join("Gemfile.lock");
-            if !lockfiles.contains(&lockfile) {
-                lockfiles.push(lockfile);
-            }
+        let gemfile = if gemfile.is_absolute() {
+            gemfile.clone()
+        } else {
+            root_dir.join(gemfile)
+        };
+        let lockfile = lockfile_path_for(&gemfile);
+        if !lockfiles.contains(&lockfile) {
+            lockfiles.push(lockfile);
         }
     }
 
@@ -173,30 +190,17 @@ fn parse_lockfile_path(lock_path: &Path) -> Lockfile {
     let mut current_artifact: Option<usize> = None;
     let mut current_source: Option<LockedSource> = None;
     let mut in_specs = false;
-    let mut in_platforms = false;
-    let mut platforms = Vec::new();
 
     for line in content.lines() {
         if !line.starts_with(' ') && !line.is_empty() {
             current_artifact = None;
             in_specs = false;
-            in_platforms = line == "PLATFORMS";
             current_source = match line {
                 "GEM" => Some(LockedSource::Registry),
                 "GIT" => Some(LockedSource::Git),
                 "PATH" => Some(LockedSource::Path),
                 _ => None,
             };
-            continue;
-        }
-
-        if in_platforms {
-            if let Some(platform) = line.strip_prefix("  ") {
-                let platform = platform.trim();
-                if !platform.is_empty() {
-                    platforms.push(platform.to_string());
-                }
-            }
             continue;
         }
 
@@ -229,10 +233,9 @@ fn parse_lockfile_path(lock_path: &Path) -> Lockfile {
         }
     }
 
-    platforms.sort_by_key(|platform| std::cmp::Reverse(platform.len()));
     let mut lockfile = Lockfile::default();
     for raw in raw_artifacts {
-        let (version, platform) = split_resolved_artifact(&raw.resolved, &platforms);
+        let (version, platform) = split_resolved_artifact(&raw.resolved);
         let dependencies = raw.dependencies;
         let artifact = LockedArtifact {
             version,
@@ -266,61 +269,35 @@ fn parse_spec_line(line: &str) -> Option<(String, String)> {
     Some((name.to_string(), resolved.to_string()))
 }
 
-fn split_resolved_artifact(resolved: &str, platforms: &[String]) -> (String, Option<String>) {
-    let mut suffixes: Vec<String> = platforms
-        .iter()
-        .filter(|platform| platform.as_str() != "ruby")
-        .flat_map(|platform| {
-            let mut suffixes = vec![platform.clone()];
-            if let Some(normalized) = normalize_os_versioned_platform(platform) {
-                suffixes.push(normalized);
-            }
-            suffixes
-        })
-        .collect();
-    suffixes.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
-    suffixes.dedup();
+/// Split `1.18.9-x86_64-linux-gnu` into version and platform the way Bundler's
+/// lockfile `NAME_VERSION` regex does: gem versions never contain `-`, so the
+/// platform is everything after the first `-`, whether or not it is listed
+/// under PLATFORMS.
+fn split_resolved_artifact(resolved: &str) -> (String, Option<String>) {
+    match resolved.split_once('-') {
+        Some((version, platform)) if !platform.is_empty() && platform != "ruby" => {
+            (version.to_string(), Some(platform.to_string()))
+        }
+        Some((version, _)) => (version.to_string(), None),
+        None => (resolved.to_string(), None),
+    }
+}
 
-    for platform in suffixes {
-        let suffix = format!("-{platform}");
-        if let Some(version) = resolved.strip_suffix(&suffix) {
-            return (version.to_string(), Some(platform));
+/// Number of unique gems reachable from `gem_name` (excluding the gem itself).
+pub fn count_transitive_deps(gem_name: &str, lock_deps: &HashMap<String, Vec<String>>) -> usize {
+    let mut visited: HashSet<&str> = HashSet::new();
+    let mut stack: Vec<&str> = vec![gem_name];
+    visited.insert(gem_name);
+    while let Some(current) = stack.pop() {
+        if let Some(deps) = lock_deps.get(current) {
+            for dep in deps {
+                if visited.insert(dep.as_str()) {
+                    stack.push(dep.as_str());
+                }
+            }
         }
     }
-    (resolved.to_string(), None)
-}
-
-fn normalize_os_versioned_platform(platform: &str) -> Option<String> {
-    let (base, version) = platform.rsplit_once('-')?;
-    (!version.is_empty() && version.bytes().all(|byte| byte.is_ascii_digit()))
-        .then(|| base.to_string())
-}
-
-pub fn count_transitive_deps(gem_name: &str, lock_deps: &HashMap<String, Vec<String>>) -> usize {
-    let mut visited = HashSet::new();
-    count_inner(gem_name, lock_deps, &mut visited)
-}
-
-fn count_inner(
-    gem_name: &str,
-    lock_deps: &HashMap<String, Vec<String>>,
-    visited: &mut HashSet<String>,
-) -> usize {
-    if visited.contains(gem_name) {
-        return 0;
-    }
-    visited.insert(gem_name.to_string());
-
-    let direct = match lock_deps.get(gem_name) {
-        Some(deps) => deps,
-        None => return 0,
-    };
-
-    let mut count = direct.len();
-    for dependency in direct {
-        count += count_inner(dependency, lock_deps, visited);
-    }
-    count
+    visited.len() - 1
 }
 
 #[cfg(test)]
@@ -424,6 +401,41 @@ PLATFORMS
     }
 
     #[test]
+    fn splits_native_platform_not_listed_in_platforms() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Gemfile.lock"),
+            "\
+GEM
+  remote: https://rubygems.org/
+  specs:
+    nokogiri (1.18.9)
+      racc (~> 1.4)
+    nokogiri (1.18.9-x86_64-linux-gnu)
+      racc (~> 1.4)
+
+PLATFORMS
+  ruby
+  x86_64-linux
+",
+        )
+        .unwrap();
+
+        let lockfile = parse_gemfile_lock(dir.path());
+        let native = &lockfile.artifacts("nokogiri")[1];
+        assert_eq!(native.version, "1.18.9");
+        assert_eq!(native.platform.as_deref(), Some("x86_64-linux-gnu"));
+        assert!(lockfile.has_platform_specific_registry_artifacts());
+        assert_eq!(
+            lockfile.preferred_registry_full_names("nokogiri", Some("x86_64-linux")),
+            vec![
+                "nokogiri-1.18.9-x86_64-linux-gnu".to_string(),
+                "nokogiri-1.18.9".to_string()
+            ]
+        );
+    }
+
+    #[test]
     fn detects_when_runtime_platform_is_needed() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
@@ -494,7 +506,18 @@ GIT
         let mut deps = HashMap::new();
         deps.insert("a".to_string(), vec!["b".to_string()]);
         deps.insert("b".to_string(), vec!["a".to_string()]);
-        assert_eq!(count_transitive_deps("a", &deps), 2);
+        // Only `b` is a dependency of `a`; the cycle back to `a` is not a new gem.
+        assert_eq!(count_transitive_deps("a", &deps), 1);
+    }
+
+    #[test]
+    fn count_transitive_deps_counts_shared_nodes_once() {
+        let mut deps = HashMap::new();
+        deps.insert("a".to_string(), vec!["b".to_string(), "c".to_string()]);
+        deps.insert("b".to_string(), vec!["d".to_string()]);
+        deps.insert("c".to_string(), vec!["d".to_string()]);
+        deps.insert("d".to_string(), vec!["a".to_string()]);
+        assert_eq!(count_transitive_deps("a", &deps), 3);
     }
 
     #[test]
@@ -503,38 +526,77 @@ GIT
         assert_eq!(count_transitive_deps("nonexistent", &deps), 0);
     }
 
-    #[test]
-    fn parse_multiple_gemfile_locks_merges_nearest_lockfiles() {
-        let dir = tempfile::tempdir().unwrap();
-        let engine = dir.path().join("engines/admin");
-        std::fs::create_dir_all(&engine).unwrap();
-        std::fs::write(
-            dir.path().join("Gemfile.lock"),
-            "\
+    const RAILS_LOCK: &str = "\
 GEM
   specs:
     rails (7.1.0)
       actionpack (= 7.1.0)
     actionpack (7.1.0)
-",
-        )
-        .unwrap();
-        std::fs::write(
-            engine.join("Gemfile.lock"),
-            "\
+";
+    const PUMA_LOCK: &str = "\
 GEM
   specs:
     puma (6.4.0)
       nio4r (~> 2.0)
     nio4r (2.7.0)
-",
-        )
-        .unwrap();
+";
 
-        let lockfile = parse_gemfile_locks(dir.path(), &[engine.join("Gemfile")]);
+    #[test]
+    fn parse_multiple_gemfile_locks_merges_each_gemfiles_lockfile() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = dir.path().join("engines/admin");
+        std::fs::create_dir_all(&engine).unwrap();
+        std::fs::write(dir.path().join("Gemfile.lock"), RAILS_LOCK).unwrap();
+        std::fs::write(engine.join("Gemfile.lock"), PUMA_LOCK).unwrap();
+
+        let lockfile = parse_gemfile_locks(
+            dir.path(),
+            &[dir.path().join("Gemfile"), engine.join("Gemfile")],
+        );
         assert_eq!(lockfile.dependencies()["rails"], vec!["actionpack"]);
         assert_eq!(lockfile.dependencies()["puma"], vec!["nio4r"]);
         assert_eq!(lockfile.artifacts("rails")[0].version, "7.1.0");
         assert_eq!(lockfile.artifacts("puma")[0].version, "6.4.0");
+    }
+
+    #[test]
+    fn parse_gemfile_locks_does_not_merge_unanalyzed_root_lockfile() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = dir.path().join("engines/admin");
+        std::fs::create_dir_all(&engine).unwrap();
+        std::fs::write(dir.path().join("Gemfile.lock"), RAILS_LOCK).unwrap();
+        std::fs::write(engine.join("Gemfile.lock"), PUMA_LOCK).unwrap();
+
+        let lockfile = parse_gemfile_locks(dir.path(), &[engine.join("Gemfile")]);
+        assert!(!lockfile.dependencies().contains_key("rails"));
+        assert_eq!(lockfile.dependencies()["puma"], vec!["nio4r"]);
+    }
+
+    #[test]
+    fn named_gemfile_uses_its_own_lockfile() {
+        let dir = tempfile::tempdir().unwrap();
+        let gemfiles = dir.path().join("gemfiles");
+        std::fs::create_dir_all(&gemfiles).unwrap();
+        std::fs::write(dir.path().join("Gemfile.lock"), RAILS_LOCK).unwrap();
+        std::fs::write(gemfiles.join("rails7.gemfile.lock"), PUMA_LOCK).unwrap();
+
+        let lockfile = parse_gemfile_locks(dir.path(), &[PathBuf::from("gemfiles/rails7.gemfile")]);
+        assert!(!lockfile.dependencies().contains_key("rails"));
+        assert_eq!(lockfile.dependencies()["puma"], vec!["nio4r"]);
+    }
+
+    #[test]
+    fn gems_rb_uses_gems_locked() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("gems.rb"), "gem 'puma'\n").unwrap();
+        std::fs::write(dir.path().join("gems.locked"), PUMA_LOCK).unwrap();
+        assert_eq!(
+            lockfile_path_for(&dir.path().join("gems.rb")),
+            dir.path().join("gems.locked")
+        );
+        assert_eq!(
+            parse_gemfile_lock(dir.path()).dependencies()["puma"],
+            vec!["nio4r"]
+        );
     }
 }
