@@ -5,7 +5,7 @@ use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Serialize};
 
-const CACHE_VERSION: u32 = 7; // bumped: lexical masking changes source findings
+const CACHE_VERSION: u32 = 8; // bumped: entries carry Active Storage attachment services
 const CACHE_FILE: &str = ".unused_gems_cache";
 
 #[derive(Serialize, Deserialize)]
@@ -19,6 +19,21 @@ pub(crate) struct CacheEntry {
     pub(crate) modules: Vec<String>,
     pub(crate) bundler_groups: Vec<String>,
     pub(crate) bundler_require_all: bool,
+    pub(crate) storage_services: Vec<String>,
+}
+
+/// Scan result for one file, produced by the walker on a cache miss and
+/// applied to the cache afterwards.
+#[derive(Debug, Clone)]
+pub struct CacheUpdate {
+    pub rel_path: String,
+    pub mtime: SystemTime,
+    pub size: u64,
+    pub requires: Vec<String>,
+    pub modules: Vec<String>,
+    pub bundler_groups: Vec<String>,
+    pub bundler_require_all: bool,
+    pub storage_services: Vec<String>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -93,6 +108,7 @@ impl FileCache {
                 modules: entry.modules.clone(),
                 bundler_groups: entry.bundler_groups.clone(),
                 bundler_require_all: entry.bundler_require_all,
+                storage_services: entry.storage_services.clone(),
             })
         } else {
             None
@@ -134,40 +150,32 @@ impl FileCache {
     }
 
     /// Insert/update a cache entry.
-    #[allow(clippy::too_many_arguments)]
-    pub fn put(
-        &mut self,
-        rel_path: String,
-        mtime: SystemTime,
-        size: u64,
-        requires: &[String],
-        modules: Vec<String>,
-        bundler_groups: &[String],
-        bundler_require_all: bool,
-    ) {
+    pub fn put(&mut self, update: CacheUpdate) {
         #[cfg(not(unix))]
         let content_fingerprint = self
             .cache_path
             .parent()
-            .map(|root| content_fingerprint(&root.join(&rel_path)))
+            .map(|root| content_fingerprint(&root.join(&update.rel_path)))
             .unwrap_or_default();
-        let duration = mtime
+        let duration = update
+            .mtime
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap_or_default();
         let mtime_secs = duration.as_secs();
         let mtime_nanos = duration.subsec_nanos();
         self.entries.lock().unwrap().insert(
-            rel_path,
+            update.rel_path,
             CacheEntry {
                 mtime_secs,
                 mtime_nanos,
-                size,
+                size: update.size,
                 #[cfg(not(unix))]
                 content_fingerprint,
-                requires: requires.to_vec(),
-                modules,
-                bundler_groups: bundler_groups.to_vec(),
-                bundler_require_all,
+                requires: update.requires,
+                modules: update.modules,
+                bundler_groups: update.bundler_groups,
+                bundler_require_all: update.bundler_require_all,
+                storage_services: update.storage_services,
             },
         );
         self.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -229,6 +237,19 @@ mod tests {
     use super::*;
     use std::time::{Duration, SystemTime};
 
+    fn update(rel_path: &str, mtime: SystemTime, size: u64) -> CacheUpdate {
+        CacheUpdate {
+            rel_path: rel_path.to_string(),
+            mtime,
+            size,
+            requires: Vec::new(),
+            modules: Vec::new(),
+            bundler_groups: Vec::new(),
+            bundler_require_all: false,
+            storage_services: Vec::new(),
+        }
+    }
+
     #[test]
     fn disabled_cache() {
         let cache = FileCache::disabled();
@@ -244,15 +265,13 @@ mod tests {
         assert!(cache.is_enabled());
 
         let mtime = SystemTime::UNIX_EPOCH + Duration::from_secs(1000000);
-        cache.put(
-            "app/foo.rb".to_string(),
-            mtime,
-            42,
-            &["foo".to_string()],
-            vec!["Foo".to_string()],
-            &["default".to_string()],
-            false,
-        );
+        cache.put(CacheUpdate {
+            requires: vec!["foo".to_string()],
+            modules: vec!["Foo".to_string()],
+            bundler_groups: vec!["default".to_string()],
+            storage_services: vec!["amazon".to_string()],
+            ..update("app/foo.rb", mtime, 42)
+        });
 
         let entry = cache.get("app/foo.rb", mtime, 42);
         assert!(entry.is_some());
@@ -261,6 +280,7 @@ mod tests {
         assert_eq!(entry.modules, vec!["Foo"]);
         assert_eq!(entry.bundler_groups, vec!["default"]);
         assert!(!entry.bundler_require_all);
+        assert_eq!(entry.storage_services, vec!["amazon"]);
     }
 
     #[test]
@@ -268,7 +288,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut cache = FileCache::load(dir.path());
         let mtime = SystemTime::UNIX_EPOCH + Duration::from_secs(1000000);
-        cache.put("f.rb".to_string(), mtime, 42, &[], vec![], &[], false);
+        cache.put(update("f.rb", mtime, 42));
 
         let other_mtime = mtime + Duration::from_secs(1);
         assert!(cache.get("f.rb", other_mtime, 42).is_none());
@@ -279,7 +299,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut cache = FileCache::load(dir.path());
         let mtime = SystemTime::UNIX_EPOCH + Duration::from_secs(1000000);
-        cache.put("f.rb".to_string(), mtime, 42, &[], vec![], &[], false);
+        cache.put(update("f.rb", mtime, 42));
 
         assert!(cache.get("f.rb", mtime, 99).is_none());
     }
@@ -289,7 +309,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut cache = FileCache::load(dir.path());
         let mtime = SystemTime::UNIX_EPOCH + Duration::new(1000000, 1000);
-        cache.put("f.rb".to_string(), mtime, 42, &[], vec![], &[], false);
+        cache.put(update("f.rb", mtime, 42));
 
         // Use a difference >= 200ns to exceed Windows FILETIME 100ns granularity
         let other_mtime = SystemTime::UNIX_EPOCH + Duration::new(1000000, 1200);
@@ -303,15 +323,12 @@ mod tests {
 
         {
             let mut cache = FileCache::load(dir.path());
-            cache.put(
-                "app/bar.rb".to_string(),
-                mtime,
-                100,
-                &["bar".to_string()],
-                vec!["Bar".to_string()],
-                &[],
-                true,
-            );
+            cache.put(CacheUpdate {
+                requires: vec!["bar".to_string()],
+                modules: vec!["Bar".to_string()],
+                bundler_require_all: true,
+                ..update("app/bar.rb", mtime, 100)
+            });
             cache.save();
         }
 
@@ -346,6 +363,7 @@ mod tests {
                         modules: vec![],
                         bundler_groups: vec![],
                         bundler_require_all: false,
+                        storage_services: vec![],
                     },
                 );
                 m

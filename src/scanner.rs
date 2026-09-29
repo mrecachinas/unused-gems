@@ -29,6 +29,8 @@ static REQUIRE_FINDER: Lazy<memmem::Finder<'static>> =
 static AUTOLOAD_FINDER: Lazy<memmem::Finder<'static>> =
     Lazy::new(|| memmem::Finder::new(b"autoload"));
 static GEM_DOT_FINDER: Lazy<memmem::Finder<'static>> = Lazy::new(|| memmem::Finder::new(b"Gem."));
+static ATTACHED_FINDER: Lazy<memmem::Finder<'static>> =
+    Lazy::new(|| memmem::Finder::new(b"_attached"));
 static BUNDLER_REQUIRE_FINDER: Lazy<memmem::Finder<'static>> =
     Lazy::new(|| memmem::Finder::new(b"Bundler.require"));
 const RAILS_GROUP_CONDITION_PREFIX: &str = "__rails_group_condition__:";
@@ -2075,16 +2077,140 @@ fn collect_middleware_refs<'a>(bytes: &'a [u8], mask: &[u8], names: &mut FileMod
     }
 }
 
+/// Collect Active Storage service names from attachment declarations such as
+/// `has_one_attached :avatar, service: :amazon` (including multi-line calls and
+/// lambdas like `service: ->(u) { u.eu? ? :europe : :usa }`). Only unmasked
+/// code is considered, so comments and string contents are ignored.
+fn collect_attachment_services(bytes: &[u8], mask: &[u8], services: &mut Vec<String>) {
+    const MAX_STATEMENT_LINES: usize = 20;
+    let finder = &*ATTACHED_FINDER;
+    let mut pos = 0;
+    while let Some(idx) = finder.find(&bytes[pos..]) {
+        let hit = pos + idx;
+        pos = hit + 1;
+        let start = if hit >= 7 && &bytes[hit - 7..hit] == b"has_one" {
+            hit - 7
+        } else if hit >= 8 && &bytes[hit - 8..hit] == b"has_many" {
+            hit - 8
+        } else {
+            continue;
+        };
+        let after = hit + b"_attached".len();
+        if is_skipped(mask, start)
+            || (start > 0 && (is_word_char(bytes[start - 1]) || bytes[start - 1] == b':'))
+            || bytes.get(after).is_some_and(|&b| is_word_char(b))
+        {
+            continue;
+        }
+
+        // Walk the call's argument list until the statement ends.
+        let mut i = after;
+        let mut depth = 0i32;
+        let mut lines = 0;
+        let mut last_significant = 0u8;
+        let mut service_depth: Option<i32> = None;
+        while i < bytes.len() {
+            let b = bytes[i];
+            if is_skipped(mask, i) {
+                i += 1;
+                continue;
+            }
+            match b {
+                b'\n' => {
+                    if depth <= 0
+                        && !matches!(last_significant, b',' | b'\\' | b'(' | b'{' | b'[' | b':')
+                    {
+                        break;
+                    }
+                    lines += 1;
+                    if lines > MAX_STATEMENT_LINES {
+                        break;
+                    }
+                }
+                b'(' | b'[' | b'{' => depth += 1,
+                b')' | b']' | b'}' => {
+                    depth -= 1;
+                    if depth < 0 {
+                        break;
+                    }
+                    if service_depth.is_some_and(|d| depth < d) {
+                        service_depth = None;
+                    }
+                }
+                b',' if service_depth == Some(depth) => service_depth = None,
+                b';' if depth == 0 => break,
+                b'd' if depth == 0
+                    && bytes[i..].starts_with(b"do")
+                    && !is_word_char(bytes[i - 1])
+                    && !bytes.get(i + 2).is_some_and(|&c| is_word_char(c)) =>
+                {
+                    break;
+                }
+                b's' if service_depth.is_none()
+                    && bytes[i..].starts_with(b"service")
+                    && !is_word_char(bytes[i - 1]) =>
+                {
+                    let key_end = i + b"service".len();
+                    let label =
+                        bytes.get(key_end) == Some(&b':') && bytes.get(key_end + 1) != Some(&b':');
+                    let rocket = bytes[i - 1] == b':' && {
+                        let arrow = skip_whitespace_inline(bytes, key_end);
+                        bytes[arrow..].starts_with(b"=>")
+                    };
+                    if label || rocket {
+                        service_depth = Some(depth);
+                        last_significant = b':';
+                        i = if label {
+                            key_end + 1
+                        } else {
+                            skip_whitespace_inline(bytes, key_end) + 2
+                        };
+                        let value = skip_whitespace_inline(bytes, i);
+                        if let Some((name, _)) = extract_quoted(bytes, value) {
+                            if let Ok(name) = std::str::from_utf8(name) {
+                                services.push(name.to_string());
+                            }
+                        }
+                        continue;
+                    }
+                }
+                b':' if service_depth.is_some()
+                    && bytes.get(i + 1).is_some_and(|&c| is_word_char(c))
+                    && !is_word_char(bytes[i - 1])
+                    && bytes[i - 1] != b':' =>
+                {
+                    let sym_start = i + 1;
+                    let mut sym_end = sym_start;
+                    while sym_end < bytes.len() && is_word_char(bytes[sym_end]) {
+                        sym_end += 1;
+                    }
+                    if let Ok(name) = std::str::from_utf8(&bytes[sym_start..sym_end]) {
+                        services.push(name.to_string());
+                    }
+                    last_significant = b'_';
+                    i = sym_end;
+                    continue;
+                }
+                _ => {}
+            }
+            if !b.is_ascii_whitespace() {
+                last_significant = b;
+            }
+            i += 1;
+        }
+    }
+}
+
+#[inline]
+fn skip_whitespace_inline(bytes: &[u8], mut i: usize) -> usize {
+    while i < bytes.len() && matches!(bytes[i], b' ' | b'\t') {
+        i += 1;
+    }
+    i
+}
+
 /// Type alias for cache update entries collected during the walk
-pub type CacheUpdate = (
-    String,
-    std::time::SystemTime,
-    u64,
-    Vec<String>,
-    Vec<String>,
-    Vec<String>,
-    bool,
-);
+pub type CacheUpdate = crate::cache::CacheUpdate;
 
 type ScriptFileList = Vec<(String, Vec<u8>)>;
 type ModuleMap = Vec<HashMap<String, HashSet<Arc<str>>>>;
@@ -2293,6 +2419,7 @@ pub fn scan_source_tree_with_threads_and_explicit_skips(
                                 modules: Vec::new(),
                                 bundler_groups: entry.bundler_groups.clone(),
                                 bundler_require_all: entry.bundler_require_all,
+                                storage_services: entry.storage_services.clone(),
                             };
                             cache_shared.reinsert(rel.to_string(), entry);
                             flush_buf.buf.push(file_result);
@@ -2310,15 +2437,16 @@ pub fn scan_source_tree_with_threads_and_explicit_skips(
                                 let file_modules = std::mem::take(&mut file_result.modules);
                                 if use_cache {
                                     if let Some(ref md) = metadata {
-                                        flush_buf.cache_buf.push((
-                                            file_result.rel_path.clone(),
-                                            cache_timestamp,
-                                            md.len(),
-                                            file_result.requires.clone(),
-                                            file_modules,
-                                            file_result.bundler_groups.clone(),
-                                            file_result.bundler_require_all,
-                                        ));
+                                        flush_buf.cache_buf.push(CacheUpdate {
+                                            rel_path: file_result.rel_path.clone(),
+                                            mtime: cache_timestamp,
+                                            size: md.len(),
+                                            requires: file_result.requires.clone(),
+                                            modules: file_modules,
+                                            bundler_groups: file_result.bundler_groups.clone(),
+                                            bundler_require_all: file_result.bundler_require_all,
+                                            storage_services: file_result.storage_services.clone(),
+                                        });
                                     }
                                 }
                                 flush_buf.buf.push(file_result);
@@ -2359,8 +2487,10 @@ pub fn scan_source_tree_with_threads_and_explicit_skips(
     let mut modules: HashMap<String, HashSet<String>> = HashMap::new();
     let mut bundler_groups: HashSet<String> = HashSet::new();
     let mut bundler_require_all = false;
+    let mut storage_services: HashSet<String> = HashSet::new();
 
     for r in all_results {
+        storage_services.extend(r.storage_services);
         for req in &r.requires {
             requires
                 .entry(req.clone())
@@ -2406,6 +2536,7 @@ pub fn scan_source_tree_with_threads_and_explicit_skips(
             bundler_groups,
             bundler_require_all,
             script_files: all_script_files,
+            storage_services,
         },
         all_cache_updates,
     )
@@ -2587,6 +2718,11 @@ fn scan_file_bytes_with(
     let mut requires = Vec::new();
     let mut bundler_groups = Vec::new();
     let mut bundler_require_all = false;
+    let mut storage_services = Vec::new();
+
+    if is_ruby && ATTACHED_FINDER.find(bytes).is_some() {
+        collect_attachment_services(bytes, &mask, &mut storage_services);
+    }
 
     if has_ruby_scan_tokens {
         scan_requires_filtered(bytes, &mask, &mut requires);
@@ -2652,6 +2788,7 @@ fn scan_file_bytes_with(
         modules: file_modules,
         bundler_groups,
         bundler_require_all,
+        storage_services,
     })
 }
 
@@ -3767,8 +3904,8 @@ require 'real_regex'
 
         // Apply cache updates
         let mut cache_mut = crate::cache::FileCache::load(dir.path());
-        for (rp, mt, sz, reqs, mods, bg, ba) in updates {
-            cache_mut.put(rp, mt, sz, &reqs, mods, &bg, ba);
+        for update in updates {
+            cache_mut.put(update);
         }
         cache_mut.save();
 
@@ -3788,8 +3925,8 @@ require 'real_regex'
         let cache = std::sync::Arc::new(crate::cache::FileCache::load(dir.path()));
         let (_, updates) = scan_source_tree(dir.path(), &[], cache);
         let mut cache = crate::cache::FileCache::load(dir.path());
-        for (rp, mt, sz, reqs, mods, bg, ba) in updates {
-            cache.put(rp, mt, sz, &reqs, mods, &bg, ba);
+        for update in updates {
+            cache.put(update);
         }
         cache.save();
 
@@ -3858,6 +3995,45 @@ require 'real_regex'
     }
 
     #[test]
+    fn attachment_services_are_collected_from_code_only() {
+        let input = b"class User\n  has_one_attached :avatar, service: :amazon, dependent: :purge\n  has_many_attached :docs,\n    service: ->(u) { u.eu? ? :europe : :usa }\n  has_one_attached :legacy, :service => :old_disk\n  has_one_attached :named, service: \"quoted\"\n  # has_one_attached :x, service: :commented\n  s = \"has_one_attached :y, service: :in_string\"\n  has_one_attached :plain\n  validates :name, service: :not_attachment\nend\n";
+        let mask = build_skip_mask(input, true, LineCommentKind::Hash);
+        let mut services = Vec::new();
+        collect_attachment_services(input, &mask, &mut services);
+        services.sort();
+        assert_eq!(
+            services,
+            vec!["amazon", "europe", "old_disk", "quoted", "usa"]
+        );
+    }
+
+    #[test]
+    fn attachment_services_survive_cache_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("user.rb"),
+            "has_one_attached :avatar, service: :amazon\n",
+        )
+        .unwrap();
+        let cache = Arc::new(crate::cache::FileCache::load(dir.path()));
+        let (first, updates) = scan_source_tree(dir.path(), &[], cache);
+        assert!(first.storage_services.contains("amazon"));
+        let mut cache = crate::cache::FileCache::load(dir.path());
+        for update in updates {
+            cache.put(update);
+        }
+        cache.save();
+
+        let cache = Arc::new(crate::cache::FileCache::load(dir.path()));
+        let (second, updates) = scan_source_tree(dir.path(), &[], cache);
+        assert!(
+            updates.is_empty(),
+            "second scan should be served from cache"
+        );
+        assert!(second.storage_services.contains("amazon"));
+    }
+
+    #[test]
     fn scan_file_reports_unique_modules_per_file() {
         let dir = tempfile::tempdir().unwrap();
         let rb = dir.path().join("a.rb");
@@ -3900,7 +4076,7 @@ require 'real_regex'
         assert_eq!(uncached.modules.len(), 90_000);
         assert_eq!(cached.modules.len(), 90_000);
         assert_eq!(updates.len(), 1500);
-        assert!(updates.iter().all(|update| update.4.len() == 60));
+        assert!(updates.iter().all(|update| update.modules.len() == 60));
         assert!(
             cached_time <= uncached_time * 4 + std::time::Duration::from_millis(500),
             "cold cached scan {cached_time:?} vs uncached {uncached_time:?}"
