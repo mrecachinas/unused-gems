@@ -130,9 +130,11 @@ pub fn print_results_text(
                         } => println!("    → {} in {}", mod_name, file),
                         Evidence::Script { file } => println!("    → script ref in {}", file),
                         Evidence::BundlerRequire => println!("    → Bundler.require"),
-                        Evidence::DatabaseAdapter { adapter } => {
-                            println!("    → adapter: {} in config/database.yml", adapter)
-                        }
+                        Evidence::DatabaseAdapter {
+                            adapter,
+                            kind,
+                            source,
+                        } => println!("    → {}: {} in {}", adapter_label(kind), adapter, source),
                     }
                 }
                 println!();
@@ -359,6 +361,16 @@ pub fn print_results_github(
     unused_count
 }
 
+fn adapter_label(kind: &str) -> &'static str {
+    match kind {
+        "database" => "database adapter",
+        "cable" => "cable adapter",
+        "storage" => "storage service",
+        "cache" => "cache store",
+        _ => "adapter",
+    }
+}
+
 fn summarize_evidence(evidence: &[Evidence]) -> String {
     let mut parts = Vec::new();
     let mut require_count = 0;
@@ -370,7 +382,7 @@ fn summarize_evidence(evidence: &[Evidence]) -> String {
             Evidence::Module { .. } => module_count += 1,
             Evidence::Script { .. } => script_count += 1,
             Evidence::BundlerRequire => parts.push("bundler_require".to_string()),
-            Evidence::DatabaseAdapter { adapter } => parts.push(format!("adapter:{}", adapter)),
+            Evidence::DatabaseAdapter { adapter, .. } => parts.push(format!("adapter:{}", adapter)),
         }
     }
     if require_count > 0 {
@@ -564,6 +576,8 @@ mod tests {
             Evidence::BundlerRequire,
             Evidence::DatabaseAdapter {
                 adapter: "pg".into(),
+                kind: "database".into(),
+                source: "config/database.yml".into(),
             },
         ];
         let s = summarize_evidence(&evidence);
@@ -749,6 +763,8 @@ mod tests {
                     Evidence::BundlerRequire,
                     Evidence::DatabaseAdapter {
                         adapter: "pg".into(),
+                        kind: "database".into(),
+                        source: "config/database.yml".into(),
                     },
                 ],
                 gem: make_gem_entry("rails", &["default"]),
@@ -776,5 +792,21 @@ mod tests {
         let lock_deps = HashMap::new();
         let count = print_results_text(&results, false, &lock_deps);
         assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn adapter_evidence_serializes_kind_and_source() {
+        let evidence = Evidence::DatabaseAdapter {
+            adapter: "redis".into(),
+            kind: "cable".into(),
+            source: "config/cable.yml".into(),
+        };
+        let json = serde_json::to_value(&evidence).unwrap();
+        assert_eq!(json["type"], "database_adapter");
+        assert_eq!(json["adapter"], "redis");
+        assert_eq!(json["kind"], "cable");
+        assert_eq!(json["source"], "config/cable.yml");
+        assert_eq!(adapter_label("cable"), "cable adapter");
+        assert_eq!(adapter_label("cache"), "cache store");
     }
 }

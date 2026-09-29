@@ -168,6 +168,15 @@ adapters:
 
 Adapter entries map the value used in Rails config to the gem that provides it.
 
+Built-in mappings cover common database adapters (including `postgis`, `sqlserver`,
+`oracle_enhanced` and `cockroachdb`, which credit both the ActiveRecord adapter gem and
+its driver), static `url:` schemes in `config/database.yml` (`postgres://`, `mysql2://`,
+`sqlite3:`, `trilogy://`, or a literal default inside
+`<%= ENV.fetch("DATABASE_URL", "…") %>`), and unknown database adapters fall back to a
+gem named after the adapter or `activerecord-<adapter>-adapter`. Rails' built-in
+backends (`async`/`inline`/`test` cable adapters, `Disk`/`Mirror` storage services,
+`memory_store`/`file_store`/`null_store` caches) credit no gem.
+
 ## Performance
 
 Built with Rust for maximum performance:

@@ -394,24 +394,31 @@ fn main() {
         matcher::match_gem_usage(&gems, &scan_results)
     );
 
-    // 4b. Merge database adapter evidence (computed in concurrent init)
-    let all_adapter_sources: Vec<(&HashMap<String, String>, &str)> = vec![
-        (&db_adapters, "config/database.yml"),
-        (&cable_adapters, "config/cable.yml"),
-        (&storage_adapters, "config/storage.yml"),
-        (&cache_config_adapters, "config/environments"),
-    ];
-    for (adapter_map, source_file) in &all_adapter_sources {
-        for (gem_name, adapter) in *adapter_map {
-            if let Some(result) = results.get_mut(gem_name) {
-                result.evidence.push(types::Evidence::DatabaseAdapter {
-                    adapter: adapter.clone(),
-                });
-                if result.status != GemStatus::Used {
-                    result.files.push(source_file.to_string());
-                    result.files.sort();
-                    result.status = GemStatus::Used;
-                }
+    // 4b. Merge adapter evidence (computed in concurrent init)
+    let mut adapter_evidence: Vec<(&str, &str, &str, &str)> = Vec::new();
+    for (adapter_map, kind, source) in [
+        (&db_adapters, "database", "config/database.yml"),
+        (&cable_adapters, "cable", "config/cable.yml"),
+        (&storage_adapters, "storage", "config/storage.yml"),
+    ] {
+        for (gem_name, adapter) in adapter_map {
+            adapter_evidence.push((gem_name, adapter, kind, source));
+        }
+    }
+    for (gem_name, (store, source)) in &cache_config_adapters {
+        adapter_evidence.push((gem_name, store, "cache", source));
+    }
+    for (gem_name, adapter, kind, source) in adapter_evidence {
+        if let Some(result) = results.get_mut(gem_name) {
+            result.evidence.push(types::Evidence::DatabaseAdapter {
+                adapter: adapter.to_string(),
+                kind: kind.to_string(),
+                source: source.to_string(),
+            });
+            if result.status != GemStatus::Used {
+                result.files.push(source.to_string());
+                result.files.sort();
+                result.status = GemStatus::Used;
             }
         }
     }
@@ -724,17 +731,19 @@ fn capitalize(s: &str) -> String {
 /// scanners below only match static `key: value` lines, which work fine on raw
 /// `.yml.erb` source.
 fn read_yaml_or_erb(yml_path: &std::path::Path) -> Option<String> {
+    read_yaml_or_erb_raw(yml_path).map(|c| strip_erb_blocks(&c))
+}
+
+fn read_yaml_or_erb_raw(yml_path: &std::path::Path) -> Option<String> {
     if let Ok(c) = std::fs::read_to_string(yml_path) {
-        return Some(strip_erb_blocks(&c));
+        return Some(c);
     }
     let erb_path = {
         let mut s = yml_path.as_os_str().to_owned();
         s.push(".erb");
         std::path::PathBuf::from(s)
     };
-    std::fs::read_to_string(&erb_path)
-        .ok()
-        .map(|c| strip_erb_blocks(&c))
+    std::fs::read_to_string(&erb_path).ok()
 }
 
 fn strip_erb_blocks(input: &str) -> String {
@@ -780,20 +789,36 @@ fn scan_database_adapters(
     overrides: &adapters::AdapterOverrides,
 ) -> std::collections::HashMap<String, String> {
     let db_yml = dir.join("config").join("database.yml");
-    let content = match read_yaml_or_erb(&db_yml) {
+    let raw = match read_yaml_or_erb_raw(&db_yml) {
         Some(c) => c,
         None => return std::collections::HashMap::new(),
     };
+    let content = strip_erb_blocks(&raw);
 
     static ADAPTER_RE: once_cell::sync::Lazy<regex::Regex> = once_cell::sync::Lazy::new(|| {
         regex::Regex::new(r"(?m)^[ \t]*adapter:[ \t]*(\S+)").unwrap()
     });
+    // `url:` values are read from the raw source so an ERB literal default
+    // (`ENV.fetch("DATABASE_URL", "postgres://…")`) can supply the scheme.
+    static URL_RE: once_cell::sync::Lazy<regex::Regex> = once_cell::sync::Lazy::new(|| {
+        regex::Regex::new(r"(?m)^[ \t]*url:[ \t]*(.+?)[ \t]*$").unwrap()
+    });
+
+    let mut found: Vec<String> = ADAPTER_RE
+        .captures_iter(&content)
+        .map(|cap| cap[1].trim_matches(|c| c == '\'' || c == '"').to_string())
+        .collect();
+    found.extend(
+        URL_RE
+            .captures_iter(&raw)
+            .filter_map(|cap| adapters::database_url_adapter(&cap[1])),
+    );
 
     let mut adapters = std::collections::HashMap::new();
-    for cap in ADAPTER_RE.captures_iter(&content) {
-        let adapter = cap[1].trim_matches(|c| c == '\'' || c == '"');
-        let gem_name = adapters::database_gem(adapter, overrides);
-        adapters.insert(gem_name.to_string(), adapter.to_string());
+    for adapter in found {
+        for gem_name in adapters::database_gems(&adapter, overrides) {
+            adapters.insert(gem_name, adapter.clone());
+        }
     }
     adapters
 }
@@ -816,8 +841,9 @@ fn scan_cable_adapters(
     let mut adapters = std::collections::HashMap::new();
     for cap in ADAPTER_RE.captures_iter(&content) {
         let adapter = cap[1].trim_matches(|c| c == '\'' || c == '"');
-        let gem_name = adapters::cable_gem(adapter, overrides);
-        adapters.insert(gem_name.to_string(), adapter.to_string());
+        if let Some(gem_name) = adapters::cable_gem(adapter, overrides) {
+            adapters.insert(gem_name, adapter.to_string());
+        }
     }
     adapters
 }
@@ -930,10 +956,11 @@ fn scan_storage_adapters(
 }
 
 /// Scan config/environments/*.rb and config/application.rb for cache_store settings.
+/// Maps gem → (store, relative source file).
 fn scan_cache_config(
     dir: &std::path::Path,
     overrides: &adapters::AdapterOverrides,
-) -> std::collections::HashMap<String, String> {
+) -> std::collections::HashMap<String, (String, String)> {
     static CACHE_RE: once_cell::sync::Lazy<regex::Regex> = once_cell::sync::Lazy::new(|| {
         regex::Regex::new(
             r"(?m)^[ \t]*(?:config|Rails\.application\.config)\.cache_store\s*=\s*:(\w+)",
@@ -964,7 +991,12 @@ fn scan_cache_config(
             let store = &cap[1];
             let gem_name = adapters::cache_gem(store, overrides);
             if let Some(gem) = gem_name {
-                adapters.insert(gem.to_string(), store.to_string());
+                let source = file
+                    .strip_prefix(dir)
+                    .unwrap_or(&file)
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                adapters.insert(gem, (store.to_string(), source));
             }
         }
     }
@@ -1180,6 +1212,53 @@ mod tests {
     }
 
     #[test]
+    fn scan_database_adapters_maps_third_party_adapters_and_urls() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = tmp.path().join("config");
+        std::fs::create_dir_all(&cfg).unwrap();
+        std::fs::write(
+            cfg.join("database.yml"),
+            "default:\n  adapter: postgis\nother:\n  adapter: sqlserver\ndev:\n  url: mysql2://localhost/app\nt:\n  adapter: \"trilogy\" # comment\nprod:\n  url: <%= ENV.fetch(\"DATABASE_URL\", \"sqlite3:db/prod.sqlite3\") %>\n",
+        )
+        .unwrap();
+
+        let adapters = scan_database_adapters(tmp.path(), &adapters::AdapterOverrides::default());
+        for (gem, adapter) in [
+            ("activerecord-postgis-adapter", "postgis"),
+            ("pg", "postgis"),
+            ("activerecord-sqlserver-adapter", "sqlserver"),
+            ("tiny_tds", "sqlserver"),
+            ("mysql2", "mysql2"),
+            ("trilogy", "trilogy"),
+            ("sqlite3", "sqlite3"),
+        ] {
+            assert_eq!(
+                adapters.get(gem).map(String::as_str),
+                Some(adapter),
+                "{gem}"
+            );
+        }
+        assert!(!adapters.contains_key("postgis"));
+        assert!(!adapters.contains_key("sqlserver"));
+    }
+
+    #[test]
+    fn scan_cable_adapters_skips_builtin_adapters() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = tmp.path().join("config");
+        std::fs::create_dir_all(&cfg).unwrap();
+        std::fs::write(
+            cfg.join("cable.yml"),
+            "development:\n  adapter: async\ntest:\n  adapter: test\nproduction:\n  adapter: redis\n",
+        )
+        .unwrap();
+
+        let adapters = scan_cable_adapters(tmp.path(), &adapters::AdapterOverrides::default());
+        assert_eq!(adapters.len(), 1);
+        assert_eq!(adapters.get("redis").map(String::as_str), Some("redis"));
+    }
+
+    #[test]
     fn strip_erb_blocks_preserves_static_yaml_lines() {
         let stripped =
             strip_erb_blocks("<% if ENV['DATABASE_URL'] %>\n  adapter: postgresql\n<% end %>\n");
@@ -1286,6 +1365,28 @@ mod tests {
 
         let adapters = scan_cache_config(tmp.path(), &adapters::AdapterOverrides::default());
         assert!(!adapters.contains_key("dalli"));
+    }
+
+    #[test]
+    fn scan_cache_config_records_source_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = tmp.path().join("config").join("environments");
+        std::fs::create_dir_all(&cfg).unwrap();
+        std::fs::write(
+            cfg.join("production.rb"),
+            "config.cache_store = :redis_cache_store\nconfig.cache_store = :memory_store\n",
+        )
+        .unwrap();
+
+        let adapters = scan_cache_config(tmp.path(), &adapters::AdapterOverrides::default());
+        assert_eq!(adapters.len(), 1);
+        assert_eq!(
+            adapters.get("redis"),
+            Some(&(
+                "redis_cache_store".to_string(),
+                "config/environments/production.rb".to_string()
+            ))
+        );
     }
 
     #[test]
