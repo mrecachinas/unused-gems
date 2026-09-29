@@ -140,8 +140,12 @@ pub enum GemSource {
 pub struct FileResult {
     pub rel_path: String,
     pub requires: Vec<String>,
+    /// Unique constant names referenced by this file (reused for cache entries).
+    pub modules: Vec<String>,
     pub bundler_groups: Vec<String>,
     pub bundler_require_all: bool,
+    /// Active Storage services named by `has_*_attached ..., service: :name`.
+    pub storage_services: Vec<String>,
 }
 
 #[derive(Debug, Default)]
@@ -152,6 +156,8 @@ pub struct ScanResults {
     pub bundler_require_all: bool,
     /// Script file contents collected during the walk: (rel_path, content_bytes)
     pub script_files: Vec<(String, Vec<u8>)>,
+    /// Active Storage services selected by attachment declarations in code.
+    pub storage_services: HashSet<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]

@@ -193,8 +193,8 @@ fn bench_thread_sweep(c: &mut Criterion) {
             Some(1),
         );
         let mut mut_cache = cache::FileCache::load(warm.path());
-        for (rp, mt, sz, reqs, mods, bg, ba) in updates {
-            mut_cache.put(rp, mt, sz, &reqs, mods, &bg, ba);
+        for update in updates {
+            mut_cache.put(update);
         }
         mut_cache.save();
     }

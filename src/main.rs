@@ -65,7 +65,7 @@ struct Cli {
     #[arg(long)]
     diff: Option<String>,
 
-    /// Additional directories to skip (comma-separated)
+    /// Additional directories to skip (comma-separated names or root-relative paths)
     #[arg(long, value_delimiter = ',')]
     skip_dirs: Option<Vec<String>>,
 
@@ -259,7 +259,7 @@ fn main() {
     }
     let (
         (((mut gem_index, vendor_path_index), gem_paths), (mut scan_results, cache_updates)),
-        (db_adapters, (cable_adapters, (storage_adapters, cache_config_adapters))),
+        (db_adapters, (cable_adapters, cache_config_adapters)),
     ) = timed!(
         "concurrent_init",
         rayon::join(
@@ -319,19 +319,9 @@ fn main() {
                                 )
                             },
                             || {
-                                rayon::join(
-                                    || {
-                                        timed!(
-                                            "scan_storage_adapters",
-                                            scan_storage_adapters(&dir, adapter_overrides)
-                                        )
-                                    },
-                                    || {
-                                        timed!(
-                                            "scan_cache_config",
-                                            scan_cache_config(&dir, adapter_overrides)
-                                        )
-                                    },
+                                timed!(
+                                    "scan_cache_config",
+                                    scan_cache_config(&dir, adapter_overrides)
                                 )
                             },
                         )
@@ -341,6 +331,11 @@ fn main() {
         )
     );
     introspect::index_declared_gem_sources(&dir, &gems, &gem_paths, &mut gem_index);
+    // Attachment `service:` symbols come from the parallel source walk.
+    let storage_adapters = timed!(
+        "scan_storage_adapters",
+        scan_storage_adapters(&dir, adapter_overrides, &scan_results.storage_services)
+    );
 
     // Apply cache updates from the walk
     let mut file_cache = match Arc::try_unwrap(file_cache) {
@@ -353,8 +348,8 @@ fn main() {
             }
         }
     };
-    for (rel_path, mtime, size, reqs, mods, bgroups, breq_all) in cache_updates {
-        file_cache.put(rel_path, mtime, size, &reqs, mods, &bgroups, breq_all);
+    for update in cache_updates {
+        file_cache.put(update);
     }
 
     // Synthesize active bundler groups when `Bundler.require(*Rails.groups)` (or equivalent)
@@ -902,9 +897,12 @@ fn scan_cable_adapters(
 }
 
 /// Scan config/storage.yml (or .yml.erb) for service: values and map them to gem names.
+/// Services are selected by `config.active_storage.service` settings and by the
+/// attachment `service:` names collected during the source walk.
 fn scan_storage_adapters(
     dir: &std::path::Path,
     overrides: &adapters::AdapterOverrides,
+    attachment_services: &HashSet<String>,
 ) -> std::collections::HashMap<String, String> {
     let storage_yml = dir.join("config").join("storage.yml");
     let content = match read_yaml_or_erb(&storage_yml) {
@@ -936,43 +934,7 @@ fn scan_storage_adapters(
             selected.insert(cap[1].to_string());
         }
     }
-    static SERVICE_SYMBOL_RE: once_cell::sync::Lazy<regex::Regex> =
-        once_cell::sync::Lazy::new(|| regex::Regex::new(r":(\w+)").unwrap());
-    let app_pattern = dir.join("app").join("**").join("*.rb");
-    if let Some(pattern) = app_pattern.to_str() {
-        if let Ok(paths) = glob::glob(pattern) {
-            for path in paths.flatten() {
-                let Ok(source) = std::fs::read_to_string(path) else {
-                    continue;
-                };
-                let lines: Vec<&str> = source.lines().collect();
-                for (index, line) in lines.iter().enumerate() {
-                    if !line.contains("has_one_attached") && !line.contains("has_many_attached") {
-                        continue;
-                    }
-                    let mut statement = line.to_string();
-                    for continuation in lines.iter().skip(index + 1).take(5) {
-                        let trimmed = continuation.trim_start();
-                        if continuation.len() == trimmed.len()
-                            || ["class ", "def ", "end", "has_one_", "has_many_", "module "]
-                                .iter()
-                                .any(|prefix| trimmed.starts_with(prefix))
-                        {
-                            break;
-                        }
-                        statement.push(' ');
-                        statement.push_str(trimmed);
-                    }
-                    let Some((_, service_expression)) = statement.split_once("service:") else {
-                        continue;
-                    };
-                    for cap in SERVICE_SYMBOL_RE.captures_iter(service_expression) {
-                        selected.insert(cap[1].to_string());
-                    }
-                }
-            }
-        }
-    }
+    selected.extend(attachment_services.iter().cloned());
 
     let mut services = std::collections::HashMap::new();
     let mut current = None;
@@ -1539,8 +1501,22 @@ mod tests {
         )
         .unwrap();
 
-        let adapters = scan_storage_adapters(tmp.path(), &adapters::AdapterOverrides::default());
+        let adapters = scan_storage_adapters(
+            tmp.path(),
+            &adapters::AdapterOverrides::default(),
+            &HashSet::new(),
+        );
         assert_eq!(adapters.get("aws-sdk-s3").map(|s| s.as_str()), Some("S3"));
+    }
+
+    fn storage_adapters_after_walk(dir: &std::path::Path) -> HashMap<String, String> {
+        let cache = Arc::new(cache::FileCache::disabled());
+        let (results, _) = scanner::scan_source_tree(dir, &scanner::default_skip_dirs(), cache);
+        scan_storage_adapters(
+            dir,
+            &adapters::AdapterOverrides::default(),
+            &results.storage_services,
+        )
     }
 
     #[test]
@@ -1561,7 +1537,7 @@ mod tests {
         )
         .unwrap();
 
-        let adapters = scan_storage_adapters(tmp.path(), &adapters::AdapterOverrides::default());
+        let adapters = storage_adapters_after_walk(tmp.path());
         assert_eq!(adapters.get("aws-sdk-s3").map(String::as_str), Some("S3"));
     }
 
@@ -1583,12 +1559,34 @@ mod tests {
         )
         .unwrap();
 
-        let adapters = scan_storage_adapters(tmp.path(), &adapters::AdapterOverrides::default());
+        let adapters = storage_adapters_after_walk(tmp.path());
         assert_eq!(adapters.get("aws-sdk-s3").map(String::as_str), Some("S3"));
         assert_eq!(
             adapters.get("google-cloud-storage").map(String::as_str),
             Some("GCS")
         );
+    }
+
+    #[test]
+    fn scan_storage_adapters_ignores_commented_and_string_attachments() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = tmp.path().join("config");
+        let models = tmp.path().join("app").join("models");
+        std::fs::create_dir_all(&cfg).unwrap();
+        std::fs::create_dir_all(&models).unwrap();
+        std::fs::write(
+            cfg.join("storage.yml"),
+            "amazon:\n  service: S3\ngoogle:\n  service: GCS\n",
+        )
+        .unwrap();
+        std::fs::write(
+            models.join("user.rb"),
+            "class User\n  # has_one_attached :avatar, service: :amazon\n  DOC = \"has_many_attached :files, service: :google\"\nend\n",
+        )
+        .unwrap();
+
+        let adapters = storage_adapters_after_walk(tmp.path());
+        assert!(adapters.is_empty(), "{adapters:?}");
     }
 
     #[test]

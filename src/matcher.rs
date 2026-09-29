@@ -303,6 +303,7 @@ mod tests {
             bundler_groups: HashSet::new(),
             bundler_require_all: false,
             script_files: Vec::new(),
+            storage_services: HashSet::new(),
         }
     }
 

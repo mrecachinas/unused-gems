@@ -81,8 +81,8 @@ unused-gems --diff baseline.json /path/to/project
 # Fail only when a gem becomes unused or a newly added gem is unused
 unused-gems --diff baseline.json --fail-on new /path/to/project
 
-# Skip additional directories
-unused-gems --skip-dirs tmp,cache /path/to/project
+# Skip additional directories (names, or paths relative to the project root)
+unused-gems --skip-dirs tmp,cache,app/legacy /path/to/project
 
 # Treat the development and test groups as active for Bundler.require(*Rails.groups)
 unused-gems --rails-env development,test /path/to/project
@@ -105,7 +105,7 @@ unused-gems --gemfile engines/a/Gemfile --gemfile engines/b/Gemfile /path/to/pro
     --diff <BASELINE>     Compare against previous JSON output (text, json or github per -o)
     --fail-on <POLICY>    none (always 0), any (default: 1 if unused), new (1 only for new unused in --diff)
     --sarif               Emit SARIF JSON (ignored with --diff)
-    --skip-dirs <DIRS>    Additional directories to skip (comma-separated)
+    --skip-dirs <DIRS>    Additional directories to skip (comma-separated names or root-relative paths)
     --rails-env <ENVS>    Rails environment group(s) considered active (comma-separated or repeated)
     --allow-missing-gemfile  Exit 0 with a notice when the Gemfile is missing
 -h, --help                Print help
@@ -233,7 +233,7 @@ Built with Rust for maximum performance:
 - **ruby-prism** for accurate Gemfile AST parsing (same parser as CRuby 3.3+)
 - **Hand-rolled byte scanners** with SIMD-accelerated `memchr` — no per-file regex overhead
 - **Parallel file walking** via `ignore` crate (scans generated sources even when gitignored)
-- **Bincode file cache** — unchanged files skip scanning on repeat runs
+- **Bincode file cache** — unchanged files skip scanning on repeat runs (entries for removed files are pruned; the cache is replaced atomically)
 - **Zero-alloc hot path** — extension checks, comment detection all avoid heap allocation
 - **vendor/cache support** — lists require paths from packed `.gem` tarballs (size-bounded, only for gems that aren't installed)
 
