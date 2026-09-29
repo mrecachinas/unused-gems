@@ -2785,7 +2785,9 @@ fn scan_file_bytes_with(
     // YAML config patterns (keep regex — rarely hit, complex multiline patterns).
     // Fix #8: use regex::bytes::Regex to avoid the String::from_utf8_lossy
     // allocation; patterns are byte-compatible.
-    if is_yaml
+    if is_yaml && is_rubocop_config(full_path) {
+        rubocop_config_gems(bytes, &mut requires);
+    } else if is_yaml
         && (memmem::find(bytes, b"rubocop").is_some()
             || memmem::find(bytes, b"require:").is_some()
             || memmem::find(bytes, b"plugins:").is_some()
@@ -2830,6 +2832,154 @@ fn scan_file_bytes_with(
         bundler_require_all,
         storage_services,
     })
+}
+
+/// `.rubocop.yml`, `.rubocop_todo.yml`, `rubocop-*.yml`, `.standard.yml`, ...
+fn is_rubocop_config(path: &Path) -> bool {
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    name.contains("rubocop") || name.starts_with(".standard")
+}
+
+/// Extract gem names referenced by a RuboCop/Standard config: `require:` and
+/// `plugins:` (a string, a list of strings, or a list of single-key maps) and
+/// the keys of `inherit_gem:`. Invalid YAML (e.g. ERB) falls back to a
+/// tolerant line-based reader.
+fn rubocop_config_gems(bytes: &[u8], gems: &mut Vec<String>) {
+    use serde_yaml::Value;
+
+    fn push_names(value: &Value, gems: &mut Vec<String>) {
+        match value {
+            Value::String(name) => gems.push(name.clone()),
+            Value::Sequence(items) => {
+                for item in items {
+                    match item {
+                        Value::String(name) => gems.push(name.clone()),
+                        Value::Mapping(map) => push_keys(map, gems),
+                        _ => {}
+                    }
+                }
+            }
+            Value::Mapping(map) => push_keys(map, gems),
+            _ => {}
+        }
+    }
+
+    fn push_keys(map: &serde_yaml::Mapping, gems: &mut Vec<String>) {
+        gems.extend(map.keys().filter_map(Value::as_str).map(str::to_string));
+    }
+
+    match serde_yaml::from_slice::<Value>(bytes) {
+        Ok(Value::Mapping(config)) => {
+            for key in ["require", "plugins"] {
+                if let Some(value) = config.get(key) {
+                    push_names(value, gems);
+                }
+            }
+            if let Some(Value::Mapping(inherited)) = config.get("inherit_gem") {
+                push_keys(inherited, gems);
+            }
+        }
+        Ok(_) => {}
+        Err(_) => rubocop_config_gems_fallback(bytes, gems),
+    }
+}
+
+/// Line-based reader for RuboCop configs that are not valid YAML.
+fn rubocop_config_gems_fallback(bytes: &[u8], gems: &mut Vec<String>) {
+    fn strip_comment(value: &str) -> &str {
+        let value = value.trim();
+        if value.starts_with('#') {
+            return "";
+        }
+        value.split(" #").next().unwrap_or("").trim()
+    }
+    fn unquote(value: &str) -> &str {
+        value.trim().trim_matches(|c| c == '\'' || c == '"').trim()
+    }
+    fn push_flow(value: &str, keys_only: bool, gems: &mut Vec<String>) {
+        let inner = value
+            .trim_start_matches(['[', '{'])
+            .trim_end_matches([']', '}']);
+        for item in inner.split(',') {
+            let item = if keys_only || item.contains(": ") || item.trim_end().ends_with(':') {
+                item.split(':').next().unwrap_or("")
+            } else {
+                item
+            };
+            let item = unquote(item);
+            if !item.is_empty() {
+                gems.push(item.to_string());
+            }
+        }
+    }
+
+    let text = String::from_utf8_lossy(bytes);
+    let mut section: Option<&str> = None;
+    let mut child_indent: Option<usize> = None;
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let indent = line.len() - trimmed.len();
+        if indent == 0 {
+            child_indent = None;
+            section = ["require", "plugins", "inherit_gem"]
+                .into_iter()
+                .find(|key| {
+                    trimmed
+                        .strip_prefix(key)
+                        .is_some_and(|rest| rest.starts_with(':'))
+                });
+            let Some(key) = section else {
+                continue;
+            };
+            let value = strip_comment(&trimmed[key.len() + 1..]);
+            if value.starts_with('[') || value.starts_with('{') {
+                push_flow(value, key == "inherit_gem", gems);
+                section = None;
+            } else if !value.is_empty() {
+                if key != "inherit_gem" {
+                    gems.push(unquote(value).to_string());
+                }
+                section = None;
+            }
+            continue;
+        }
+        let Some(key) = section else {
+            continue;
+        };
+        let child_indent = *child_indent.get_or_insert(indent);
+        if indent != child_indent {
+            continue;
+        }
+        let entry = if key == "inherit_gem" {
+            trimmed.split(':').next().unwrap_or("")
+        } else if let Some(item) = trimmed.strip_prefix('-') {
+            let item = strip_comment(item);
+            if item.ends_with(':') || item.contains(": ") {
+                item.split(':').next().unwrap_or("")
+            } else {
+                item
+            }
+        } else {
+            continue;
+        };
+        let entry = unquote(entry);
+        if !entry.is_empty() {
+            gems.push(entry.to_string());
+        }
+    }
+    for cap in RUBOCOP_RE.captures_iter(bytes) {
+        if let Ok(name) = std::str::from_utf8(&cap[1]) {
+            if !gems.iter().any(|gem| gem == name) {
+                gems.push(name.to_string());
+            }
+        }
+    }
 }
 
 /// Classify a path into Ruby, YAML, and template dialects in one pass.
@@ -3645,6 +3795,83 @@ require 'real_regex'
         assert!(result.is_some());
         let r = result.unwrap();
         assert!(r.requires.contains(&"rubocop-minitest".to_string()));
+    }
+
+    #[test]
+    fn rubocop_config_reference_forms() {
+        let cases: &[(&str, &[&str])] = &[
+            (
+                "inherit_gem:\n  rubocop-shopify: rubocop.yml\n",
+                &["rubocop-shopify"],
+            ),
+            (
+                "inherit_gem: { rubocop-rails-omakase: rubocop.yml }\n",
+                &["rubocop-rails-omakase"],
+            ),
+            (
+                "inherit_gem:\n  rubocop-github:\n    - config/default.yml\n",
+                &["rubocop-github"],
+            ),
+            (
+                "plugins: [standard-performance]\n",
+                &["standard-performance"],
+            ),
+            ("require: standard\n", &["standard"]),
+            ("plugins:\n  - \"rubocop-rails\"\n", &["rubocop-rails"]),
+            ("require:\n  - standard # comment\n", &["standard"]),
+            ("require:\n  - standard", &["standard"]),
+            (
+                "plugins:\n  - rubocop-rails:\n      foo: bar\n  - rubocop-rspec\n",
+                &["rubocop-rails", "rubocop-rspec"],
+            ),
+        ];
+        for (config, expected) in cases {
+            let mut gems = Vec::new();
+            rubocop_config_gems(config.as_bytes(), &mut gems);
+            assert_eq!(&gems, expected, "{config:?}");
+        }
+    }
+
+    #[test]
+    fn rubocop_config_invalid_yaml_uses_fallback() {
+        let config = b"<% if ENV['CI'] %>\ninherit_gem: { rubocop-rails-omakase: rubocop.yml }\n<% end %>\nplugins: [standard-performance, 'standard-rails']\nrequire:\n  - \"rubocop-rspec\" # comment\n  - rubocop-rake:\n      x: 1\nAllCops:\n  - rubocop-minitest\n";
+        assert!(serde_yaml::from_slice::<serde_yaml::Value>(config).is_err());
+        let mut gems = Vec::new();
+        rubocop_config_gems(config, &mut gems);
+        gems.sort();
+        assert_eq!(
+            gems,
+            vec![
+                "rubocop-minitest",
+                "rubocop-rails-omakase",
+                "rubocop-rake",
+                "rubocop-rspec",
+                "standard-performance",
+                "standard-rails",
+            ]
+        );
+    }
+
+    #[test]
+    fn scan_file_dot_rubocop_flow_inherit_gem() {
+        let dir = tempfile::tempdir().unwrap();
+        let yml = dir.path().join(".rubocop.yml");
+        std::fs::write(
+            &yml,
+            "inherit_gem: { rubocop-rails-omakase: rubocop.yml }\nplugins: [standard-performance]\n",
+        )
+        .unwrap();
+        let mut modules = HashMap::new();
+        let result = scan_file(
+            yml.to_str().unwrap(),
+            dir.path().to_str().unwrap(),
+            &mut modules,
+        )
+        .unwrap();
+        assert_eq!(
+            result.requires,
+            vec!["standard-performance", "rubocop-rails-omakase"]
+        );
     }
 
     #[test]
