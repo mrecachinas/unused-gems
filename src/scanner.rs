@@ -1564,10 +1564,31 @@ fn mask_ruby_range_cached(
                 }
                 i += 2;
             }
-            _ => i += 1,
+            _ => {
+                i += 1;
+                // Bytes that cannot start a token are skipped in bulk; stop at a
+                // newline so line-start markers are still checked.
+                if bytes[i - 1] != b'\n' {
+                    while i < end && !LEX_TOKEN_START[bytes[i] as usize] {
+                        i += 1;
+                    }
+                }
+            }
         }
     }
 }
+
+/// Bytes handled by a `mask_ruby_range_cached` match arm (plus `\n`).
+static LEX_TOKEN_START: [bool; 256] = {
+    let mut table = [false; 256];
+    let tokens = b"?$#'\"%/<\n";
+    let mut i = 0;
+    while i < tokens.len() {
+        table[tokens[i] as usize] = true;
+        i += 1;
+    }
+    table
+};
 
 /// `=begin` / `=end` markers must start a line and be followed by whitespace
 /// or EOL (`=ending` is not `=end`).
