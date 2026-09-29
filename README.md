@@ -156,7 +156,7 @@ declaration order.
 | `scanner.rs` | Parallel source tree scanning with hand-rolled byte scanners |
 | `introspect.rs` | Discovers gem require paths and module names from installed gems or vendor/cache tarballs |
 | `matcher.rs` | Matches gems against scan results to determine usage |
-| `scripts.rs` | Scans Makefiles, Dockerfiles, CI configs for gem references |
+| `scripts.rs` | Scans Rake tasks, Makefiles, Dockerfiles, Procfiles, CI configs for gem executables run as commands |
 | `lockfile.rs` | Parses Gemfile.lock for transitive dependency counting |
 | `cache.rs` | Bincode file cache — skips re-scanning unchanged files |
 | `output.rs` | Text, JSON, GitHub Actions output formatters |
