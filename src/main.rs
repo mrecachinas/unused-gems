@@ -50,7 +50,9 @@ struct Cli {
     #[arg(long)]
     ignore_file: Option<String>,
 
-    /// Gemfile path(s) to analyze. Repeat for monorepos. Defaults to <directory>/Gemfile.
+    /// Gemfile path(s) to analyze. Repeat for monorepos. Defaults to <directory>/Gemfile,
+    /// falling back to <directory>/gems.rb. Each Gemfile uses its own lockfile
+    /// (`<gemfile>.lock`, or `gems.locked` for `gems.rb`).
     #[arg(long)]
     gemfile: Vec<String>,
 
@@ -155,7 +157,7 @@ fn main() {
             })
             .collect()
     } else {
-        vec![dir.join("Gemfile")]
+        vec![gemfile::default_gemfile_path(&dir)]
     };
 
     // Check Gemfile existence before parsing (exit 2 if missing)

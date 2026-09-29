@@ -7,11 +7,25 @@ use crate::types::GemEntry;
 
 const DEFAULT_DEVELOPMENT_GROUP: &str = "development";
 
+/// Bundler's default Gemfile discovery for `dir`: `Gemfile`, then `gems.rb`.
+/// Returns `<dir>/Gemfile` when neither exists so callers report that name.
+pub fn default_gemfile_path(dir: &Path) -> PathBuf {
+    let gemfile = dir.join("Gemfile");
+    if gemfile.is_file() {
+        return gemfile;
+    }
+    let gems_rb = dir.join("gems.rb");
+    if gems_rb.is_file() {
+        return gems_rb;
+    }
+    gemfile
+}
+
 /// Parse a Gemfile using ruby-prism AST and extract gem declarations.
 pub fn parse_gemfile(dir: &Path) -> Vec<GemEntry> {
-    let gemfile_path = dir.join("Gemfile");
+    let gemfile_path = default_gemfile_path(dir);
     if !gemfile_path.exists() {
-        eprintln!("Error: No Gemfile found in {}", dir.display());
+        eprintln!("Error: No Gemfile or gems.rb found in {}", dir.display());
         std::process::exit(1);
     }
 
@@ -1104,6 +1118,23 @@ mod tests {
         assert_eq!(gems.len(), 1);
         assert_eq!(gems[0].name, "rails");
         assert_eq!(gems[0].groups, vec!["default"]);
+    }
+
+    #[test]
+    fn parse_gemfile_falls_back_to_gems_rb() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("gems.rb"), "gem 'rails'\n").unwrap();
+        assert_eq!(default_gemfile_path(dir.path()), dir.path().join("gems.rb"));
+        assert_eq!(names(&parse_gemfile(dir.path())), vec!["rails"]);
+    }
+
+    #[test]
+    fn default_gemfile_path_prefers_gemfile_over_gems_rb() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("gems.rb"), "gem 'puma'\n").unwrap();
+        std::fs::write(dir.path().join("Gemfile"), "gem 'rails'\n").unwrap();
+        assert_eq!(default_gemfile_path(dir.path()), dir.path().join("Gemfile"));
+        assert_eq!(names(&parse_gemfile(dir.path())), vec!["rails"]);
     }
 
     #[test]

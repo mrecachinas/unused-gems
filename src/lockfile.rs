@@ -133,18 +133,35 @@ impl Lockfile {
     }
 }
 
-pub fn parse_gemfile_lock(dir: &Path) -> Lockfile {
-    parse_lockfile_path(&dir.join("Gemfile.lock"))
+/// The lockfile Bundler pairs with `gemfile`: `gems.locked` for `gems.rb`,
+/// otherwise `<gemfile>.lock` (e.g. `gemfiles/rails7.gemfile.lock`).
+pub fn lockfile_path_for(gemfile: &Path) -> PathBuf {
+    if gemfile.file_name().is_some_and(|name| name == "gems.rb") {
+        return gemfile.with_file_name("gems.locked");
+    }
+    let mut path = gemfile.as_os_str().to_owned();
+    path.push(".lock");
+    PathBuf::from(path)
 }
 
+pub fn parse_gemfile_lock(dir: &Path) -> Lockfile {
+    parse_lockfile_path(&lockfile_path_for(&crate::gemfile::default_gemfile_path(
+        dir,
+    )))
+}
+
+/// Parse and merge the lockfiles belonging to the analyzed Gemfiles only.
 pub fn parse_gemfile_locks(root_dir: &Path, gemfile_paths: &[PathBuf]) -> Lockfile {
-    let mut lockfiles = vec![root_dir.join("Gemfile.lock")];
+    let mut lockfiles: Vec<PathBuf> = Vec::new();
     for gemfile in gemfile_paths {
-        if let Some(parent) = gemfile.parent() {
-            let lockfile = parent.join("Gemfile.lock");
-            if !lockfiles.contains(&lockfile) {
-                lockfiles.push(lockfile);
-            }
+        let gemfile = if gemfile.is_absolute() {
+            gemfile.clone()
+        } else {
+            root_dir.join(gemfile)
+        };
+        let lockfile = lockfile_path_for(&gemfile);
+        if !lockfiles.contains(&lockfile) {
+            lockfiles.push(lockfile);
         }
     }
 
@@ -509,38 +526,77 @@ GIT
         assert_eq!(count_transitive_deps("nonexistent", &deps), 0);
     }
 
-    #[test]
-    fn parse_multiple_gemfile_locks_merges_nearest_lockfiles() {
-        let dir = tempfile::tempdir().unwrap();
-        let engine = dir.path().join("engines/admin");
-        std::fs::create_dir_all(&engine).unwrap();
-        std::fs::write(
-            dir.path().join("Gemfile.lock"),
-            "\
+    const RAILS_LOCK: &str = "\
 GEM
   specs:
     rails (7.1.0)
       actionpack (= 7.1.0)
     actionpack (7.1.0)
-",
-        )
-        .unwrap();
-        std::fs::write(
-            engine.join("Gemfile.lock"),
-            "\
+";
+    const PUMA_LOCK: &str = "\
 GEM
   specs:
     puma (6.4.0)
       nio4r (~> 2.0)
     nio4r (2.7.0)
-",
-        )
-        .unwrap();
+";
 
-        let lockfile = parse_gemfile_locks(dir.path(), &[engine.join("Gemfile")]);
+    #[test]
+    fn parse_multiple_gemfile_locks_merges_each_gemfiles_lockfile() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = dir.path().join("engines/admin");
+        std::fs::create_dir_all(&engine).unwrap();
+        std::fs::write(dir.path().join("Gemfile.lock"), RAILS_LOCK).unwrap();
+        std::fs::write(engine.join("Gemfile.lock"), PUMA_LOCK).unwrap();
+
+        let lockfile = parse_gemfile_locks(
+            dir.path(),
+            &[dir.path().join("Gemfile"), engine.join("Gemfile")],
+        );
         assert_eq!(lockfile.dependencies()["rails"], vec!["actionpack"]);
         assert_eq!(lockfile.dependencies()["puma"], vec!["nio4r"]);
         assert_eq!(lockfile.artifacts("rails")[0].version, "7.1.0");
         assert_eq!(lockfile.artifacts("puma")[0].version, "6.4.0");
+    }
+
+    #[test]
+    fn parse_gemfile_locks_does_not_merge_unanalyzed_root_lockfile() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = dir.path().join("engines/admin");
+        std::fs::create_dir_all(&engine).unwrap();
+        std::fs::write(dir.path().join("Gemfile.lock"), RAILS_LOCK).unwrap();
+        std::fs::write(engine.join("Gemfile.lock"), PUMA_LOCK).unwrap();
+
+        let lockfile = parse_gemfile_locks(dir.path(), &[engine.join("Gemfile")]);
+        assert!(!lockfile.dependencies().contains_key("rails"));
+        assert_eq!(lockfile.dependencies()["puma"], vec!["nio4r"]);
+    }
+
+    #[test]
+    fn named_gemfile_uses_its_own_lockfile() {
+        let dir = tempfile::tempdir().unwrap();
+        let gemfiles = dir.path().join("gemfiles");
+        std::fs::create_dir_all(&gemfiles).unwrap();
+        std::fs::write(dir.path().join("Gemfile.lock"), RAILS_LOCK).unwrap();
+        std::fs::write(gemfiles.join("rails7.gemfile.lock"), PUMA_LOCK).unwrap();
+
+        let lockfile = parse_gemfile_locks(dir.path(), &[PathBuf::from("gemfiles/rails7.gemfile")]);
+        assert!(!lockfile.dependencies().contains_key("rails"));
+        assert_eq!(lockfile.dependencies()["puma"], vec!["nio4r"]);
+    }
+
+    #[test]
+    fn gems_rb_uses_gems_locked() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("gems.rb"), "gem 'puma'\n").unwrap();
+        std::fs::write(dir.path().join("gems.locked"), PUMA_LOCK).unwrap();
+        assert_eq!(
+            lockfile_path_for(&dir.path().join("gems.rb")),
+            dir.path().join("gems.locked")
+        );
+        assert_eq!(
+            parse_gemfile_lock(dir.path()).dependencies()["puma"],
+            vec!["nio4r"]
+        );
     }
 }
