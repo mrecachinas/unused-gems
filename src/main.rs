@@ -426,6 +426,10 @@ fn main() {
     for (gem_name, (store, source)) in &cache_config_adapters {
         adapter_evidence.push((gem_name, store, "cache", source));
     }
+    let system_test_gems = scan_system_test_drivers(&dir, &scan_results.modules);
+    for (gem_name, (driver, source)) in &system_test_gems {
+        adapter_evidence.push((gem_name, driver, "system_test", source));
+    }
     for (gem_name, adapter, kind, source) in adapter_evidence {
         if let Some(result) = results.get_mut(gem_name) {
             result.evidence.push(types::Evidence::DatabaseAdapter {
@@ -1027,6 +1031,61 @@ fn scan_cache_config(
     adapters
 }
 
+/// Rails system tests load Capybara implicitly and pick a driver by symbol
+/// (`driven_by :selenium`), so neither gem is required or referenced by
+/// constant. Only files that reference `ActionDispatch::SystemTestCase` or
+/// `Capybara` are read. Maps gem → (driver or base class, relative file).
+fn scan_system_test_drivers(
+    dir: &Path,
+    modules: &HashMap<String, HashSet<String>>,
+) -> HashMap<String, (String, String)> {
+    static DRIVER_RE: once_cell::sync::Lazy<regex::Regex> = once_cell::sync::Lazy::new(|| {
+        regex::Regex::new(
+            r"(?m)^[ \t]*(?:driven_by[ \t(]+|Capybara\.(?:default|javascript)_driver[ \t]*=[ \t]*):(\w+)",
+        )
+        .unwrap()
+    });
+    const SYSTEM_TEST_CASE: &str = "ActionDispatch::SystemTestCase";
+
+    let mut found = HashMap::new();
+    let mut files: Vec<&String> = Vec::new();
+    for (module, module_files) in modules {
+        if module == SYSTEM_TEST_CASE || module == "Capybara" || module.starts_with("Capybara::") {
+            files.extend(module_files);
+        }
+    }
+    if let Some(module_files) = modules.get(SYSTEM_TEST_CASE) {
+        if let Some(file) = module_files.iter().min() {
+            found.insert(
+                "capybara".to_string(),
+                (SYSTEM_TEST_CASE.to_string(), file.clone()),
+            );
+        }
+    }
+    files.sort();
+    files.dedup();
+    for file in files {
+        let Ok(content) = std::fs::read_to_string(dir.join(file)) else {
+            continue;
+        };
+        for cap in DRIVER_RE.captures_iter(&content) {
+            let gem = match &cap[1] {
+                d if d.starts_with("selenium") => "selenium-webdriver",
+                "cuprite" => "cuprite",
+                "apparition" => "apparition",
+                "poltergeist" => "poltergeist",
+                "webkit" => "capybara-webkit",
+                "playwright" => "capybara-playwright-driver",
+                _ => continue,
+            };
+            found
+                .entry(gem.to_string())
+                .or_insert_with(|| (cap[1].to_string(), file.clone()));
+        }
+    }
+    found
+}
+
 /// `Rails.groups` always includes `default`, but its environment-specific
 /// groups cannot be inferred safely without executing the application.
 fn synthesize_bundler_groups(
@@ -1448,6 +1507,33 @@ mod tests {
                 "config/environments/production.rb".to_string()
             ))
         );
+    }
+
+    #[test]
+    fn scan_system_test_drivers_credits_capybara_and_driver_gems() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("test")).unwrap();
+        std::fs::write(
+            tmp.path().join("test/application_system_test_case.rb"),
+            "class ApplicationSystemTestCase < ActionDispatch::SystemTestCase\n  driven_by :selenium, using: :headless_chrome\nend\n",
+        )
+        .unwrap();
+        let modules = HashMap::from([(
+            "ActionDispatch::SystemTestCase".to_string(),
+            HashSet::from(["test/application_system_test_case.rb".to_string()]),
+        )]);
+
+        let found = scan_system_test_drivers(tmp.path(), &modules);
+        let file = "test/application_system_test_case.rb".to_string();
+        assert_eq!(
+            found.get("capybara"),
+            Some(&("ActionDispatch::SystemTestCase".to_string(), file.clone()))
+        );
+        assert_eq!(
+            found.get("selenium-webdriver"),
+            Some(&("selenium".to_string(), file))
+        );
+        assert!(scan_system_test_drivers(tmp.path(), &HashMap::new()).is_empty());
     }
 
     #[test]

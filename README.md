@@ -197,6 +197,12 @@ gem named after the adapter or `activerecord-<adapter>-adapter`. Rails' built-in
 backends (`async`/`inline`/`test` cable adapters, `Disk`/`Mirror` storage services,
 `memory_store`/`file_store`/`null_store` caches) credit no gem.
 
+Rails system tests are recognised too: referencing `ActionDispatch::SystemTestCase`
+credits `capybara`, and `driven_by :selenium` (or `Capybara.default_driver =`/
+`javascript_driver = :selenium_*`, `:cuprite`, …) credits the driver gem. In JSON output
+this configuration evidence has `"type": "database_adapter"` (kept for compatibility)
+plus `kind` (`database`, `cable`, `storage`, `cache`, `system_test`) and `source` (file).
+
 ## Performance
 
 Built with Rust for maximum performance:

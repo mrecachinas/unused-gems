@@ -350,6 +350,7 @@ fn adapter_label(kind: &str) -> &'static str {
         "cable" => "cable adapter",
         "storage" => "storage service",
         "cache" => "cache store",
+        "system_test" => "system test",
         _ => "adapter",
     }
 }
