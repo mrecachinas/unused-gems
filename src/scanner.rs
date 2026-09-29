@@ -2903,6 +2903,19 @@ pub fn scan_source_tree_with_threads_and_explicit_skips(
     let skip_set: HashSet<String> = skip_dirs.iter().map(|s| s.to_string()).collect();
     let explicit_skip_set: HashSet<String> =
         explicit_skip_dirs.iter().map(|s| s.to_string()).collect();
+    // Entries with a path separator (`app/legacy`) match the directory's path
+    // relative to the scan root rather than its name.
+    let path_skips: Vec<std::path::PathBuf> = skip_dirs
+        .iter()
+        .chain(explicit_skip_dirs)
+        .filter(|skip| skip.contains('/') || skip.contains('\\'))
+        .map(|skip| {
+            let skip = skip.trim_end_matches(['/', '\\']);
+            let skip = skip.strip_prefix("./").unwrap_or(skip);
+            std::path::PathBuf::from(skip)
+        })
+        .collect();
+    let walk_root = dir.to_path_buf();
     let dir_str = dir.to_string_lossy().to_string();
     let use_cache = cache.is_enabled();
 
@@ -2917,10 +2930,21 @@ pub fn scan_source_tree_with_threads_and_explicit_skips(
         .git_ignore(false)
         .git_global(false)
         .git_exclude(false)
-        .follow_links(false)
+        // Symlinked files and directories are scanned like regular ones; the
+        // walker reports symlink loops as errors, which are skipped.
+        .follow_links(true)
         .hidden(false)
         .filter_entry(move |entry| {
             if entry.file_type().is_some_and(|ft| ft.is_dir()) {
+                if !path_skips.is_empty() {
+                    let rel = entry
+                        .path()
+                        .strip_prefix(&walk_root)
+                        .unwrap_or(entry.path());
+                    if path_skips.iter().any(|skip| skip.as_path() == rel) {
+                        return false;
+                    }
+                }
                 let name = entry.file_name().to_string_lossy();
                 let is_vendor_bundle = name == "bundle"
                     && entry
@@ -4989,6 +5013,60 @@ require 'real_regex'
             None,
         );
         assert!(!results.requires.contains_key("hidden"));
+    }
+
+    #[test]
+    fn explicit_skip_dir_paths_match_relative_to_root() {
+        let dir = tempfile::tempdir().unwrap();
+        for sub in ["app/legacy", "app/legacy_v2", "lib/app/legacy"] {
+            let path = dir.path().join(sub);
+            std::fs::create_dir_all(&path).unwrap();
+            let gem = sub.replace('/', "_");
+            std::fs::write(path.join("a.rb"), format!("require '{gem}'\n")).unwrap();
+        }
+        let cache = Arc::new(crate::cache::FileCache::disabled());
+        for skip in ["app/legacy", "./app/legacy/"] {
+            let (results, _) = scan_source_tree_with_threads_and_explicit_skips(
+                dir.path(),
+                &[skip],
+                &[skip],
+                cache.clone(),
+                None,
+            );
+            assert!(!results.requires.contains_key("app_legacy"), "{skip}");
+            assert!(results.requires.contains_key("app_legacy_v2"), "{skip}");
+            assert!(results.requires.contains_key("lib_app_legacy"), "{skip}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scan_source_tree_follows_symlinks() {
+        let outer = tempfile::tempdir().unwrap();
+        let root = outer.path().join("project");
+        let shared = outer.path().join("shared");
+        std::fs::create_dir_all(root.join("app")).unwrap();
+        std::fs::create_dir_all(root.join("lib")).unwrap();
+        std::fs::create_dir_all(shared.join("lib")).unwrap();
+        std::fs::write(shared.join("a.rb"), "require 'alpha'\n").unwrap();
+        std::fs::write(shared.join("lib").join("b.rb"), "Beta.x\n").unwrap();
+        std::fs::write(root.join("lib").join("g_real.rb"), "Gamma.x\n").unwrap();
+        std::os::unix::fs::symlink(shared.join("a.rb"), root.join("app").join("a.rb")).unwrap();
+        std::os::unix::fs::symlink(shared.join("lib"), root.join("app").join("shared_lib"))
+            .unwrap();
+        std::os::unix::fs::symlink(
+            root.join("lib").join("g_real.rb"),
+            root.join("app").join("g_link.rb"),
+        )
+        .unwrap();
+        // A directory loop must not hang or crash the walk.
+        std::os::unix::fs::symlink(&root, root.join("lib").join("loop")).unwrap();
+
+        let cache = Arc::new(crate::cache::FileCache::disabled());
+        let (results, _) = scan_source_tree(&root, &default_skip_dirs(), cache);
+        assert!(results.requires.contains_key("alpha"));
+        assert!(results.modules.contains_key("Beta"));
+        assert!(results.modules["Gamma"].len() >= 2);
     }
 
     #[test]
