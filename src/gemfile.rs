@@ -12,7 +12,7 @@ pub fn parse_gemfile(dir: &Path) -> Vec<GemEntry> {
     let gemfile_path = dir.join("Gemfile");
     if !gemfile_path.exists() {
         eprintln!("Error: No Gemfile found in {}", dir.display());
-        std::process::exit(1);
+        std::process::exit(2);
     }
 
     parse_gemfiles(dir, &[gemfile_path])

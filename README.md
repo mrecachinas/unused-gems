@@ -84,8 +84,8 @@ unused-gems --diff baseline.json --fail-on new /path/to/project
 # Skip additional directories
 unused-gems --skip-dirs tmp,cache /path/to/project
 
-# Treat the test group as active for Bundler.require(*Rails.groups)
-unused-gems --rails-env test /path/to/project
+# Treat the development and test groups as active for Bundler.require(*Rails.groups)
+unused-gems --rails-env development,test /path/to/project
 
 # Scan a monorepo with multiple Gemfiles
 unused-gems --gemfile engines/a/Gemfile --gemfile engines/b/Gemfile /path/to/project
@@ -101,11 +101,28 @@ unused-gems --gemfile engines/a/Gemfile --gemfile engines/b/Gemfile /path/to/pro
     --no-cache            Disable file scan cache
     --ignore-file <PATH>  Ignore file; relative paths resolve against the scanned directory (default: .unused_gems.yml)
     --gemfile <PATH>      Gemfile path to analyze; repeat for monorepos
-    --diff <BASELINE>     Compare against previous JSON output
+    --diff <BASELINE>     Compare against previous JSON output (text, json or github per -o)
+    --fail-on <POLICY>    none (always 0), any (default: 1 if unused), new (1 only for new unused in --diff)
+    --sarif               Emit SARIF JSON (ignored with --diff)
     --skip-dirs <DIRS>    Additional directories to skip (comma-separated)
-    --rails-env <ENV>      Rails environment group considered active
+    --rails-env <ENVS>    Rails environment group(s) considered active (comma-separated or repeated)
+    --allow-missing-gemfile  Exit 0 with a notice when the Gemfile is missing
 -h, --help                Print help
 ```
+
+## Exit codes
+
+| Code | Meaning |
+|------|---------|
+| `0` | No unused gems (or `--fail-on none`, or `--fail-on new` without new unused gems) |
+| `1` | Unused gems found (per `--fail-on`) |
+| `2` | Fatal error: invalid directory, missing Gemfile, unreadable or invalid `--diff` baseline, bad CLI arguments |
+
+`--fail-on new` only has an effect together with `--diff`; without it a warning is printed
+and the exit code is `0`. With `-o json`, `--diff` prints
+`{"schema_version": "1", "diff": {"newly_unused": [...], "no_longer_unused": [...],
+"status_changed": [...], "added": [...], "removed": [...]}, "new_unused_count": N}`; with
+`-o github` it emits a warning annotation per newly unused gem.
 
 ## Gemfile semantics
 

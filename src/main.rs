@@ -23,6 +23,9 @@ use rayon::prelude::*;
 
 use types::GemStatus;
 
+/// Exit codes: 0 = no unused gems, 1 = unused gems found, 2 = fatal error.
+const EXIT_ERROR: i32 = 2;
+
 #[derive(Parser)]
 #[command(name = "unused-gems")]
 #[command(about = "High-performance scanner for unused gems in Ruby projects")]
@@ -56,6 +59,7 @@ struct Cli {
     gemfile: Vec<String>,
 
     /// Compare against a previous JSON output file and show changes
+    /// (rendered as text, json or github annotations per --output)
     #[arg(long)]
     diff: Option<String>,
 
@@ -63,9 +67,10 @@ struct Cli {
     #[arg(long, value_delimiter = ',')]
     skip_dirs: Option<Vec<String>>,
 
-    /// Rails environment whose Gemfile group should be considered active
-    #[arg(long)]
-    rails_env: Option<String>,
+    /// Rails environment(s) whose Gemfile groups should be considered active
+    /// (comma-separated or repeated, e.g. --rails-env development,test)
+    #[arg(long, value_delimiter = ',')]
+    rails_env: Vec<String>,
 
     /// Disable file cache (always scan all files fresh)
     #[arg(long)]
@@ -95,12 +100,28 @@ fn main() {
         .canonicalize()
         .unwrap_or_else(|_| {
             eprintln!("Error: {} is not a valid directory", cli.directory);
-            std::process::exit(1);
+            std::process::exit(EXIT_ERROR);
         });
 
     if !dir.is_dir() {
         eprintln!("Error: {} is not a directory", dir.display());
-        std::process::exit(1);
+        std::process::exit(EXIT_ERROR);
+    }
+
+    // Load the diff baseline up front so a bad path fails before scanning.
+    let baseline = cli.diff.as_deref().map(|path| {
+        diff::load_baseline(path).unwrap_or_else(|e| {
+            eprintln!("Error: {}", e);
+            std::process::exit(EXIT_ERROR);
+        })
+    });
+    if cli.fail_on == "new" && baseline.is_none() {
+        eprintln!(
+            "Warning: --fail-on new only applies with --diff; exit code will be 0 regardless of unused gems"
+        );
+    }
+    if cli.sarif && baseline.is_some() {
+        eprintln!("Warning: --sarif is ignored with --diff; use -o json or -o github");
     }
 
     // Configure the rayon global pool when --jobs specified. This affects
@@ -181,7 +202,7 @@ fn main() {
                     .collect::<Vec<_>>()
                     .join(", ")
             );
-            std::process::exit(2);
+            std::process::exit(EXIT_ERROR);
         }
     }
 
@@ -324,11 +345,7 @@ fn main() {
     // Synthesize active bundler groups when `Bundler.require(*Rails.groups)` (or equivalent)
     // is detected. See `synthesize_bundler_groups` for rationale.
     if scan_results.bundler_require_all {
-        synthesize_bundler_groups(
-            &gems,
-            cli.rails_env.as_deref(),
-            &mut scan_results.bundler_groups,
-        );
+        synthesize_bundler_groups(&gems, &cli.rails_env, &mut scan_results.bundler_groups);
     }
 
     // 2b+3. Script scanning || resolve require paths (concurrent)
@@ -520,8 +537,14 @@ fn main() {
     }
 
     // 9. Diff mode: compare and exit
-    if let Some(ref baseline_path) = cli.diff {
-        let new_unused_count = diff::print_diff(&results, baseline_path);
+    if let Some(ref baseline) = baseline {
+        let report = diff::compute_diff(&results, baseline);
+        match cli.output.as_str() {
+            "json" => diff::print_diff_json(&report),
+            "github" => diff::print_diff_github(&report, &dir),
+            _ => diff::print_diff_text(&report),
+        }
+        let new_unused_count = report.new_unused_count();
         // Save cache before exit
         timed!("cache_save", file_cache.save());
         let exit_code = match cli.fail_on.as_str() {
@@ -573,7 +596,7 @@ fn main() {
         "none" => 0,
         "any" if unused_count > 0 => 1,
         "any" => 0,
-        // "new" only meaningful in diff mode; non-diff treats as none
+        // "new" only meaningful in diff mode (warned above); non-diff treats as none
         _ => 0,
     };
     std::process::exit(exit_code);
@@ -1008,7 +1031,7 @@ fn scan_cache_config(
 /// groups cannot be inferred safely without executing the application.
 fn synthesize_bundler_groups(
     _gems: &[types::GemEntry],
-    rails_env: Option<&str>,
+    rails_envs: &[String],
     target: &mut HashSet<String>,
 ) {
     const CONDITION_PREFIX: &str = "__rails_group_condition__:";
@@ -1021,9 +1044,13 @@ fn synthesize_bundler_groups(
         target.remove(condition);
     }
     target.insert("default".to_string());
-    if let Some(env) = rails_env {
+    for env in rails_envs
+        .iter()
+        .map(|env| env.trim())
+        .filter(|env| !env.is_empty())
+    {
         target.insert(env.to_string());
-        for condition in conditions {
+        for condition in &conditions {
             let Some((group, environments)) = condition
                 .trim_start_matches(CONDITION_PREFIX)
                 .split_once(':')
@@ -1063,7 +1090,7 @@ mod tests {
             gem("newrelic", &["production", "staging"]),
         ];
         let mut groups = HashSet::new();
-        synthesize_bundler_groups(&gems, None, &mut groups);
+        synthesize_bundler_groups(&gems, &[], &mut groups);
         assert!(groups.contains("default"));
         assert_eq!(groups.len(), 1);
     }
@@ -1072,7 +1099,7 @@ mod tests {
     fn synthesize_bundler_groups_always_includes_default() {
         let gems = vec![gem("rails", &[])];
         let mut groups = HashSet::new();
-        synthesize_bundler_groups(&gems, None, &mut groups);
+        synthesize_bundler_groups(&gems, &[], &mut groups);
         assert!(groups.contains("default"));
         assert_eq!(groups.len(), 1);
     }
@@ -1085,7 +1112,7 @@ mod tests {
             gem("c", &["test", "development"]),
         ];
         let mut groups = HashSet::new();
-        synthesize_bundler_groups(&gems, None, &mut groups);
+        synthesize_bundler_groups(&gems, &[], &mut groups);
         assert_eq!(groups, HashSet::from(["default".to_string()]));
     }
 
@@ -1093,7 +1120,7 @@ mod tests {
     fn synthesize_bundler_groups_includes_explicit_rails_environment() {
         let gems = vec![gem("rails", &[])];
         let mut groups = HashSet::new();
-        synthesize_bundler_groups(&gems, Some("test"), &mut groups);
+        synthesize_bundler_groups(&gems, &["test".to_string()], &mut groups);
         assert_eq!(
             groups,
             HashSet::from(["default".to_string(), "test".to_string()])
@@ -1106,7 +1133,7 @@ mod tests {
         let mut groups = HashSet::from([String::from(
             "__rails_group_condition__:assets:development,test",
         )]);
-        synthesize_bundler_groups(&gems, Some("development"), &mut groups);
+        synthesize_bundler_groups(&gems, &["development".to_string()], &mut groups);
         assert_eq!(
             groups,
             HashSet::from([
@@ -1115,6 +1142,39 @@ mod tests {
                 "assets".to_string()
             ])
         );
+    }
+
+    #[test]
+    fn synthesize_bundler_groups_accepts_multiple_environments() {
+        let gems = vec![gem("rails", &[])];
+        let mut groups = HashSet::from([String::from("__rails_group_condition__:assets:test")]);
+        synthesize_bundler_groups(
+            &gems,
+            &["development".to_string(), "test".to_string()],
+            &mut groups,
+        );
+        assert_eq!(
+            groups,
+            HashSet::from([
+                "default".to_string(),
+                "development".to_string(),
+                "test".to_string(),
+                "assets".to_string()
+            ])
+        );
+    }
+
+    #[test]
+    fn rails_env_flag_is_comma_separated_and_repeatable() {
+        let cli = Cli::try_parse_from([
+            "unused-gems",
+            "--rails-env",
+            "development,test",
+            "--rails-env",
+            "staging",
+        ])
+        .unwrap();
+        assert_eq!(cli.rails_env, ["development", "test", "staging"]);
     }
 
     #[test]

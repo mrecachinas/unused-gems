@@ -40,7 +40,7 @@ Parse Gemfile (ruby-prism AST)
 
 ## Key Conventions
 
-**Error handling:** No custom error types or error crates. Graceful degradation — missing gems, bad caches, etc. are logged via `eprintln!` and skipped. Only a missing Gemfile is fatal (`exit(1)`). Exit code is 0 if no unused gems found, 1 otherwise.
+**Error handling:** No custom error types or error crates. Graceful degradation — missing gems, bad caches, etc. are logged via `eprintln!` and skipped. Fatal errors (missing Gemfile, invalid directory, unreadable/invalid `--diff` baseline) exit 2. Otherwise the exit code is 0 if no unused gems were found and 1 if some were (subject to `--fail-on`).
 
 **Performance patterns:**
 - Byte-level scanning with `memchr::memmem::Finder` instead of regex in hot paths (scanner.rs)

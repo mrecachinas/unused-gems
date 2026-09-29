@@ -420,7 +420,7 @@ fn summarize_evidence(evidence: &[Evidence]) -> String {
     parts.join(", ")
 }
 
-fn gemfile_line_numbers(dir: &Path) -> HashMap<String, usize> {
+pub(crate) fn gemfile_line_numbers(dir: &Path) -> HashMap<String, usize> {
     let gemfile_path = dir.join("Gemfile");
     let content = match std::fs::read_to_string(gemfile_path) {
         Ok(c) => c,
