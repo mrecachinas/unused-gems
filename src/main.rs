@@ -16,7 +16,7 @@ mod types;
 use std::collections::{HashMap, HashSet};
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use clap::Parser;
 use rayon::prelude::*;
@@ -258,7 +258,7 @@ fn main() {
         }
     }
     let (
-        ((mut gem_index, vendor_path_index), (mut scan_results, cache_updates)),
+        (((mut gem_index, vendor_path_index), gem_paths), (mut scan_results, cache_updates)),
         (db_adapters, (cable_adapters, (storage_adapters, cache_config_adapters))),
     ) = timed!(
         "concurrent_init",
@@ -266,13 +266,16 @@ fn main() {
             || {
                 rayon::join(
                     || {
-                        let gp = introspect::find_gem_paths(&dir);
-                        rayon::join(
+                        let gp = timed!("find_gem_paths", introspect::find_gem_paths(&dir));
+                        let indexes = rayon::join(
                             || {
-                                introspect::build_gem_index_for_lock(
-                                    &gp,
-                                    &lockfile,
-                                    current_gem_platform,
+                                timed!(
+                                    "build_gem_index",
+                                    introspect::build_gem_index_for_lock(
+                                        &gp,
+                                        &lockfile,
+                                        current_gem_platform,
+                                    )
                                 )
                             },
                             || {
@@ -282,15 +285,19 @@ fn main() {
                                     current_gem_platform,
                                 )
                             },
-                        )
+                        );
+                        (indexes, gp)
                     },
                     || {
-                        scanner::scan_source_tree_with_threads_and_explicit_skips(
-                            &dir,
-                            &skip_dirs,
-                            &extra_refs,
-                            cache_for_scan,
-                            walker_threads,
+                        timed!(
+                            "scan_source_tree",
+                            scanner::scan_source_tree_with_threads_and_explicit_skips(
+                                &dir,
+                                &skip_dirs,
+                                &extra_refs,
+                                cache_for_scan,
+                                walker_threads,
+                            )
                         )
                     },
                 )
@@ -333,7 +340,7 @@ fn main() {
             },
         )
     );
-    introspect::index_declared_gem_sources(&dir, &gems, &mut gem_index);
+    introspect::index_declared_gem_sources(&dir, &gems, &gem_paths, &mut gem_index);
 
     // Apply cache updates from the walk
     let mut file_cache = match Arc::try_unwrap(file_cache) {
@@ -357,8 +364,8 @@ fn main() {
     }
 
     // 2b+3. Script scanning || resolve require paths (concurrent)
-    let vendor_memo: Mutex<HashMap<PathBuf, Option<Arc<introspect::GemMetadata>>>> =
-        Mutex::new(HashMap::new());
+    let namespace_claims = introspect::NamespaceClaims::build(&gem_names, gem_index.keys())
+        .with_lock_dependencies(lockfile.dependencies());
     let (script_refs, _) = timed!(
         "scripts+resolve",
         rayon::join(
@@ -373,39 +380,10 @@ fn main() {
             || {
                 gems.par_iter_mut().for_each(|gem| {
                     let mut declared = std::mem::take(&mut gem.require_paths);
-                    let heuristic = resolve_require_paths(gem, &gem_index);
+                    let heuristic = resolve_require_paths(gem, &gem_index, &namespace_claims);
                     for p in heuristic {
                         if !declared.contains(&p) {
                             declared.push(p);
-                        }
-                    }
-                    // Lazy vendor fallback: extract metadata on demand
-                    if declared.len() <= 1 && gem.source.is_none() {
-                        if let Some(path) = vendor_path_index.get(&gem.name) {
-                            // Compute-outside-lock: check cache first; if miss, decompress
-                            // tarball outside the lock, then insert. Avoids serializing
-                            // every vendor extraction across all rayon workers.
-                            let cached = vendor_memo.lock().unwrap().get(path).cloned();
-                            let meta = match cached {
-                                Some(m) => m,
-                                None => {
-                                    let computed =
-                                        introspect::extract_vendor_gem_metadata(path).map(Arc::new);
-                                    vendor_memo
-                                        .lock()
-                                        .unwrap()
-                                        .entry(path.clone())
-                                        .or_insert(computed)
-                                        .clone()
-                                }
-                            };
-                            if let Some(ref meta) = meta {
-                                for rp in &meta.require_paths {
-                                    if rp != "lib" && !declared.contains(rp) {
-                                        declared.push(rp.clone());
-                                    }
-                                }
-                            }
                         }
                     }
                     gem.require_paths = declared;
@@ -471,12 +449,38 @@ fn main() {
 
     if !unresolved.is_empty() {
         timed!("lazy_introspect_modules", {
-            let module_results: Vec<(usize, Vec<String>)> = unresolved
+            let module_results: Vec<(usize, Vec<String>, Vec<String>)> = unresolved
                 .par_iter()
-                .map(|&i| (i, resolve_module_names(&gems[i], &gem_index)))
+                .map(|&i| {
+                    let gem = &gems[i];
+                    let modules = resolve_module_names(gem, &gem_index, &namespace_claims);
+                    // Lazy vendor/cache fallback for gems that aren't installed:
+                    // list the tarball's real require names (bounded).
+                    let vendor_paths = if gem.source.is_none() && !gem_index.contains_key(&gem.name)
+                    {
+                        vendor_path_index
+                            .get(&gem.name)
+                            .and_then(|path| {
+                                introspect::vendor_gem_require_paths(
+                                    path,
+                                    &gem.name,
+                                    &namespace_claims,
+                                )
+                            })
+                            .unwrap_or_default()
+                    } else {
+                        Vec::new()
+                    };
+                    (i, modules, vendor_paths)
+                })
                 .collect();
-            for (i, modules) in module_results {
+            for (i, modules, vendor_paths) in module_results {
                 gems[i].module_names = modules;
+                for path in vendor_paths {
+                    if !gems[i].require_paths.contains(&path) {
+                        gems[i].require_paths.push(path);
+                    }
+                }
             }
         });
         // Re-match only unresolved gems with module names
@@ -646,39 +650,37 @@ fn merge_script_refs(
     }
 }
 
-/// Resolve require paths for a gem: check installed gem first, then use heuristics.
+/// Resolve require paths for a gem: union of the installed gem's require
+/// names and the curated known table; heuristics only when neither applies.
 fn resolve_require_paths(
     gem: &types::GemEntry,
     gem_index: &std::collections::HashMap<String, std::path::PathBuf>,
+    claims: &introspect::NamespaceClaims,
 ) -> Vec<String> {
-    // Try introspection first
-    if let Some(discovered) = introspect::discover_gem_require_paths(&gem.name, gem_index) {
-        let mut paths = discovered;
-        if !paths.contains(&gem.name) {
-            paths.push(gem.name.clone());
-        }
-        return paths;
-    }
+    let mut paths =
+        introspect::discover_gem_require_paths(&gem.name, gem_index, claims).unwrap_or_default();
+    let discovered = !paths.is_empty();
 
     // Known divergent gem→require mappings (gems where require path ≠ gem name)
-    if let Some(known) = known::require_paths_for(gem.name.as_str()) {
-        let mut paths: Vec<String> = known.iter().map(|s| s.to_string()).collect();
-        if !paths.contains(&gem.name) {
-            paths.push(gem.name.clone());
+    let known = known::require_paths_for(gem.name.as_str());
+    if let Some(known) = known {
+        for path in known {
+            if !paths.iter().any(|p| p == path) {
+                paths.push(path.to_string());
+            }
         }
-        return paths;
     }
 
-    // Fallback heuristics
-    let mut paths = Vec::new();
-    if gem.name.contains('-') {
+    if !discovered && known.is_none() && gem.name.contains('-') {
+        // Fallback heuristics. We deliberately do NOT add the bare first
+        // segment (e.g. "aws" for "aws-sdk-s3"): it almost never is a real
+        // require path and over-attributes usage to the gem family.
         paths.push(gem.name.replace('-', "/"));
         paths.push(gem.name.replace('-', "_"));
     }
-    paths.push(gem.name.clone());
-    // NOTE: we deliberately do NOT add the bare first segment as a require path
-    // (e.g. "aws" for "aws-sdk-s3"). It almost never corresponds to a real require
-    // path and over-attributes usage to unrelated gems in the same family.
+    if !paths.contains(&gem.name) {
+        paths.push(gem.name.clone());
+    }
     paths.dedup();
     paths
 }
@@ -690,8 +692,9 @@ fn resolve_require_paths(
 fn resolve_module_names(
     gem: &types::GemEntry,
     gem_index: &std::collections::HashMap<String, std::path::PathBuf>,
+    claims: &introspect::NamespaceClaims,
 ) -> Vec<String> {
-    let discovered = introspect::discover_gem_module_names(&gem.name, gem_index);
+    let discovered = introspect::discover_gem_module_names(&gem.name, gem_index, claims);
 
     // Static known module names for gems where PascalCase heuristic fails
     let mut names = Vec::new();
@@ -725,17 +728,27 @@ fn resolve_module_names(
         let ns = segments.join("::");
         names.push(ns);
 
-        // Emit prefix variants starting from 2 segments (e.g. "Aws::Sdk").
-        // We deliberately skip the bare 1-segment prefix (e.g. "Aws" alone) because
-        // it over-attributes: code referencing `Aws::S3::Client` should NOT mark
-        // unrelated `aws-sdk-cloudwatch` as Used. The curated KNOWN_MODULE_NAMES
-        // table provides the precise mappings (e.g. aws-sdk-core → "Aws").
+        // Proper-prefix variants from 2 segments (e.g. "Some::Unknown"). The
+        // bare 1-segment prefix ("Aws") is never emitted, and a prefix is
+        // dropped when it names another gem's namespace or a shared gem
+        // family ("Google::Cloud" for google-cloud-*, "OpenTelemetry::
+        // Instrumentation" for opentelemetry-instrumentation-*): code using
+        // a sibling gem must not mark this one Used.
+        let raw_segments: Vec<&str> = gem.name.split('-').collect();
         for i in 2..segments.len() {
             let prefix = segments[..i].join("::");
-            names.push(prefix);
+            let name_prefix = raw_segments[..i].join("-");
+            if !claims.is_shared_name_prefix(&name_prefix, &gem.name)
+                && !claims.module_owned_by_other(&prefix, &gem.name)
+            {
+                names.push(prefix);
+            }
         }
     }
     if !gem.name.contains('-') && gem.name.matches('_').count() >= 2 {
+        // Underscore compound prefixes ("foo_bar_baz" → "FooBar"), with the
+        // same guard: "ActiveModel" for active_model_serializers belongs to
+        // activemodel, "ActionPolicy" for action_policy_graphql to action_policy.
         let segments: Vec<&str> = gem.name.split('_').filter(|s| !s.is_empty()).collect();
         if segments.len() >= 3 {
             for i in 2..segments.len() {
@@ -743,7 +756,11 @@ fn resolve_module_names(
                     .iter()
                     .map(|s| capitalize(s))
                     .collect::<String>();
-                if prefix.len() >= 4 {
+                let name_prefix = segments[..i].join("_");
+                if prefix.len() >= 4
+                    && !claims.is_shared_name_prefix(&name_prefix, &gem.name)
+                    && !claims.module_owned_by_other(&prefix, &gem.name)
+                {
                     names.push(prefix);
                 }
             }
@@ -1212,6 +1229,13 @@ mod tests {
         );
     }
 
+    fn claims_for(
+        g: &types::GemEntry,
+        idx: &std::collections::HashMap<String, std::path::PathBuf>,
+    ) -> introspect::NamespaceClaims {
+        introspect::NamespaceClaims::build(std::slice::from_ref(&g.name), idx.keys())
+    }
+
     #[test]
     fn synthesize_bundler_groups_accepts_multiple_environments() {
         let gems = vec![gem("rails", &[])];
@@ -1250,7 +1274,7 @@ mod tests {
         // aws-sdk-s3: must NOT include bare "aws" as a require path
         let g = gem("some-unknown-vendor-pkg", &[]);
         let idx = std::collections::HashMap::new();
-        let paths = resolve_require_paths(&g, &idx);
+        let paths = resolve_require_paths(&g, &idx, &claims_for(&g, &idx));
         assert!(
             !paths.iter().any(|p| p == "some"),
             "bare first segment 'some' should not be emitted; got {:?}",
@@ -1267,7 +1291,7 @@ mod tests {
         // the bare 1-segment prefix "Some" alone; it over-attributes.
         let g = gem("some-unknown-vendor-pkg", &[]);
         let idx = std::collections::HashMap::new();
-        let names = resolve_module_names(&g, &idx);
+        let names = resolve_module_names(&g, &idx, &claims_for(&g, &idx));
         assert!(
             !names.iter().any(|n| n == "Some"),
             "bare 1-segment prefix 'Some' should not be emitted; got {:?}",
@@ -1285,7 +1309,7 @@ mod tests {
         // emit BOTH the curated name AND the heuristic PascalCase form.
         let g = gem("graphql", &[]);
         let idx = std::collections::HashMap::new();
-        let names = resolve_module_names(&g, &idx);
+        let names = resolve_module_names(&g, &idx, &claims_for(&g, &idx));
         assert!(names.iter().any(|n| n == "GraphQL"));
         assert!(names.iter().any(|n| n == "Graphql"));
     }
@@ -1294,19 +1318,105 @@ mod tests {
     fn resolve_module_names_avoids_shared_extension_root() {
         let g = gem("graphql-batch", &[]);
         let idx = std::collections::HashMap::new();
-        let names = resolve_module_names(&g, &idx);
+        let names = resolve_module_names(&g, &idx, &claims_for(&g, &idx));
         assert!(names.iter().any(|n| n == "GraphQL::Batch"));
         assert!(!names.iter().any(|n| n == "GraphQL"));
     }
 
     #[test]
-    fn resolve_module_names_adds_underscore_compound_prefixes() {
+    fn resolve_module_names_drops_compound_prefixes_owned_by_other_gems() {
+        // `ActiveModel` belongs to activemodel, not active_model_serializers.
         let g = gem("active_model_serializers", &[]);
         let idx = std::collections::HashMap::new();
-        let names = resolve_module_names(&g, &idx);
-        assert!(names.iter().any(|n| n == "ActiveModel"));
+        let names = resolve_module_names(&g, &idx, &claims_for(&g, &idx));
+        assert!(!names.iter().any(|n| n == "ActiveModel"));
         assert!(names.iter().any(|n| n == "ActiveModelSerializers"));
+        assert!(names.iter().any(|n| n == "ActiveModel::Serializer"));
         assert!(!names.iter().any(|n| n == "Active"));
+
+        // Unclaimed compound prefixes are still emitted.
+        let g = gem("acme_widget_tools", &[]);
+        let names = resolve_module_names(&g, &idx, &claims_for(&g, &idx));
+        assert!(names.iter().any(|n| n == "AcmeWidget"));
+    }
+
+    fn module_names_with_gemfile(name: &str, gemfile: &[&str]) -> Vec<String> {
+        let g = gem(name, &[]);
+        let idx = std::collections::HashMap::new();
+        let gemfile: Vec<String> = gemfile.iter().map(|s| s.to_string()).collect();
+        let claims = introspect::NamespaceClaims::build(&gemfile, idx.keys());
+        resolve_module_names(&g, &idx, &claims)
+    }
+
+    #[test]
+    fn resolve_module_names_skips_shared_family_and_foreign_prefixes() {
+        let has = |names: &[String], n: &str| names.iter().any(|x| x.eq_ignore_ascii_case(n));
+        let names = module_names_with_gemfile(
+            "google-cloud-storage",
+            &["google-cloud-storage", "google-cloud-pubsub"],
+        );
+        assert!(!has(&names, "Google::Cloud"), "{names:?}");
+        assert!(has(&names, "Google::Cloud::Storage"));
+
+        let names = module_names_with_gemfile(
+            "opentelemetry-instrumentation-pg",
+            &[
+                "opentelemetry-instrumentation-pg",
+                "opentelemetry-instrumentation-redis",
+            ],
+        );
+        assert!(!has(&names, "OpenTelemetry::Instrumentation"), "{names:?}");
+        assert!(has(&names, "OpenTelemetry::Instrumentation::Pg"));
+
+        let names = module_names_with_gemfile(
+            "active_storage_validations",
+            &["active_storage_validations"],
+        );
+        assert!(!has(&names, "ActiveStorage"), "{names:?}");
+        let names = module_names_with_gemfile("action_policy_graphql", &["action_policy_graphql"]);
+        assert!(!has(&names, "ActionPolicy"), "{names:?}");
+
+        for (gem_name, foreign) in [
+            ("sidekiq-cron", "Sidekiq"),
+            ("tzinfo-data", "TZInfo"),
+            ("pry-byebug", "Byebug"),
+        ] {
+            let names = module_names_with_gemfile(gem_name, &[gem_name]);
+            assert!(!has(&names, foreign), "{gem_name}: {names:?}");
+        }
+    }
+
+    #[test]
+    fn resolve_require_paths_merges_known_paths_with_installed_discovery() {
+        let tmp = tempfile::tempdir().unwrap();
+        let gem_dir = tmp.path().join("gems").join("rubyzip-3.0.0");
+        std::fs::create_dir_all(gem_dir.join("lib")).unwrap();
+        std::fs::write(gem_dir.join("lib").join("rubyzip.rb"), "").unwrap();
+        let idx = std::collections::HashMap::from([("rubyzip".to_string(), gem_dir)]);
+        let g = gem("rubyzip", &[]);
+        let paths = resolve_require_paths(&g, &idx, &claims_for(&g, &idx));
+        assert!(paths.iter().any(|p| p == "zip"), "{paths:?}");
+        assert!(paths.iter().any(|p| p == "rubyzip"));
+    }
+
+    #[test]
+    fn resolve_require_paths_knows_rails_framework_gems() {
+        let idx = std::collections::HashMap::new();
+        for (name, expected) in [
+            ("activesupport", "active_support"),
+            ("activerecord", "active_record"),
+            ("actionpack", "action_dispatch"),
+            ("actionview", "action_view"),
+            ("railties", "rails"),
+            ("concurrent-ruby", "concurrent"),
+        ] {
+            let g = gem(name, &[]);
+            let paths = resolve_require_paths(&g, &idx, &claims_for(&g, &idx));
+            assert!(paths.iter().any(|p| p == expected), "{name}: {paths:?}");
+        }
+        let g = gem("ruby-progressbar", &[]);
+        let paths = resolve_require_paths(&g, &idx, &claims_for(&g, &idx));
+        assert!(!paths.iter().any(|p| p == "progressbar"), "{paths:?}");
     }
 
     #[test]
