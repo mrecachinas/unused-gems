@@ -173,30 +173,17 @@ fn parse_lockfile_path(lock_path: &Path) -> Lockfile {
     let mut current_artifact: Option<usize> = None;
     let mut current_source: Option<LockedSource> = None;
     let mut in_specs = false;
-    let mut in_platforms = false;
-    let mut platforms = Vec::new();
 
     for line in content.lines() {
         if !line.starts_with(' ') && !line.is_empty() {
             current_artifact = None;
             in_specs = false;
-            in_platforms = line == "PLATFORMS";
             current_source = match line {
                 "GEM" => Some(LockedSource::Registry),
                 "GIT" => Some(LockedSource::Git),
                 "PATH" => Some(LockedSource::Path),
                 _ => None,
             };
-            continue;
-        }
-
-        if in_platforms {
-            if let Some(platform) = line.strip_prefix("  ") {
-                let platform = platform.trim();
-                if !platform.is_empty() {
-                    platforms.push(platform.to_string());
-                }
-            }
             continue;
         }
 
@@ -229,10 +216,9 @@ fn parse_lockfile_path(lock_path: &Path) -> Lockfile {
         }
     }
 
-    platforms.sort_by_key(|platform| std::cmp::Reverse(platform.len()));
     let mut lockfile = Lockfile::default();
     for raw in raw_artifacts {
-        let (version, platform) = split_resolved_artifact(&raw.resolved, &platforms);
+        let (version, platform) = split_resolved_artifact(&raw.resolved);
         let dependencies = raw.dependencies;
         let artifact = LockedArtifact {
             version,
@@ -266,34 +252,18 @@ fn parse_spec_line(line: &str) -> Option<(String, String)> {
     Some((name.to_string(), resolved.to_string()))
 }
 
-fn split_resolved_artifact(resolved: &str, platforms: &[String]) -> (String, Option<String>) {
-    let mut suffixes: Vec<String> = platforms
-        .iter()
-        .filter(|platform| platform.as_str() != "ruby")
-        .flat_map(|platform| {
-            let mut suffixes = vec![platform.clone()];
-            if let Some(normalized) = normalize_os_versioned_platform(platform) {
-                suffixes.push(normalized);
-            }
-            suffixes
-        })
-        .collect();
-    suffixes.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
-    suffixes.dedup();
-
-    for platform in suffixes {
-        let suffix = format!("-{platform}");
-        if let Some(version) = resolved.strip_suffix(&suffix) {
-            return (version.to_string(), Some(platform));
+/// Split `1.18.9-x86_64-linux-gnu` into version and platform the way Bundler's
+/// lockfile `NAME_VERSION` regex does: gem versions never contain `-`, so the
+/// platform is everything after the first `-`, whether or not it is listed
+/// under PLATFORMS.
+fn split_resolved_artifact(resolved: &str) -> (String, Option<String>) {
+    match resolved.split_once('-') {
+        Some((version, platform)) if !platform.is_empty() && platform != "ruby" => {
+            (version.to_string(), Some(platform.to_string()))
         }
+        Some((version, _)) => (version.to_string(), None),
+        None => (resolved.to_string(), None),
     }
-    (resolved.to_string(), None)
-}
-
-fn normalize_os_versioned_platform(platform: &str) -> Option<String> {
-    let (base, version) = platform.rsplit_once('-')?;
-    (!version.is_empty() && version.bytes().all(|byte| byte.is_ascii_digit()))
-        .then(|| base.to_string())
 }
 
 /// Number of unique gems reachable from `gem_name` (excluding the gem itself).
@@ -408,6 +378,41 @@ PLATFORMS
             lockfile.preferred_registry_full_names("nokogiri", Some("arm64-darwin-25")),
             vec![
                 "nokogiri-1.18.9-arm64-darwin".to_string(),
+                "nokogiri-1.18.9".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn splits_native_platform_not_listed_in_platforms() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Gemfile.lock"),
+            "\
+GEM
+  remote: https://rubygems.org/
+  specs:
+    nokogiri (1.18.9)
+      racc (~> 1.4)
+    nokogiri (1.18.9-x86_64-linux-gnu)
+      racc (~> 1.4)
+
+PLATFORMS
+  ruby
+  x86_64-linux
+",
+        )
+        .unwrap();
+
+        let lockfile = parse_gemfile_lock(dir.path());
+        let native = &lockfile.artifacts("nokogiri")[1];
+        assert_eq!(native.version, "1.18.9");
+        assert_eq!(native.platform.as_deref(), Some("x86_64-linux-gnu"));
+        assert!(lockfile.has_platform_specific_registry_artifacts());
+        assert_eq!(
+            lockfile.preferred_registry_full_names("nokogiri", Some("x86_64-linux")),
+            vec![
+                "nokogiri-1.18.9-x86_64-linux-gnu".to_string(),
                 "nokogiri-1.18.9".to_string()
             ]
         );
