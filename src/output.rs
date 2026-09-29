@@ -305,9 +305,19 @@ pub fn print_results_github(
             continue;
         }
 
-        let location = match line_nums.get(name) {
-            Some(line) => format!("file=Gemfile,line={}", line),
-            None => "file=Gemfile".to_string(),
+        let declared = info
+            .gem
+            .declarations
+            .iter()
+            .find_map(|d| Some((d.file.as_ref()?, d.line?)));
+        let location = match (declared, line_nums.get(name)) {
+            (Some((file, line)), _) => format!(
+                "file={},line={}",
+                file.strip_prefix(dir).unwrap_or(file).display(),
+                line
+            ),
+            (None, Some(line)) => format!("file=Gemfile,line={}", line),
+            (None, None) => "file=Gemfile".to_string(),
         };
 
         let level = if info.status == GemStatus::Unused {

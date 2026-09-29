@@ -562,3 +562,34 @@ fn gemspec_in_group_block_uses_bundler_2_6_semantics() {
     assert_eq!(groups_of(&results, "devdep"), vec!["development"]);
     assert_eq!(status_of(&results, "devdep"), "bundler_required");
 }
+
+#[test]
+fn github_annotations_point_at_declaring_file_and_line() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        &root.join("Gemfile"),
+        "source 'https://rubygems.org'\ngem 'root_gem'\neval_gemfile 'gemfiles/extra.gemfile'\n",
+    );
+    write(
+        &root.join("gemfiles/extra.gemfile"),
+        "\n\ngem 'extra_gem'\n",
+    );
+    write(&root.join("app.rb"), "# nothing\n");
+
+    let bin = env!("CARGO_BIN_EXE_unused-gems");
+    let output = Command::new(bin)
+        .args(["--output", "github", "--no-cache", "--quiet"])
+        .arg(root)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("file=Gemfile,line=2::Gem 'root_gem'"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("file=gemfiles/extra.gemfile,line=3::Gem 'extra_gem'"),
+        "{stdout}"
+    );
+}
