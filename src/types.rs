@@ -42,8 +42,6 @@ pub enum GemStatus {
     Used,
     Unused,
     BundlerRequired,
-    #[allow(dead_code)]
-    RequireFalse,
     Ignored,
     PlatformExcluded,
 }
@@ -54,7 +52,6 @@ impl std::fmt::Display for GemStatus {
             GemStatus::Used => write!(f, "used"),
             GemStatus::Unused => write!(f, "unused"),
             GemStatus::BundlerRequired => write!(f, "bundler_required"),
-            GemStatus::RequireFalse => write!(f, "require_false"),
             GemStatus::Ignored => write!(f, "ignored"),
             GemStatus::PlatformExcluded => write!(f, "platform_excluded"),
         }
