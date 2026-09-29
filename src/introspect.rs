@@ -49,14 +49,85 @@ pub struct GemMetadata {
     pub executables: Vec<String>,
 }
 
-/// Compare two gem version strings numerically (e.g. "1.16.8" > "1.9.1").
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum VersionSegment {
+    /// Decimal digits with leading zeros stripped ("" means zero).
+    Num(String),
+    Str(String),
+}
+
+impl VersionSegment {
+    fn is_zero(&self) -> bool {
+        matches!(self, VersionSegment::Num(n) if n.is_empty())
+    }
+}
+
+/// Split a version into RubyGems-style canonical segments: numeric and alpha
+/// runs, `-` treated as `.pre.`, with trailing zeros removed from both the
+/// release part and the prerelease part (mirrors `Gem::Version#canonical_segments`).
+fn canonical_version_segments(version: &str) -> Vec<VersionSegment> {
+    let version = version.trim().replace('-', ".pre.");
+    let bytes = version.as_bytes();
+    let mut segments = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        let start = i;
+        if bytes[i].is_ascii_digit() {
+            while i < bytes.len() && bytes[i].is_ascii_digit() {
+                i += 1;
+            }
+            let digits = version[start..i].trim_start_matches('0');
+            segments.push(VersionSegment::Num(digits.to_string()));
+        } else if bytes[i].is_ascii_alphabetic() {
+            while i < bytes.len() && bytes[i].is_ascii_alphabetic() {
+                i += 1;
+            }
+            segments.push(VersionSegment::Str(version[start..i].to_string()));
+        } else {
+            i += 1;
+        }
+    }
+
+    let split = segments
+        .iter()
+        .position(|segment| matches!(segment, VersionSegment::Str(_)))
+        .unwrap_or(segments.len());
+    let mut prerelease = segments.split_off(split);
+    while segments.last().is_some_and(VersionSegment::is_zero) {
+        segments.pop();
+    }
+    while prerelease.last().is_some_and(VersionSegment::is_zero) {
+        prerelease.pop();
+    }
+    segments.extend(prerelease);
+    segments
+}
+
+/// Compare two gem version strings with `Gem::Version` semantics:
+/// numeric segments compare numerically ("1.16.8" > "1.9.1"), and any string
+/// segment marks a prerelease that sorts before the corresponding release
+/// ("1.0.0.rc1" < "1.0.0", "2.0.0.beta9" < "2.0.0.beta10").
 fn compare_gem_versions(a: &str, b: &str) -> std::cmp::Ordering {
-    let parse = |s: &str| -> Vec<u64> {
-        s.split('.')
-            .map(|p| p.parse::<u64>().unwrap_or(0))
-            .collect()
-    };
-    parse(a).cmp(&parse(b))
+    use std::cmp::Ordering;
+    let a = canonical_version_segments(a);
+    let b = canonical_version_segments(b);
+    let zero = VersionSegment::Num(String::new());
+    for i in 0..a.len().max(b.len()) {
+        let lhs = a.get(i).unwrap_or(&zero);
+        let rhs = b.get(i).unwrap_or(&zero);
+        let ordering = match (lhs, rhs) {
+            (VersionSegment::Num(l), VersionSegment::Num(r)) => {
+                l.len().cmp(&r.len()).then_with(|| l.cmp(r))
+            }
+            (VersionSegment::Str(l), VersionSegment::Str(r)) => l.cmp(r),
+            (VersionSegment::Str(_), VersionSegment::Num(_)) => Ordering::Less,
+            (VersionSegment::Num(_), VersionSegment::Str(_)) => Ordering::Greater,
+        };
+        if ordering != Ordering::Equal {
+            return ordering;
+        }
+    }
+    Ordering::Equal
 }
 
 /// Extract version from a gem directory name, handling platform suffixes.
@@ -79,6 +150,31 @@ fn extract_gem_version(dir_name: &str) -> Option<String> {
     None
 }
 
+fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .filter(|home| !home.is_empty())
+        .map(PathBuf::from)
+}
+
+fn env_path(name: &str) -> Option<PathBuf> {
+    std::env::var_os(name)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+}
+
+fn env_string(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn push_unique_dir(paths: &mut Vec<PathBuf>, path: PathBuf) {
+    if path.is_dir() && !paths.contains(&path) {
+        paths.push(path);
+    }
+}
+
 /// Find gem installation directories. Tries fast filesystem probes first,
 /// only falling back to the `gem` subprocess as a last resort.
 pub fn find_gem_paths(project_dir: &Path) -> Vec<PathBuf> {
@@ -90,7 +186,7 @@ pub fn find_gem_paths(project_dir: &Path) -> Vec<PathBuf> {
             project_dir.join(bundle_path)
         };
         // Bundler installs under <BUNDLE_PATH>/ruby/<api_version>/
-        if let Some(gem_root) = find_bundler_gem_root(&abs) {
+        if let Some(gem_root) = find_bundler_gem_root(&abs, project_dir) {
             return vec![gem_root];
         }
         // Some layouts put gems directly under BUNDLE_PATH
@@ -99,46 +195,39 @@ pub fn find_gem_paths(project_dir: &Path) -> Vec<PathBuf> {
         }
     }
 
-    // 2. GEM_PATH env — often set by rbenv/rvm init scripts
-    if let Ok(gem_path) = std::env::var("GEM_PATH") {
-        let paths: Vec<PathBuf> = std::env::split_paths(&gem_path)
-            .filter(|p| p.is_dir())
-            .collect();
+    // 2. GEM_PATH / GEM_HOME env. RubyGems searches GEM_PATH followed by
+    //    GEM_HOME; without GEM_PATH it searches the Ruby's default dirs + GEM_HOME.
+    let gem_path_env = std::env::var_os("GEM_PATH").filter(|v| !v.is_empty());
+    let gem_home_env = env_path("GEM_HOME");
+    if gem_path_env.is_some() {
+        let paths = gem_paths_from_env(gem_path_env.as_deref(), gem_home_env.as_deref());
         if !paths.is_empty() {
+            return paths;
+        }
+    } else if let Some(gem_home) = gem_home_env {
+        if gem_home.is_dir() {
+            let mut paths = probe_version_manager_gem_paths(project_dir).unwrap_or_default();
+            paths.retain(|path| path != &gem_home);
+            paths.insert(0, gem_home);
             return paths;
         }
     }
 
-    // 3. GEM_HOME env
-    if let Ok(gem_home) = std::env::var("GEM_HOME") {
-        let p = PathBuf::from(&gem_home);
-        if p.is_dir() {
-            return vec![p];
-        }
+    // 3. Probe version managers (rbenv, rvm, mise, asdf, chruby, PATH) directly.
+    if let Some(paths) = probe_version_manager_gem_paths(project_dir) {
+        return paths;
     }
 
-    // 4. Probe rbenv filesystem directly (no subprocess)
-    if let Some(path) = probe_rbenv(project_dir) {
-        return vec![path];
-    }
-
-    // 5. Probe rvm filesystem directly
-    if let Some(path) = probe_rvm(project_dir) {
-        return vec![path];
-    }
-
-    // 6. Last resort: shell out to `gem environment gempath`
+    // 4. Last resort: shell out to `gem environment gempath` from the project
+    //    so shims and per-directory version files resolve like they would for
+    //    the project itself.
     if let Ok(output) = std::process::Command::new("gem")
         .args(["environment", "gempath"])
+        .current_dir(project_dir)
         .output()
     {
         if output.status.success() {
-            let path_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            let paths: Vec<PathBuf> = path_str
-                .split(':')
-                .filter(|s| !s.is_empty())
-                .map(PathBuf::from)
-                .collect();
+            let paths = parse_gem_environment_gempath(&String::from_utf8_lossy(&output.stdout));
             if !paths.is_empty() {
                 return paths;
             }
@@ -146,6 +235,33 @@ pub fn find_gem_paths(project_dir: &Path) -> Vec<PathBuf> {
     }
 
     Vec::new()
+}
+
+fn parse_gem_environment_gempath(output: &str) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    for path in std::env::split_paths(output.trim()) {
+        if !path.as_os_str().is_empty() && !paths.contains(&path) {
+            paths.push(path);
+        }
+    }
+    paths
+}
+
+/// Combine GEM_PATH entries with GEM_HOME (RubyGems always searches GEM_HOME
+/// too), keeping order, dropping duplicates and non-directories.
+fn gem_paths_from_env(gem_path: Option<&std::ffi::OsStr>, gem_home: Option<&Path>) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    if let Some(gem_path) = gem_path {
+        for path in std::env::split_paths(gem_path) {
+            if !path.as_os_str().is_empty() {
+                push_unique_dir(&mut paths, path);
+            }
+        }
+    }
+    if let Some(gem_home) = gem_home {
+        push_unique_dir(&mut paths, gem_home.to_path_buf());
+    }
+    paths
 }
 
 /// Read BUNDLE_PATH from .bundle/config in the project directory.
@@ -166,77 +282,440 @@ fn read_bundle_path(project_dir: &Path) -> Option<PathBuf> {
 }
 
 /// Find the gem root inside a Bundler bundle path.
-/// Bundler typically installs to <path>/ruby/<api_version>/.
-fn find_bundler_gem_root(bundle_path: &Path) -> Option<PathBuf> {
-    let ruby_dir = bundle_path.join("ruby");
-    if !ruby_dir.is_dir() {
-        return None;
-    }
-    // Find the API version directory (e.g., "3.4.0")
-    if let Ok(entries) = std::fs::read_dir(&ruby_dir) {
-        for entry in entries.flatten() {
-            let p = entry.path();
-            if p.is_dir() && p.join("gems").is_dir() {
-                return Some(p);
+/// Bundler installs to <path>/ruby/<api_version>/. When several API versions
+/// are present, prefer the active Ruby's; otherwise pick the newest.
+fn find_bundler_gem_root(bundle_path: &Path, project_dir: &Path) -> Option<PathBuf> {
+    let candidates = bundler_api_dirs(bundle_path);
+    if candidates.len() > 1 {
+        if let Some(api) = active_ruby_api_version(project_dir) {
+            if let Some((path, _)) = candidates.iter().find(|(_, name)| *name == api) {
+                return Some(path.clone());
             }
         }
     }
-    None
+    newest_api_dir(candidates)
 }
 
-/// Probe rbenv filesystem to find gem path without spawning a process.
+fn bundler_api_dirs(bundle_path: &Path) -> Vec<(PathBuf, String)> {
+    let mut candidates = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(bundle_path.join("ruby")) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.join("gems").is_dir() {
+                candidates.push((path, entry.file_name().to_string_lossy().to_string()));
+            }
+        }
+    }
+    candidates
+}
+
+fn newest_api_dir(candidates: Vec<(PathBuf, String)>) -> Option<PathBuf> {
+    candidates
+        .into_iter()
+        .max_by(|a, b| compare_gem_versions(&a.1, &b.1).then_with(|| a.1.cmp(&b.1)))
+        .map(|(path, _)| path)
+}
+
+/// RubyGems API version ("3.4.0") of the Ruby the project would run, derived
+/// without spawning: from a probed install prefix, else from `.ruby-version`.
+fn active_ruby_api_version(project_dir: &Path) -> Option<String> {
+    let home = home_dir();
+    if let Some(prefix) = probe_ruby_prefix(project_dir, home.as_deref()) {
+        if let Some(api) = ruby_prefix_gem_dir(&prefix)
+            .and_then(|dir| dir.file_name().map(|n| n.to_string_lossy().to_string()))
+        {
+            return Some(api);
+        }
+    }
+    let version = find_ruby_version_file(project_dir)?;
+    api_version_from_ruby_version(&version)
+}
+
+/// "3.4.8" / "ruby-3.4.8" → "3.4.0".
+fn api_version_from_ruby_version(version: &str) -> Option<String> {
+    let version = version.trim().trim_start_matches("ruby-");
+    let mut parts = version.split('.');
+    let major = parts
+        .next()
+        .filter(|p| p.chars().all(|c| c.is_ascii_digit()))?;
+    let minor = parts
+        .next()
+        .filter(|p| p.chars().all(|c| c.is_ascii_digit()))?;
+    if major.is_empty() || minor.is_empty() {
+        return None;
+    }
+    Some(format!("{major}.{minor}.0"))
+}
+
+/// `<prefix>/lib/ruby/gems/<api>` (newest API dir with a `gems/` subdir).
+fn ruby_prefix_gem_dir(prefix: &Path) -> Option<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(prefix.join("lib").join("ruby").join("gems")) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.join("gems").is_dir() {
+                candidates.push((path, entry.file_name().to_string_lossy().to_string()));
+            }
+        }
+    }
+    newest_api_dir(candidates)
+}
+
+/// Gem dirs RubyGems searches by default for a Ruby install prefix:
+/// `<prefix>/lib/ruby/gems/<api>` plus the user dir `~/.gem/ruby/<api>`.
+fn gem_dirs_for_ruby_prefix(prefix: &Path, home: Option<&Path>) -> Vec<PathBuf> {
+    let Some(default_dir) = ruby_prefix_gem_dir(prefix) else {
+        return Vec::new();
+    };
+    let mut dirs = vec![default_dir.clone()];
+    if let (Some(home), Some(api)) = (home, default_dir.file_name()) {
+        let user_dir = home.join(".gem").join("ruby").join(api);
+        if user_dir.join("gems").is_dir() {
+            dirs.push(user_dir);
+        }
+    }
+    dirs
+}
+
+/// Filesystem-only probes for the active Ruby's gem directories.
+fn probe_version_manager_gem_paths(project_dir: &Path) -> Option<Vec<PathBuf>> {
+    let home = home_dir();
+    if let Some(prefix) = probe_rbenv(project_dir, home.as_deref()) {
+        let dirs = gem_dirs_for_ruby_prefix(&prefix, home.as_deref());
+        if !dirs.is_empty() {
+            return Some(dirs);
+        }
+    }
+    if let Some(path) = probe_rvm(project_dir) {
+        return Some(vec![path]);
+    }
+    let prefix = probe_mise(project_dir, home.as_deref())
+        .or_else(|| probe_asdf(project_dir, home.as_deref()))
+        .or_else(|| probe_chruby(project_dir, home.as_deref()))
+        .or_else(|| probe_path_ruby(home.as_deref()))?;
+    let dirs = gem_dirs_for_ruby_prefix(&prefix, home.as_deref());
+    (!dirs.is_empty()).then_some(dirs)
+}
+
+/// Install prefix of the project's Ruby (rbenv, mise, asdf, chruby, PATH).
+fn probe_ruby_prefix(project_dir: &Path, home: Option<&Path>) -> Option<PathBuf> {
+    probe_rbenv(project_dir, home)
+        .or_else(|| probe_mise(project_dir, home))
+        .or_else(|| probe_asdf(project_dir, home))
+        .or_else(|| probe_chruby(project_dir, home))
+        .or_else(|| probe_path_ruby(home))
+}
+
+/// Pick the install dir for a version spec inside `versions_dir`.
+/// Exact names win; otherwise the spec is matched as a segment-aware prefix
+/// (`3.3` matches `3.3.10` but not `3.30.0`) and the highest version is chosen.
+/// `name_prefix` handles layouts like chruby's `ruby-3.4.8`.
+fn select_version_dir(versions_dir: &Path, spec: &str, name_prefix: &str) -> Option<PathBuf> {
+    let spec = spec.trim();
+    if spec.is_empty() {
+        return None;
+    }
+    let mut specs = vec![spec.to_string()];
+    if let Some(stripped) = spec.strip_prefix("ruby-") {
+        specs.push(stripped.to_string());
+    }
+    for spec in &specs {
+        let exact = versions_dir.join(format!("{name_prefix}{spec}"));
+        if exact.is_dir() {
+            return Some(exact);
+        }
+    }
+
+    let entries = std::fs::read_dir(versions_dir).ok()?;
+    let mut best: Option<(String, PathBuf)> = None;
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        let Some(version) = name.strip_prefix(name_prefix) else {
+            continue;
+        };
+        if !version.starts_with(|c: char| c.is_ascii_digit()) {
+            continue;
+        }
+        let matches = specs.iter().any(|spec| {
+            spec == "latest"
+                || version == spec
+                || version
+                    .strip_prefix(spec.as_str())
+                    .is_some_and(|rest| rest.starts_with('.'))
+        });
+        if !matches || !entry.path().is_dir() {
+            continue;
+        }
+        let better = best
+            .as_ref()
+            .is_none_or(|(best_version, _)| compare_gem_versions(version, best_version).is_gt());
+        if better {
+            best = Some((version.to_string(), entry.path()));
+        }
+    }
+    best.map(|(_, path)| path)
+}
+
+/// Probe rbenv filesystem to find the Ruby prefix without spawning a process.
 /// Replicates rbenv's version resolution: RBENV_VERSION env → .ruby-version
 /// walking up from project_dir → ~/.rbenv/version (global default).
-fn probe_rbenv(project_dir: &Path) -> Option<PathBuf> {
-    let home = std::env::var("HOME").ok().map(PathBuf::from)?;
-    let rbenv_root = std::env::var("RBENV_ROOT")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| home.join(".rbenv"));
-
+fn probe_rbenv(project_dir: &Path, home: Option<&Path>) -> Option<PathBuf> {
+    let rbenv_root = env_path("RBENV_ROOT").or_else(|| home.map(|h| h.join(".rbenv")))?;
     let versions_dir = rbenv_root.join("versions");
     if !versions_dir.is_dir() {
         return None;
     }
 
-    // Resolve version the same way rbenv does
-    let version = std::env::var("RBENV_VERSION").ok().or_else(|| {
-        // Walk from project_dir upward looking for .ruby-version (matches rbenv shim behavior)
+    let version = env_string("RBENV_VERSION").or_else(|| {
         find_ruby_version_file(project_dir).or_else(|| {
-            // Global default
             std::fs::read_to_string(rbenv_root.join("version"))
                 .ok()
                 .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
         })
     })?;
+    select_version_dir(&versions_dir, &version, "")
+}
 
-    // Find exact or prefix-matching version directory
-    let version_dir = versions_dir.join(&version);
-    let resolved_dir = if version_dir.is_dir() {
-        version_dir
-    } else {
-        // Prefix match (e.g., "3.3" matches "3.3.9")
-        let mut best: Option<PathBuf> = None;
-        if let Ok(entries) = std::fs::read_dir(&versions_dir) {
-            for entry in entries.flatten() {
-                let name = entry.file_name().to_string_lossy().to_string();
-                if name.starts_with(&version) && entry.path().is_dir() {
-                    best = Some(entry.path());
+fn mise_data_dir(home: Option<&Path>) -> Option<PathBuf> {
+    env_path("MISE_DATA_DIR")
+        .or_else(|| env_path("XDG_DATA_HOME").map(|p| p.join("mise")))
+        .or_else(|| home.map(|h| h.join(".local").join("share").join("mise")))
+}
+
+fn mise_global_config(home: Option<&Path>) -> Option<PathBuf> {
+    env_path("MISE_GLOBAL_CONFIG_FILE")
+        .or_else(|| env_path("MISE_CONFIG_DIR").map(|p| p.join("config.toml")))
+        .or_else(|| env_path("XDG_CONFIG_HOME").map(|p| p.join("mise").join("config.toml")))
+        .or_else(|| home.map(|h| h.join(".config").join("mise").join("config.toml")))
+}
+
+/// Probe mise installs (`<data>/installs/ruby/<version>`) using mise's config
+/// resolution: MISE_RUBY_VERSION → nearest mise.toml / .tool-versions (or
+/// `.ruby-version` when idiomatic files are enabled for ruby) → global config.
+fn probe_mise(project_dir: &Path, home: Option<&Path>) -> Option<PathBuf> {
+    let installs = mise_data_dir(home)?.join("installs").join("ruby");
+    if !installs.is_dir() {
+        return None;
+    }
+    let global_config = mise_global_config(home);
+    let global_text = global_config
+        .as_ref()
+        .and_then(|path| std::fs::read_to_string(path).ok());
+    let idiomatic = env_string("MISE_IDIOMATIC_VERSION_FILE_ENABLE_TOOLS")
+        .is_some_and(|tools| tools.split(',').any(|t| t.trim() == "ruby"))
+        || global_text
+            .as_deref()
+            .is_some_and(mise_idiomatic_ruby_enabled);
+    let version = env_string("MISE_RUBY_VERSION")
+        .or_else(|| find_mise_ruby_version(project_dir, idiomatic))
+        .or_else(|| global_text.as_deref().and_then(parse_mise_toml_ruby))?;
+    select_version_dir(&installs, &version, "")
+}
+
+fn mise_idiomatic_ruby_enabled(config: &str) -> bool {
+    config.lines().any(|line| {
+        let line = line.trim();
+        (line.starts_with("idiomatic_version_file_enable_tools")
+            && (line.contains("\"ruby\"") || line.contains("'ruby'")))
+            || line.replace(' ', "") == "legacy_version_file=true"
+    })
+}
+
+/// Walk up from `start_dir` looking for the nearest mise-style ruby pin.
+fn find_mise_ruby_version(start_dir: &Path, idiomatic: bool) -> Option<String> {
+    const TOML_FILES: &[&str] = &[
+        "mise.local.toml",
+        ".mise.local.toml",
+        "mise.toml",
+        ".mise.toml",
+        "mise/config.toml",
+        ".mise/config.toml",
+        ".config/mise.toml",
+        ".config/mise/config.toml",
+    ];
+    let mut dir = start_dir
+        .canonicalize()
+        .unwrap_or_else(|_| start_dir.to_path_buf());
+    loop {
+        for file in TOML_FILES {
+            if let Ok(content) = std::fs::read_to_string(dir.join(file)) {
+                if let Some(version) = parse_mise_toml_ruby(&content) {
+                    return Some(version);
                 }
             }
         }
-        best?
-    };
-
-    // Gem path: <ruby_dir>/lib/ruby/gems/<api_version>/
-    let gems_base = resolved_dir.join("lib").join("ruby").join("gems");
-    if let Ok(entries) = std::fs::read_dir(&gems_base) {
-        for entry in entries.flatten() {
-            if entry.path().is_dir() && entry.path().join("gems").is_dir() {
-                return Some(entry.path());
+        if let Ok(content) = std::fs::read_to_string(dir.join(".tool-versions")) {
+            if let Some(version) = parse_tool_versions_ruby(&content) {
+                return Some(version);
             }
+        }
+        if idiomatic {
+            if let Some(version) = read_ruby_version_in(&dir) {
+                return Some(version);
+            }
+        }
+        if !dir.pop() {
+            return None;
+        }
+    }
+}
+
+/// Extract `ruby = "x"` (or `ruby = ["x", ...]` / `ruby = { version = "x" }`)
+/// from a mise TOML `[tools]` table.
+fn parse_mise_toml_ruby(content: &str) -> Option<String> {
+    let mut in_tools = false;
+    for line in content.lines() {
+        let line = line.trim();
+        if line.starts_with('[') {
+            in_tools = line.trim_end_matches(|c: char| c == ']' || c.is_whitespace()) == "[tools";
+            continue;
+        }
+        if !in_tools {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let key = key.trim().trim_matches(|c| c == '"' || c == '\'');
+        if key != "ruby" && key != "core:ruby" {
+            continue;
+        }
+        return extract_quoted_strings(value).into_iter().find(|v| {
+            let v = v.trim();
+            !v.is_empty() && v != "version"
+        });
+    }
+    None
+}
+
+/// Extract the first ruby version from a `.tool-versions` file.
+fn parse_tool_versions_ruby(content: &str) -> Option<String> {
+    content.lines().find_map(|line| {
+        let line = line.split('#').next().unwrap_or("");
+        let mut parts = line.split_whitespace();
+        (parts.next() == Some("ruby"))
+            .then(|| parts.next().map(str::to_string))
+            .flatten()
+    })
+}
+
+/// Probe asdf installs (`<ASDF_DATA_DIR>/installs/ruby/<version>`), resolving
+/// the version from ASDF_RUBY_VERSION → nearest .tool-versions → ~/.tool-versions.
+fn probe_asdf(project_dir: &Path, home: Option<&Path>) -> Option<PathBuf> {
+    let installs = env_path("ASDF_DATA_DIR")
+        .or_else(|| home.map(|h| h.join(".asdf")))?
+        .join("installs")
+        .join("ruby");
+    if !installs.is_dir() {
+        return None;
+    }
+    let version = env_string("ASDF_RUBY_VERSION")
+        .or_else(|| find_tool_versions_ruby(project_dir))
+        .or_else(|| {
+            let content = std::fs::read_to_string(home?.join(".tool-versions")).ok()?;
+            parse_tool_versions_ruby(&content)
+        })?;
+    select_version_dir(&installs, &version, "")
+}
+
+fn find_tool_versions_ruby(start_dir: &Path) -> Option<String> {
+    let mut dir = start_dir
+        .canonicalize()
+        .unwrap_or_else(|_| start_dir.to_path_buf());
+    loop {
+        if let Ok(content) = std::fs::read_to_string(dir.join(".tool-versions")) {
+            if let Some(version) = parse_tool_versions_ruby(&content) {
+                return Some(version);
+            }
+        }
+        if !dir.pop() {
+            return None;
+        }
+    }
+}
+
+/// Probe chruby: an active `RUBY_ROOT`, else `.ruby-version` resolved against
+/// `~/.rubies/ruby-<version>` and `/opt/rubies/ruby-<version>`.
+fn probe_chruby(project_dir: &Path, home: Option<&Path>) -> Option<PathBuf> {
+    if let Some(root) = env_path("RUBY_ROOT") {
+        if root.join("lib").join("ruby").join("gems").is_dir() {
+            return Some(root);
+        }
+    }
+    let mut roots: Vec<PathBuf> = Vec::new();
+    if let Some(home) = home {
+        roots.push(home.join(".rubies"));
+    }
+    roots.push(PathBuf::from("/opt/rubies"));
+    roots.retain(|root| root.is_dir());
+    if roots.is_empty() {
+        return None;
+    }
+    let version = find_ruby_version_file(project_dir)?;
+    let version = version.trim_start_matches("ruby-");
+    roots
+        .iter()
+        .find_map(|root| select_version_dir(root, version, "ruby-"))
+}
+
+/// Derive the Ruby prefix from a `ruby` executable on PATH when its real path
+/// lives inside a known version-manager install tree (no subprocess).
+fn probe_path_ruby(home: Option<&Path>) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    let mut install_roots: Vec<PathBuf> = Vec::new();
+    if let Some(data) = mise_data_dir(home) {
+        install_roots.push(data.join("installs").join("ruby"));
+    }
+    if let Some(asdf) = env_path("ASDF_DATA_DIR").or_else(|| home.map(|h| h.join(".asdf"))) {
+        install_roots.push(asdf.join("installs").join("ruby"));
+    }
+    if let Some(rbenv) = env_path("RBENV_ROOT").or_else(|| home.map(|h| h.join(".rbenv"))) {
+        install_roots.push(rbenv.join("versions"));
+    }
+    if let Some(home) = home {
+        install_roots.push(home.join(".rubies"));
+        install_roots.push(home.join(".rvm").join("rubies"));
+    }
+    install_roots.push(PathBuf::from("/opt/rubies"));
+    let install_roots: Vec<PathBuf> = install_roots
+        .into_iter()
+        .filter_map(|root| root.canonicalize().ok())
+        .collect();
+    if install_roots.is_empty() {
+        return None;
+    }
+    ruby_prefix_from_path_entries(std::env::split_paths(&path), &install_roots)
+}
+
+fn ruby_prefix_from_path_entries(
+    entries: impl Iterator<Item = PathBuf>,
+    install_roots: &[PathBuf],
+) -> Option<PathBuf> {
+    for dir in entries {
+        let candidate = dir.join("ruby");
+        if !candidate.is_file() {
+            continue;
+        }
+        let Ok(real) = candidate.canonicalize() else {
+            continue;
+        };
+        let Some(prefix) = real.parent().and_then(Path::parent) else {
+            continue;
+        };
+        if install_roots.iter().any(|root| prefix.starts_with(root))
+            && prefix.join("lib").join("ruby").join("gems").is_dir()
+        {
+            return Some(prefix.to_path_buf());
         }
     }
     None
+}
+
+fn read_ruby_version_in(dir: &Path) -> Option<String> {
+    let content = std::fs::read_to_string(dir.join(".ruby-version")).ok()?;
+    let version = content.trim().to_string();
+    (!version.is_empty()).then_some(version)
 }
 
 /// Walk from project_dir upward to find a .ruby-version file (same as rbenv shim).
@@ -246,12 +725,8 @@ fn find_ruby_version_file(start_dir: &Path) -> Option<String> {
         .ok()
         .unwrap_or_else(|| start_dir.to_path_buf());
     loop {
-        let candidate = dir.join(".ruby-version");
-        if let Ok(content) = std::fs::read_to_string(&candidate) {
-            let v = content.trim().to_string();
-            if !v.is_empty() {
-                return Some(v);
-            }
+        if let Some(version) = read_ruby_version_in(&dir) {
+            return Some(version);
         }
         if !dir.pop() {
             return None;
@@ -998,6 +1473,39 @@ mod tests {
         );
     }
 
+    #[test]
+    fn compare_versions_prerelease_sorts_before_release() {
+        use std::cmp::Ordering::*;
+        assert_eq!(compare_gem_versions("1.0.0.rc1", "1.0.0"), Less);
+        assert_eq!(compare_gem_versions("1.0.0", "1.0.0.rc1"), Greater);
+        assert_eq!(compare_gem_versions("2.0.0.beta10", "2.0.0.beta9"), Greater);
+        assert_eq!(compare_gem_versions("2.0.0.beta2", "2.0.0.rc1"), Less);
+        assert_eq!(compare_gem_versions("1.0", "1.0.0"), Equal);
+        assert_eq!(compare_gem_versions("1.0.a", "1.0.0.a"), Equal);
+        assert_eq!(compare_gem_versions("1.0.0.pre", "0.9.9"), Greater);
+        assert_eq!(
+            compare_gem_versions("1.99999999999999999999999", "1.2"),
+            Greater
+        );
+    }
+
+    #[test]
+    fn build_gem_index_prefers_release_over_prerelease() {
+        let dir = tempfile::tempdir().unwrap();
+        make_dirs(
+            &dir.path().join("gems"),
+            &[
+                "foo-1.0.0.rc1",
+                "foo-1.0.0",
+                "baz-2.0.0.beta9",
+                "baz-2.0.0.beta10",
+            ],
+        );
+        let index = build_gem_index(&[dir.path().to_path_buf()]);
+        assert!(index["foo"].ends_with("foo-1.0.0"));
+        assert!(index["baz"].ends_with("baz-2.0.0.beta10"));
+    }
+
     // ── read_bundle_path ──
 
     #[test]
@@ -1674,7 +2182,7 @@ PLATFORMS
         let dir = tempfile::tempdir().unwrap();
         let ruby_dir = dir.path().join("ruby").join("3.3.0");
         std::fs::create_dir_all(ruby_dir.join("gems")).unwrap();
-        let result = find_bundler_gem_root(dir.path());
+        let result = find_bundler_gem_root(dir.path(), dir.path());
         assert!(result.is_some());
         assert!(result.unwrap().ends_with("3.3.0"));
     }
@@ -1682,7 +2190,7 @@ PLATFORMS
     #[test]
     fn bundler_gem_root_no_ruby_dir() {
         let dir = tempfile::tempdir().unwrap();
-        let result = find_bundler_gem_root(dir.path());
+        let result = find_bundler_gem_root(dir.path(), dir.path());
         assert!(result.is_none());
     }
 
@@ -1692,8 +2200,198 @@ PLATFORMS
         let ruby_dir = dir.path().join("ruby").join("3.3.0");
         std::fs::create_dir_all(&ruby_dir).unwrap();
         // No "gems" subdir inside version dir
-        let result = find_bundler_gem_root(dir.path());
+        let result = find_bundler_gem_root(dir.path(), dir.path());
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn bundler_gem_root_prefers_active_ruby_api_then_newest() {
+        let dir = tempfile::tempdir().unwrap();
+        for api in ["3.3.0", "3.10.0", "3.4.0"] {
+            std::fs::create_dir_all(dir.path().join("ruby").join(api).join("gems")).unwrap();
+        }
+        let project = dir.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join(".ruby-version"), "3.4.8\n").unwrap();
+        assert!(find_bundler_gem_root(dir.path(), &project)
+            .unwrap()
+            .ends_with("3.4.0"));
+        assert!(newest_api_dir(bundler_api_dirs(dir.path()))
+            .unwrap()
+            .ends_with("3.10.0"));
+    }
+
+    #[test]
+    fn api_version_from_ruby_version_strings() {
+        assert_eq!(api_version_from_ruby_version("3.4.8"), Some("3.4.0".into()));
+        assert_eq!(
+            api_version_from_ruby_version("ruby-3.3.1\n"),
+            Some("3.3.0".into())
+        );
+        assert_eq!(api_version_from_ruby_version("jruby-9.4"), None);
+    }
+
+    // ── version selection / gem path discovery ──
+
+    fn make_dirs(root: &Path, names: &[&str]) {
+        for name in names {
+            std::fs::create_dir_all(root.join(name)).unwrap();
+        }
+    }
+
+    #[test]
+    fn select_version_dir_prefix_is_segment_aware_and_picks_highest() {
+        let dir = tempfile::tempdir().unwrap();
+        make_dirs(dir.path(), &["3.3.9", "3.3.10", "3.30.0", "3.4.1"]);
+        assert!(select_version_dir(dir.path(), "3.3", "")
+            .unwrap()
+            .ends_with("3.3.10"));
+        assert!(select_version_dir(dir.path(), "3.4.1", "")
+            .unwrap()
+            .ends_with("3.4.1"));
+        assert!(select_version_dir(dir.path(), "ruby-3.4.1", "")
+            .unwrap()
+            .ends_with("3.4.1"));
+        assert!(select_version_dir(dir.path(), "3.5", "").is_none());
+        assert!(select_version_dir(dir.path(), "latest", "")
+            .unwrap()
+            .ends_with("3.30.0"));
+    }
+
+    #[test]
+    fn select_version_dir_with_name_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        make_dirs(dir.path(), &["ruby-3.3.9", "ruby-3.3.10", "jruby-9.4.0"]);
+        assert!(select_version_dir(dir.path(), "3.3", "ruby-")
+            .unwrap()
+            .ends_with("ruby-3.3.10"));
+    }
+
+    #[test]
+    fn gem_dirs_for_ruby_prefix_includes_user_gem_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let prefix = dir.path().join("rubies").join("3.4.8");
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(prefix.join("lib/ruby/gems/3.4.0/gems")).unwrap();
+        std::fs::create_dir_all(home.join(".gem/ruby/3.4.0/gems")).unwrap();
+        std::fs::create_dir_all(home.join(".gem/ruby/3.3.0/gems")).unwrap();
+        let dirs = gem_dirs_for_ruby_prefix(&prefix, Some(&home));
+        assert_eq!(
+            dirs,
+            vec![
+                prefix.join("lib/ruby/gems/3.4.0"),
+                home.join(".gem/ruby/3.4.0")
+            ]
+        );
+    }
+
+    #[test]
+    fn gem_paths_from_env_combines_gem_path_and_gem_home() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a");
+        let b = dir.path().join("b");
+        let home = dir.path().join("home");
+        for p in [&a, &b, &home] {
+            std::fs::create_dir_all(p).unwrap();
+        }
+        let joined = std::env::join_paths([&a, &b, &a, &dir.path().join("missing")]).unwrap();
+        assert_eq!(
+            gem_paths_from_env(Some(&joined), Some(&home)),
+            vec![a.clone(), b.clone(), home.clone()]
+        );
+        let joined = std::env::join_paths([&home, &a]).unwrap();
+        assert_eq!(
+            gem_paths_from_env(Some(&joined), Some(&home)),
+            vec![home.clone(), a.clone()]
+        );
+    }
+
+    #[test]
+    fn parse_gem_environment_gempath_uses_platform_separator() {
+        let joined = std::env::join_paths(["/x/gems", "/y/gems", "/x/gems"]).unwrap();
+        let output = format!("{}\n", joined.to_string_lossy());
+        assert_eq!(
+            parse_gem_environment_gempath(&output),
+            vec![PathBuf::from("/x/gems"), PathBuf::from("/y/gems")]
+        );
+    }
+
+    #[test]
+    fn parse_mise_toml_ruby_variants() {
+        assert_eq!(
+            parse_mise_toml_ruby(
+                "[settings]\nruby = \"x\"\n[tools]\nnode = \"25\"\nruby = \"3.4.8\" # pin\n"
+            ),
+            Some("3.4.8".into())
+        );
+        assert_eq!(
+            parse_mise_toml_ruby("[tools]\nruby = [\"3.3\", \"3.4\"]\n"),
+            Some("3.3".into())
+        );
+        assert_eq!(
+            parse_mise_toml_ruby("[tools]\nruby = { version = \"3.2\" }\n"),
+            Some("3.2".into())
+        );
+        assert_eq!(parse_mise_toml_ruby("[tools]\nnode = \"25\"\n"), None);
+        assert!(mise_idiomatic_ruby_enabled(
+            "[settings]\nidiomatic_version_file_enable_tools = [\"node\", \"ruby\"]\n"
+        ));
+        assert!(!mise_idiomatic_ruby_enabled(
+            "[settings]\nidiomatic_version_file_enable_tools = [\"node\"]\n"
+        ));
+    }
+
+    #[test]
+    fn parse_tool_versions_ruby_line() {
+        assert_eq!(
+            parse_tool_versions_ruby("nodejs 20.1.0\n# ruby 2.0\nruby 3.4.8 system\n"),
+            Some("3.4.8".into())
+        );
+        assert_eq!(parse_tool_versions_ruby("nodejs 20\n"), None);
+    }
+
+    #[test]
+    fn find_mise_ruby_version_walks_up_and_respects_idiomatic_setting() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("a").join("b");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join(".ruby-version"), "3.2.1\n").unwrap();
+        std::fs::write(
+            dir.path().join("a").join("mise.toml"),
+            "[tools]\nruby = \"3.4\"\n",
+        )
+        .unwrap();
+        assert_eq!(find_mise_ruby_version(&project, false), Some("3.4".into()));
+        assert_eq!(find_mise_ruby_version(&project, true), Some("3.2.1".into()));
+        std::fs::write(project.join(".tool-versions"), "ruby 3.3.0\n").unwrap();
+        assert_eq!(
+            find_mise_ruby_version(&project, false),
+            Some("3.3.0".into())
+        );
+    }
+
+    #[test]
+    fn ruby_prefix_from_path_requires_install_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("installs").join("ruby");
+        let prefix = root.join("3.4.8");
+        std::fs::create_dir_all(prefix.join("bin")).unwrap();
+        std::fs::create_dir_all(prefix.join("lib/ruby/gems/3.4.0/gems")).unwrap();
+        std::fs::write(prefix.join("bin").join("ruby"), "").unwrap();
+        let other = dir.path().join("usr");
+        std::fs::create_dir_all(other.join("bin")).unwrap();
+        std::fs::create_dir_all(other.join("lib/ruby/gems/2.6.0/gems")).unwrap();
+        std::fs::write(other.join("bin").join("ruby"), "").unwrap();
+        let roots = vec![root.canonicalize().unwrap()];
+        let found = ruby_prefix_from_path_entries(
+            vec![other.join("bin"), prefix.join("bin")].into_iter(),
+            &roots,
+        );
+        assert_eq!(found, Some(prefix.canonicalize().unwrap()));
+        assert_eq!(
+            ruby_prefix_from_path_entries(vec![other.join("bin")].into_iter(), &roots),
+            None
+        );
     }
 
     // ── find_ruby_version_file ──

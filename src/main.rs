@@ -236,13 +236,16 @@ fn main() {
             || {
                 rayon::join(
                     || {
-                        let gp = introspect::find_gem_paths(&dir);
+                        let gp = timed!("find_gem_paths", introspect::find_gem_paths(&dir));
                         rayon::join(
                             || {
-                                introspect::build_gem_index_for_lock(
-                                    &gp,
-                                    &lockfile,
-                                    current_gem_platform,
+                                timed!(
+                                    "build_gem_index",
+                                    introspect::build_gem_index_for_lock(
+                                        &gp,
+                                        &lockfile,
+                                        current_gem_platform,
+                                    )
                                 )
                             },
                             || {
@@ -255,12 +258,15 @@ fn main() {
                         )
                     },
                     || {
-                        scanner::scan_source_tree_with_threads_and_explicit_skips(
-                            &dir,
-                            &skip_dirs,
-                            &extra_refs,
-                            cache_for_scan,
-                            walker_threads,
+                        timed!(
+                            "scan_source_tree",
+                            scanner::scan_source_tree_with_threads_and_explicit_skips(
+                                &dir,
+                                &skip_dirs,
+                                &extra_refs,
+                                cache_for_scan,
+                                walker_threads,
+                            )
                         )
                     },
                 )
