@@ -2497,6 +2497,7 @@ PLATFORMS
             module_names: Vec::new(),
             require_false: false,
             source: Some(GemSource::Git(url.to_string())),
+            declarations: Vec::new(),
         }
     }
 
