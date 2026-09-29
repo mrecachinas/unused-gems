@@ -2613,8 +2613,10 @@ fn is_scannable(_path: &str, full_path: &Path) -> bool {
         {
             return true;
         }
-        // Extensionless files with Ruby shebang
-        if full_path.extension().is_none() && full_path.is_file() {
+        // Extensionless files with Ruby shebang. The walker only passes regular
+        // files, so no extra stat is needed; names that are never executable
+        // Ruby scripts are rejected before opening the file.
+        if full_path.extension().is_none() && may_be_ruby_script_name(name_bytes) {
             if let Ok(mut f) = std::fs::File::open(full_path) {
                 use std::io::Read;
                 let mut buf = [0u8; 64];
@@ -2632,6 +2634,38 @@ fn is_scannable(_path: &str, full_path: &Path) -> bool {
     }
 
     false
+}
+
+/// Extensionless names that are never Ruby scripts even though they cannot be
+/// ruled out by extension (placeholders, docs, and DSL files without shebangs).
+const NON_SCRIPT_FILENAMES: &[&str] = &[
+    "Gemfile",
+    "Makefile",
+    "Dockerfile",
+    "Brewfile",
+    "Podfile",
+    "Fastfile",
+    "Appfile",
+    "Dangerfile",
+    "Steepfile",
+    "Containerfile",
+    "Justfile",
+];
+
+/// Cheap name filter applied before opening an extensionless file to look for
+/// a Ruby shebang: skips dotfiles (`.keep`, `.gitkeep`), all-caps docs
+/// (`LICENSE`, `README`, `VERSION`) and well-known non-script names.
+fn may_be_ruby_script_name(name: &[u8]) -> bool {
+    if name.is_empty() || name[0] == b'.' {
+        return false;
+    }
+    let all_caps = name
+        .iter()
+        .all(|&b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_' || b == b'-');
+    if all_caps {
+        return false;
+    }
+    !NON_SCRIPT_FILENAMES.iter().any(|f| f.as_bytes() == name)
 }
 
 // (FileContent enum removed — plain read() is faster for single sequential reads)
@@ -3797,6 +3831,22 @@ require 'real_regex'
         let script = dir.path().join("my_script");
         std::fs::write(&script, "#!/bin/bash\necho hello\n").unwrap();
         assert!(!is_scannable(script.to_str().unwrap(), &script));
+    }
+
+    #[test]
+    fn is_scannable_skips_placeholder_and_doc_names_without_opening() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in [".keep", ".gitkeep", "LICENSE", "README", "Makefile"] {
+            let path = dir.path().join(name);
+            std::fs::write(&path, "#!/usr/bin/env ruby\nrequire 'x'\n").unwrap();
+            assert!(!is_scannable(path.to_str().unwrap(), &path), "{name}");
+        }
+        let script = dir.path().join("setup");
+        std::fs::write(&script, "#!/usr/bin/env ruby\nrequire 'x'\n").unwrap();
+        assert!(is_scannable(script.to_str().unwrap(), &script));
+        assert!(may_be_ruby_script_name(b"console"));
+        assert!(!may_be_ruby_script_name(b".keep"));
+        assert!(!may_be_ruby_script_name(b"CHANGELOG"));
     }
 
     #[test]
