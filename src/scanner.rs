@@ -337,11 +337,24 @@ fn set_mask(mask: &mut [u8], start: usize, end: usize, value: bool) {
 
 type PercentEndCache = HashMap<(usize, bool), Option<usize>>;
 type InterpolationEndCache = HashMap<usize, Option<usize>>;
+/// (heredoc delimiter, search end) → earliest body start known to have no
+/// terminator line before the search end.
+type HeredocMissCache = HashMap<(Vec<u8>, usize), usize>;
 
 #[cfg(test)]
 type LexicalScanSteps = usize;
 #[cfg(not(test))]
 type LexicalScanSteps = ();
+
+/// Memoization shared by one lexical masking pass so malformed input stays
+/// linear instead of re-scanning to EOF for every unterminated opener.
+#[derive(Default)]
+struct LexCache {
+    percent_ends: PercentEndCache,
+    interpolation_ends: InterpolationEndCache,
+    heredoc_misses: HeredocMissCache,
+    steps: LexicalScanSteps,
+}
 
 #[inline]
 fn count_lexical_scan_step(steps: &mut LexicalScanSteps) {
@@ -455,9 +468,7 @@ fn expose_interpolations(
     mask: &mut [u8],
     start: usize,
     end: usize,
-    percent_ends: &mut PercentEndCache,
-    interpolation_ends: &mut InterpolationEndCache,
-    lexical_steps: &mut LexicalScanSteps,
+    cache: &mut LexCache,
 ) {
     let mut i = start;
     while i + 1 < end {
@@ -466,19 +477,15 @@ fn expose_interpolations(
             continue;
         }
         if bytes[i] == b'#' && bytes[i + 1] == b'{' {
-            if let Some(close) =
-                find_interpolation_end_cached(bytes, i + 2, end, interpolation_ends, lexical_steps)
-            {
+            if let Some(close) = find_interpolation_end_cached(
+                bytes,
+                i + 2,
+                end,
+                &mut cache.interpolation_ends,
+                &mut cache.steps,
+            ) {
                 set_mask(mask, i + 2, close, false);
-                mask_ruby_range_cached(
-                    bytes,
-                    mask,
-                    i + 2,
-                    close,
-                    percent_ends,
-                    interpolation_ends,
-                    lexical_steps,
-                );
+                mask_ruby_range_cached(bytes, mask, i + 2, close, cache);
                 i = close + 1;
                 continue;
             }
@@ -780,10 +787,14 @@ fn find_percent_literal_end(
     open: u8,
     close: u8,
     regex: bool,
-    percent_ends: &mut PercentEndCache,
-    interpolation_ends: &mut InterpolationEndCache,
-    lexical_steps: &mut LexicalScanSteps,
+    cache: &mut LexCache,
 ) -> Option<usize> {
+    let LexCache {
+        percent_ends,
+        interpolation_ends,
+        steps: lexical_steps,
+        ..
+    } = cache;
     let cache_key = (open_pos, regex);
     if let Some(cached) = percent_ends.get(&cache_key) {
         return *cached;
@@ -883,7 +894,25 @@ fn find_percent_literal_end(
     None
 }
 
-fn parse_heredoc(bytes: &[u8], abs: usize, end: usize) -> Option<(usize, usize, bool)> {
+/// A heredoc opener parsed by `parse_heredoc`.
+struct Heredoc {
+    delim_end: usize,
+    body_start: usize,
+    /// End of the terminator line's content (exclusive).
+    body_end: usize,
+    interpolated: bool,
+}
+
+/// Parse a heredoc opener at `abs` (pointing at `<<`). `body_start` overrides
+/// where the body begins, for the second of several heredocs opened on one
+/// line (`foo(<<~A, <<~B)`).
+fn parse_heredoc(
+    bytes: &[u8],
+    abs: usize,
+    end: usize,
+    body_start: Option<usize>,
+    cache: &mut LexCache,
+) -> Option<Heredoc> {
     if abs > 0
         && !matches!(
             bytes[abs - 1],
@@ -918,10 +947,21 @@ fn parse_heredoc(bytes: &[u8], abs: usize, end: usize) -> Option<(usize, usize, 
         i += 1;
     }
     let line_end = memchr::memchr(b'\n', &bytes[i..end]).map(|n| i + n)?;
-    let body_start = line_end + 1;
+    let body_start = body_start.unwrap_or(line_end + 1);
     let delim = &bytes[delim_start..delim_end];
+    // Terminator lines found at or after P are also found from any later
+    // start, so a failed search from P rules out every later body start.
+    let miss_key = (delim.to_vec(), end);
+    if cache
+        .heredoc_misses
+        .get(&miss_key)
+        .is_some_and(|&no_terminator_from| body_start >= no_terminator_from)
+    {
+        return None;
+    }
     let mut line_start = body_start;
     while line_start < end {
+        count_lexical_scan_step(&mut cache.steps);
         let eol = memchr::memchr(b'\n', &bytes[line_start..end])
             .map(|n| line_start + n)
             .unwrap_or(end);
@@ -935,29 +975,27 @@ fn parse_heredoc(bytes: &[u8], abs: usize, end: usize) -> Option<(usize, usize, 
             content += 1;
         }
         if content + delim.len() == content_end && &bytes[content..content_end] == delim {
-            return Some((delim_end, content_end, quote != Some(b'\'')));
+            return Some(Heredoc {
+                delim_end,
+                body_start,
+                body_end: content_end,
+                interpolated: quote != Some(b'\''),
+            });
         }
         line_start = if eol < end { eol + 1 } else { eol };
     }
+    cache
+        .heredoc_misses
+        .entry(miss_key)
+        .and_modify(|no_terminator_from| {
+            *no_terminator_from = (*no_terminator_from).min(body_start)
+        })
+        .or_insert(body_start);
     None
 }
 
 fn mask_ruby_range(bytes: &[u8], mask: &mut [u8], start: usize, end: usize) {
-    let mut percent_ends = PercentEndCache::new();
-    let mut interpolation_ends = InterpolationEndCache::new();
-    #[cfg(test)]
-    let mut lexical_steps = 0;
-    #[cfg(not(test))]
-    let mut lexical_steps = ();
-    mask_ruby_range_cached(
-        bytes,
-        mask,
-        start,
-        end,
-        &mut percent_ends,
-        &mut interpolation_ends,
-        &mut lexical_steps,
-    );
+    mask_ruby_range_cached(bytes, mask, start, end, &mut LexCache::default());
 }
 
 fn mask_ruby_range_cached(
@@ -965,10 +1003,10 @@ fn mask_ruby_range_cached(
     mask: &mut [u8],
     start: usize,
     end: usize,
-    percent_ends: &mut PercentEndCache,
-    interpolation_ends: &mut InterpolationEndCache,
-    lexical_steps: &mut LexicalScanSteps,
+    cache: &mut LexCache,
 ) {
+    // (opener line end, where the next heredoc body on that line starts)
+    let mut pending_heredoc_body: Option<(usize, usize)> = None;
     let mut i = start;
     while i < end {
         if mask[i] != 0 {
@@ -1021,8 +1059,8 @@ fn mask_ruby_range_cached(
                             bytes,
                             close + 2,
                             end,
-                            interpolation_ends,
-                            lexical_steps,
+                            &mut cache.interpolation_ends,
+                            &mut cache.steps,
                         )
                         .map(|interpolation_end| interpolation_end + 1)
                         .unwrap_or(end);
@@ -1042,15 +1080,7 @@ fn mask_ruby_range_cached(
                 };
                 set_mask(mask, content_start, literal_end, true);
                 if quote == b'"' {
-                    expose_interpolations(
-                        bytes,
-                        mask,
-                        content_start,
-                        literal_end,
-                        percent_ends,
-                        interpolation_ends,
-                        lexical_steps,
-                    );
+                    expose_interpolations(bytes, mask, content_start, literal_end, cache);
                 }
                 i = if found_close { close + 1 } else { literal_end };
             }
@@ -1080,21 +1110,11 @@ fn mask_ruby_range_cached(
                     open,
                     close,
                     bytes[i + 1] == b'r',
-                    percent_ends,
-                    interpolation_ends,
-                    lexical_steps,
+                    cache,
                 ) {
                     set_mask(mask, content_start, literal_end, true);
                     if matches!(bytes[i + 1], b'Q' | b'r' | b'W' | b'I' | b'x') {
-                        expose_interpolations(
-                            bytes,
-                            mask,
-                            content_start,
-                            literal_end,
-                            percent_ends,
-                            interpolation_ends,
-                            lexical_steps,
-                        );
+                        expose_interpolations(bytes, mask, content_start, literal_end, cache);
                     }
                     i = literal_end + 1;
                 } else {
@@ -1108,39 +1128,35 @@ fn mask_ruby_range_cached(
             b'/' if is_regex_start(bytes, mask, start, i) => {
                 if let Some(regex_end) = find_delimited_end(bytes, i + 1, end, b'/', b'/', true) {
                     set_mask(mask, i + 1, regex_end, true);
-                    expose_interpolations(
-                        bytes,
-                        mask,
-                        i + 1,
-                        regex_end,
-                        percent_ends,
-                        interpolation_ends,
-                        lexical_steps,
-                    );
+                    expose_interpolations(bytes, mask, i + 1, regex_end, cache);
                     i = regex_end + 1;
                 } else {
                     i += 1;
                 }
             }
             b'<' if i + 1 < end && bytes[i + 1] == b'<' => {
-                if let Some((delim_end, heredoc_end, interpolated)) = parse_heredoc(bytes, i, end) {
-                    let line_end = memchr::memchr(b'\n', &bytes[delim_end..end])
-                        .map(|n| delim_end + n)
-                        .unwrap_or(end);
-                    let body_start = (line_end + 1).min(end);
-                    set_mask(mask, i + 2, delim_end, true);
-                    set_mask(mask, body_start, heredoc_end, true);
-                    if interpolated {
+                let line_end = memchr::memchr(b'\n', &bytes[i..end])
+                    .map(|n| i + n)
+                    .unwrap_or(end);
+                let body_start = pending_heredoc_body
+                    .filter(|&(opener_line_end, _)| opener_line_end == line_end)
+                    .map(|(_, next_body)| next_body);
+                if let Some(heredoc) = parse_heredoc(bytes, i, end, body_start, cache) {
+                    set_mask(mask, i + 2, heredoc.delim_end, true);
+                    set_mask(mask, heredoc.body_start, heredoc.body_end, true);
+                    if heredoc.interpolated {
                         expose_interpolations(
                             bytes,
                             mask,
-                            body_start,
-                            heredoc_end,
-                            percent_ends,
-                            interpolation_ends,
-                            lexical_steps,
+                            heredoc.body_start,
+                            heredoc.body_end,
+                            cache,
                         );
                     }
+                    let next_body = memchr::memchr(b'\n', &bytes[heredoc.body_end..end])
+                        .map(|n| heredoc.body_end + n + 1)
+                        .unwrap_or(end);
+                    pending_heredoc_body = Some((line_end, next_body));
                 }
                 i += 2;
             }
@@ -1229,19 +1245,9 @@ fn build_skip_mask(bytes: &[u8], is_ruby: bool, line_kind: LineCommentKind) -> V
 #[cfg(test)]
 fn build_ruby_skip_mask_with_lexical_steps(bytes: &[u8]) -> (Vec<u8>, usize) {
     let mut mask = vec![0; bytes.len()];
-    let mut percent_ends = PercentEndCache::new();
-    let mut interpolation_ends = InterpolationEndCache::new();
-    let mut lexical_steps = 0;
-    mask_ruby_range_cached(
-        bytes,
-        &mut mask,
-        0,
-        bytes.len(),
-        &mut percent_ends,
-        &mut interpolation_ends,
-        &mut lexical_steps,
-    );
-    (mask, lexical_steps)
+    let mut cache = LexCache::default();
+    mask_ruby_range_cached(bytes, &mut mask, 0, bytes.len(), &mut cache);
+    (mask, cache.steps)
 }
 
 fn build_skip_mask_for_template(
@@ -3140,6 +3146,38 @@ AfterPercentLiterals.call
         ] {
             assert!(modules.contains_key(visible), "{visible}");
         }
+    }
+
+    #[test]
+    fn unterminated_heredoc_openers_scan_linearly() {
+        fn steps_for(lines: usize) -> usize {
+            let mut input = b"items <<item\n".repeat(lines);
+            input.extend_from_slice(b"require 'after_shovels'\n");
+            let (mask, steps) = build_ruby_skip_mask_with_lexical_steps(&input);
+            let mut requires = Vec::new();
+            scan_requires_filtered(&input, &mask, &mut requires);
+            assert_eq!(requires, vec!["after_shovels"]);
+            steps
+        }
+        let small = steps_for(1_000);
+        let large = steps_for(2_000);
+        assert!(
+            large <= small * 3,
+            "doubling input must remain linear: {small} -> {large}"
+        );
+    }
+
+    #[test]
+    fn two_heredocs_on_one_line_have_sequential_bodies() {
+        let input = b"foo(<<~A, <<~'B')\n  #{Beta.x}\n  StaticA\nA\n  raw #{NotInterpolated}\nB\nAfter.call\n";
+        let mask = build_skip_mask(input, true, LineCommentKind::Hash);
+        let mut modules = HashMap::new();
+        let path: Arc<str> = Arc::from("test.rb");
+        scan_modules_filtered_into(input, &mask, &mut modules, &path);
+        assert!(modules.contains_key("Beta"), "{modules:?}");
+        assert!(modules.contains_key("After"));
+        assert!(!modules.contains_key("StaticA"));
+        assert!(!modules.contains_key("NotInterpolated"));
     }
 
     #[test]
