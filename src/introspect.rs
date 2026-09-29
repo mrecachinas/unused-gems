@@ -8,9 +8,6 @@ use regex::Regex;
 use crate::lockfile::Lockfile;
 use crate::types::{GemEntry, GemSource};
 
-static MODULE_DECL_RE: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"(?m)^\s*(?:module|class)\s+([A-Z][\w:]+)").unwrap());
-
 /// Generic module/class names that appear in many gems and would over-match
 /// when used as a usage signal (e.g. any `Configuration` reference in app code
 /// would mark the gem Used). These are filtered out of discovered module names;
@@ -937,8 +934,10 @@ fn candidate_full_name(path: &Path) -> Option<String> {
 pub fn index_declared_gem_sources(
     project_dir: &Path,
     gems: &[GemEntry],
+    gem_paths: &[PathBuf],
     index: &mut HashMap<String, PathBuf>,
 ) {
+    let mut git_context: Option<(Vec<PathBuf>, HashMap<String, LockedGitSource>)> = None;
     for gem in gems {
         match gem.source.as_ref() {
             Some(GemSource::Path(path)) => {
@@ -952,8 +951,15 @@ pub fn index_declared_gem_sources(
                     );
                 }
             }
-            Some(GemSource::Git(_)) => {
-                if let Some(path) = find_local_git_checkout(project_dir, &gem.name) {
+            Some(GemSource::Git(url)) => {
+                let (roots, locked) = git_context.get_or_insert_with(|| {
+                    (
+                        git_checkout_roots(project_dir, gem_paths),
+                        read_locked_git_sources(project_dir),
+                    )
+                });
+                if let Some(path) = find_git_checkout(roots, &gem.name, url, locked.get(&gem.name))
+                {
                     index.insert(gem.name.clone(), path);
                 }
             }
@@ -973,151 +979,551 @@ fn looks_like_gem_source(path: &Path) -> bool {
                 .is_some())
 }
 
-fn find_local_git_checkout(project_dir: &Path, gem_name: &str) -> Option<PathBuf> {
-    let mut roots = Vec::new();
-    roots.push(project_dir.join(".bundle"));
-    roots.push(project_dir.join("vendor").join("bundle"));
+/// A gem's GIT source from Gemfile.lock.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct LockedGitSource {
+    remote: String,
+    revision: String,
+}
+
+/// Map gem name → GIT `remote:`/`revision:` from the project's Gemfile.lock.
+fn read_locked_git_sources(project_dir: &Path) -> HashMap<String, LockedGitSource> {
+    std::fs::read_to_string(project_dir.join("Gemfile.lock"))
+        .map(|content| parse_locked_git_sources(&content))
+        .unwrap_or_default()
+}
+
+fn parse_locked_git_sources(content: &str) -> HashMap<String, LockedGitSource> {
+    let mut sources = HashMap::new();
+    let mut current: Option<LockedGitSource> = None;
+    for line in content.lines() {
+        if !line.starts_with(' ') {
+            current = (line.trim() == "GIT").then(LockedGitSource::default);
+            continue;
+        }
+        let Some(source) = current.as_mut() else {
+            continue;
+        };
+        if let Some(remote) = line.strip_prefix("  remote:") {
+            source.remote = remote.trim().to_string();
+        } else if let Some(revision) = line.strip_prefix("  revision:") {
+            source.revision = revision.trim().to_string();
+        } else if line.starts_with("    ") && !line.starts_with("     ") {
+            if let Some(name) = line.split_whitespace().next() {
+                sources.insert(name.to_string(), source.clone());
+            }
+        }
+    }
+    sources
+}
+
+/// Bundler's checkout dir base name for a git remote (`.../rails.git` → `rails`).
+fn git_repo_basename(remote: &str) -> Option<String> {
+    let trimmed = remote.trim().trim_end_matches('/');
+    let last = trimmed.rsplit(['/', ':']).next()?;
+    let name = last.strip_suffix(".git").unwrap_or(last);
+    (!name.is_empty()).then(|| name.to_string())
+}
+
+/// All `bundler/gems` dirs where Bundler may have checked out git sources:
+/// every gem path, BUNDLE_PATH, and project-local `.bundle` / `vendor/bundle`.
+fn git_checkout_roots(project_dir: &Path, gem_paths: &[PathBuf]) -> Vec<PathBuf> {
+    let mut bases: Vec<PathBuf> = gem_paths.to_vec();
+    let mut bundle_dirs = vec![
+        project_dir.join(".bundle"),
+        project_dir.join("vendor").join("bundle"),
+    ];
     if let Some(bundle_path) = read_bundle_path(project_dir) {
-        roots.push(if bundle_path.is_absolute() {
+        bundle_dirs.push(if bundle_path.is_absolute() {
             bundle_path
         } else {
             project_dir.join(bundle_path)
         });
     }
+    for bundle_dir in bundle_dirs {
+        if let Ok(entries) = std::fs::read_dir(bundle_dir.join("ruby")) {
+            bases.extend(entries.flatten().map(|entry| entry.path()));
+        }
+        bases.push(bundle_dir);
+    }
+    let mut roots = Vec::new();
+    for base in bases {
+        push_unique_dir(&mut roots, base.join("bundler").join("gems"));
+    }
+    roots
+}
 
-    for root in roots {
-        let pattern = root
-            .join("ruby")
-            .join("*")
-            .join("bundler")
-            .join("gems")
-            .join(format!("{}-*", gem_name))
-            .display()
-            .to_string();
-        let mut paths: Vec<PathBuf> = glob::glob(&pattern)
-            .into_iter()
-            .flatten()
-            .flatten()
-            .collect();
-        paths.sort();
-        for path in paths {
-            if looks_like_gem_source(&path) {
-                return Some(path);
+fn is_checkout_suffix(suffix: &str) -> bool {
+    (7..=40).contains(&suffix.len()) && suffix.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// Locate a git gem's checkout. Bundler names checkouts `<repo>-<12 hex>`
+/// after the repository, not the gem, and one repo may hold several gems
+/// (rails/activesupport/activesupport.gemspec), so candidates are matched by
+/// repo basename (lockfile remote, Gemfile URL, gem name) with a hex suffix,
+/// preferring the locked revision, then resolved to the dir holding
+/// `<gem>.gemspec`. As a last resort every checkout is searched for it.
+fn find_git_checkout(
+    roots: &[PathBuf],
+    gem_name: &str,
+    url: &str,
+    locked: Option<&LockedGitSource>,
+) -> Option<PathBuf> {
+    let mut basenames: Vec<String> = Vec::new();
+    for remote in [locked.map(|l| l.remote.as_str()), Some(url)]
+        .into_iter()
+        .flatten()
+    {
+        if let Some(name) = git_repo_basename(remote) {
+            if !basenames.contains(&name) {
+                basenames.push(name);
             }
         }
+    }
+    if !basenames.iter().any(|name| name == gem_name) {
+        basenames.push(gem_name.to_string());
+    }
+    let revision = locked.map(|l| l.revision.as_str()).unwrap_or("");
+
+    let mut checkouts: Vec<PathBuf> = Vec::new();
+    for root in roots {
+        if let Ok(entries) = std::fs::read_dir(root) {
+            for entry in entries.flatten() {
+                if entry.path().is_dir() {
+                    checkouts.push(entry.path());
+                }
+            }
+        }
+    }
+    checkouts.sort();
+
+    let mut matching: Vec<(bool, &PathBuf)> = checkouts
+        .iter()
+        .filter_map(|path| {
+            let dir_name = path.file_name()?.to_string_lossy().to_string();
+            let suffix = basenames.iter().find_map(|base| {
+                dir_name
+                    .strip_prefix(base.as_str())
+                    .and_then(|rest| rest.strip_prefix('-'))
+                    .filter(|suffix| is_checkout_suffix(suffix))
+            })?;
+            let locked_rev = !revision.is_empty() && revision.starts_with(suffix);
+            Some((locked_rev, path))
+        })
+        .collect();
+    // Locked revision first; otherwise keep sorted (deterministic) order.
+    matching.sort_by_key(|(locked_rev, _)| !locked_rev);
+    for (_, checkout) in &matching {
+        if let Some(dir) = gem_dir_in_checkout(checkout, gem_name) {
+            return Some(dir);
+        }
+    }
+    for (_, checkout) in &matching {
+        if looks_like_gem_source(checkout) {
+            return Some((*checkout).clone());
+        }
+    }
+    checkouts
+        .iter()
+        .find_map(|checkout| gem_dir_in_checkout(checkout, gem_name))
+}
+
+/// Dir inside a checkout that holds `<gem>.gemspec` (root or up to two levels deep).
+fn gem_dir_in_checkout(checkout: &Path, gem_name: &str) -> Option<PathBuf> {
+    let spec = format!("{gem_name}.gemspec");
+    if checkout.join(&spec).is_file() {
+        return Some(checkout.to_path_buf());
+    }
+    let mut level = vec![checkout.to_path_buf()];
+    for _ in 0..2 {
+        let mut next = Vec::new();
+        for dir in &level {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                continue;
+            };
+            let mut children: Vec<PathBuf> = entries
+                .flatten()
+                .map(|entry| entry.path())
+                .filter(|path| {
+                    path.is_dir()
+                        && !path
+                            .file_name()
+                            .is_some_and(|name| name.to_string_lossy().starts_with('.'))
+                })
+                .collect();
+            children.sort();
+            for child in children {
+                if child.join(&spec).is_file() {
+                    return Some(child);
+                }
+                next.push(child);
+            }
+        }
+        level = next;
     }
     None
 }
 
-/// Discover actual require paths by inspecting the installed gem's lib/ directory.
-/// Also checks gemspec for custom require_paths (e.g., ["lib", "ext"]).
+/// Library folders that hold generators/rake tasks/assets rather than
+/// requireable library code (unless named after the gem itself).
+const AUXILIARY_DIRS: &[&str] = &["assets", "generators", "tasks", "templates"];
+
+/// Upper bound on require paths enumerated inside namespace-extension folders
+/// (e.g. `lib/rubocop/cop/performance/*.rb` for rubocop-performance).
+const MAX_ENUMERATED_REQUIRE_PATHS: usize = 256;
+const MAX_ENUMERATION_DEPTH: usize = 6;
+
+/// Namespaces (require roots and constants) claimed by gems, used so that one
+/// gem's namespace-extension folders or reopened constants don't claim usage
+/// that belongs to another gem (e.g. solid_cache's `lib/active_support/` or
+/// rails-html-sanitizer's `module ActionView`).
+#[derive(Debug, Default)]
+pub struct NamespaceClaims {
+    /// Require root → Gemfile gems whose name forms / known paths claim it.
+    require_roots: HashMap<String, Vec<String>>,
+    /// Lowercased constant → gems (Gemfile, installed, known table) owning it.
+    modules: HashMap<String, Vec<String>>,
+    /// Every gem name we know about (Gemfile, installed, known table).
+    gem_names: HashSet<String>,
+    /// Proper name prefix ("google-cloud", "active_model") → number of gems
+    /// whose names start with it.
+    family_prefixes: HashMap<String, usize>,
+    gemfile_gems: HashSet<String>,
+    /// Direct lockfile dependencies per gem.
+    dependencies: HashMap<String, HashSet<String>>,
+}
+
+/// Constant names a gem is conventionally expected to own: its PascalCase
+/// name, its hyphen namespace (`aws-sdk-s3` → `Aws::Sdk::S3`) and curated names.
+pub fn own_module_forms(gem_name: &str) -> Vec<String> {
+    let mut forms = vec![gem_name
+        .split(['-', '_'])
+        .map(capitalize_ascii)
+        .collect::<String>()];
+    if gem_name.contains('-') {
+        forms.push(
+            gem_name
+                .split('-')
+                .map(|part| part.split('_').map(capitalize_ascii).collect::<String>())
+                .collect::<Vec<_>>()
+                .join("::"),
+        );
+    }
+    if let Some(known) = crate::known::module_names_for(gem_name) {
+        forms.extend(known.iter().map(|name| name.to_string()));
+    }
+    forms.retain(|form| !form.is_empty());
+    forms
+}
+
+fn capitalize_ascii(s: &str) -> String {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(c) => c.to_uppercase().collect::<String>() + chars.as_str(),
+        None => String::new(),
+    }
+}
+
+/// Require roots a Gemfile gem claims: its name, underscored and slashed
+/// forms, and curated require paths.
+fn own_require_roots(gem_name: &str) -> Vec<String> {
+    let mut roots = vec![
+        gem_name.to_string(),
+        gem_name.replace('-', "_"),
+        gem_name.replace('-', "/"),
+    ];
+    if let Some(known) = crate::known::require_paths_for(gem_name) {
+        roots.extend(known.iter().map(|path| path.to_string()));
+    }
+    roots.sort();
+    roots.dedup();
+    roots
+}
+
+impl NamespaceClaims {
+    /// Build claims from the Gemfile's gems plus every installed gem name.
+    /// Constants are also claimed for every gem in the curated known table.
+    pub fn build<'a>(
+        gemfile_gems: &'a [String],
+        installed_gems: impl IntoIterator<Item = &'a String>,
+    ) -> Self {
+        let mut claims = NamespaceClaims {
+            gemfile_gems: gemfile_gems.iter().cloned().collect(),
+            ..NamespaceClaims::default()
+        };
+        for gem in gemfile_gems {
+            for root in own_require_roots(gem) {
+                push_owner(&mut claims.require_roots, root, gem);
+            }
+        }
+        let mut all: HashSet<&str> = gemfile_gems.iter().map(String::as_str).collect();
+        all.extend(installed_gems.into_iter().map(String::as_str));
+        all.extend(crate::known::MODULE_NAMES.iter().map(|(gem, _)| *gem));
+        all.extend(crate::known::REQUIRE_PATHS.iter().map(|(gem, _)| *gem));
+        for gem in all {
+            for form in own_module_forms(gem) {
+                push_owner(&mut claims.modules, form.to_lowercase(), gem);
+            }
+            for prefix in proper_name_prefixes(gem) {
+                *claims.family_prefixes.entry(prefix).or_default() += 1;
+            }
+            claims.gem_names.insert(gem.to_string());
+        }
+        claims
+    }
+
+    /// Record Gemfile.lock direct dependencies. A namespace owned by a gem's
+    /// own dependency that isn't declared in the Gemfile (factory_bot for
+    /// factory_bot_rails) is reachable only through that gem, so it still
+    /// counts as usage of it.
+    pub fn with_lock_dependencies(mut self, dependencies: &HashMap<String, Vec<String>>) -> Self {
+        self.dependencies = dependencies
+            .iter()
+            .map(|(gem, deps)| (gem.clone(), deps.iter().cloned().collect()))
+            .collect();
+        self
+    }
+
+    /// Whether `owner` should take credit for its namespace instead of `gem`.
+    fn is_foreign_owner(&self, owner: &str, gem: &str) -> bool {
+        owner != gem
+            && (self.gemfile_gems.contains(owner)
+                || !self
+                    .dependencies
+                    .get(gem)
+                    .is_some_and(|deps| deps.contains(owner)))
+    }
+
+    /// True when `root` is claimed by a Gemfile gem other than `gem`.
+    pub fn require_root_owned_by_other(&self, root: &str, gem: &str) -> bool {
+        self.require_roots
+            .get(root)
+            .is_some_and(|owners| owners.iter().any(|owner| owner != gem))
+    }
+
+    /// True when the most specific claimed prefix of `name` (or `name`
+    /// itself) belongs to gems other than `gem`.
+    pub fn module_owned_by_other(&self, name: &str, gem: &str) -> bool {
+        let lower = name.to_lowercase();
+        let mut candidate = lower.as_str();
+        loop {
+            if let Some(owners) = self.modules.get(candidate) {
+                return !owners.iter().any(|owner| owner == gem)
+                    && owners.iter().any(|owner| self.is_foreign_owner(owner, gem));
+            }
+            match candidate.rfind("::") {
+                Some(idx) => candidate = &candidate[..idx],
+                None => return false,
+            }
+        }
+    }
+
+    /// True when a proper name prefix of `gem` (e.g. `google-cloud` for
+    /// `google-cloud-storage`, `active_model` for `active_model_serializers`)
+    /// is itself a gem name or is shared with another gem (a gem family).
+    pub fn is_shared_name_prefix(&self, prefix: &str, gem: &str) -> bool {
+        if prefix != gem && self.gem_names.contains(prefix) {
+            return self.is_foreign_owner(prefix, gem);
+        }
+        let own = usize::from(
+            self.gem_names.contains(gem) && proper_name_prefixes(gem).iter().any(|p| p == prefix),
+        );
+        self.family_prefixes
+            .get(prefix)
+            .is_some_and(|count| count.saturating_sub(own) > 0)
+    }
+}
+
+fn push_owner(map: &mut HashMap<String, Vec<String>>, key: String, gem: &str) {
+    let owners = map.entry(key).or_default();
+    if !owners.iter().any(|owner| owner == gem) {
+        owners.push(gem.to_string());
+    }
+}
+
+/// Proper prefixes of a gem name split on `-` and `_` (`a-b_c` → `a`, `a-b`).
+fn proper_name_prefixes(gem: &str) -> Vec<String> {
+    gem.match_indices(['-', '_'])
+        .map(|(idx, _)| gem[..idx].to_string())
+        .filter(|prefix| !prefix.is_empty())
+        .collect()
+}
+
+/// Discover require paths by inspecting an installed gem's require dirs.
+/// Custom `require_paths` come from `<base>/specifications/<full_name>.gemspec`
+/// (installed gems) or a `*.gemspec` in the gem dir (git/path gems).
 pub fn discover_gem_require_paths(
     gem_name: &str,
     gem_index: &HashMap<String, PathBuf>,
+    claims: &NamespaceClaims,
 ) -> Option<Vec<String>> {
     let gem_dir = gem_index.get(gem_name)?;
-
-    // Try reading require_paths from the gem's gemspec first
     let require_dirs =
         read_gemspec_require_paths(gem_dir).unwrap_or_else(|| vec!["lib".to_string()]);
+    let list = |rel: &str| -> Vec<(String, bool)> {
+        let mut entries = Vec::new();
+        if let Ok(read_dir) = std::fs::read_dir(gem_dir.join(rel)) {
+            for entry in read_dir.flatten() {
+                let is_dir = entry.file_type().is_ok_and(|t| t.is_dir())
+                    || (entry.file_type().is_ok_and(|t| t.is_symlink()) && entry.path().is_dir());
+                entries.push((entry.file_name().to_string_lossy().to_string(), is_dir));
+            }
+        }
+        entries
+    };
+    let paths = require_names_from_listing(gem_name, &require_dirs, &list, claims);
+    (!paths.is_empty()).then_some(paths)
+}
+
+/// Turn a gem's require-dir listing into requireable names.
+///
+/// - Top-level `*.rb` files are requireable as-is (unless the name is another
+///   Gemfile gem's require root).
+/// - Folders named after the gem (`name`, `name_underscored`, or the
+///   hyphen→slash form such as `rubocop/performance`) are the gem's own roots.
+/// - Other folders are roots only when the gem also ships the matching
+///   `<folder>.rb` entry point and no other Gemfile gem claims that root.
+///   Otherwise the folder is a namespace extension (e.g. solid_cache's
+///   `active_support/`, tailwindcss-rails' `puma/`), so only the files it
+///   actually contains are listed (bounded), never the bare folder name.
+fn require_names_from_listing(
+    gem_name: &str,
+    require_dirs: &[String],
+    list: &dyn Fn(&str) -> Vec<(String, bool)>,
+    claims: &NamespaceClaims,
+) -> Vec<String> {
+    let underscored = gem_name.replace('-', "_");
+    let slashed = gem_name.replace('-', "/");
+    let is_own = |name: &str| name == gem_name || name == underscored || name == slashed;
 
     let mut paths = Vec::new();
-    for req_dir in &require_dirs {
-        let dir = gem_dir.join(req_dir);
-        if !dir.is_dir() {
-            continue;
-        }
-        let mut candidates = Vec::new();
-        if let Ok(entries) = std::fs::read_dir(&dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.is_file() {
-                    if let Some(ext) = path.extension() {
-                        if ext == "rb" {
-                            if let Some(stem) = path.file_stem() {
-                                candidates.push((stem.to_string_lossy().to_string(), true));
-                            }
-                        }
-                    }
-                } else if path.is_dir() {
-                    if let Some(name) = path.file_name() {
-                        candidates.push((name.to_string_lossy().to_string(), false));
-                    }
-                }
+    let mut extension_dirs: Vec<(String, String)> = Vec::new();
+    for req_dir in require_dirs {
+        let req_dir = req_dir.trim_end_matches('/');
+        let entries = list(req_dir);
+        let file_stems: HashSet<String> = entries
+            .iter()
+            .filter(|(_, is_dir)| !is_dir)
+            .filter_map(|(name, _)| name.strip_suffix(".rb").map(str::to_string))
+            .collect();
+        for stem in &file_stems {
+            if is_own(stem) || !claims.require_root_owned_by_other(stem, gem_name) {
+                paths.push(stem.clone());
             }
         }
-        if req_dir == "lib" {
-            let normalized = gem_name.replace('-', "_");
-            const AUXILIARY_DIRS: &[&str] =
-                &["assets", "generators", "rails", "tasks", "templates"];
-            let preferred: Vec<String> = candidates
-                .iter()
-                .filter(|(candidate, is_file)| {
-                    *is_file
-                        || candidate == gem_name
-                        || candidate == &normalized
-                        || !AUXILIARY_DIRS.contains(&candidate.as_str())
-                })
-                .map(|(candidate, _)| candidate.clone())
-                .collect();
-            if preferred.is_empty() {
-                paths.extend(candidates.into_iter().map(|(candidate, _)| candidate));
+        for (dir, is_dir) in &entries {
+            if !is_dir {
+                continue;
+            }
+            if is_own(dir) {
+                paths.push(dir.clone());
+            } else if AUXILIARY_DIRS.contains(&dir.as_str()) {
+                continue;
+            } else if file_stems.contains(dir) && !claims.require_root_owned_by_other(dir, gem_name)
+            {
+                paths.push(dir.clone());
             } else {
-                paths.extend(preferred);
+                extension_dirs.push((req_dir.to_string(), dir.clone()));
             }
-        } else {
-            paths.extend(candidates.into_iter().map(|(candidate, _)| candidate));
         }
     }
+    enumerate_extension_require_paths(list, extension_dirs, &is_own, &mut paths);
+    paths.sort();
+    paths.dedup();
+    paths
+}
 
-    if paths.is_empty() {
-        None
-    } else {
-        paths.sort();
-        paths.dedup();
-        Some(paths)
+/// Breadth-first listing of the `.rb` files inside namespace-extension
+/// folders as full require paths (`omniauth/strategies/google_oauth2`), so
+/// shallow entry points are kept before the budget runs out. Folders named
+/// after the gem (e.g. `rubocop/performance`) are kept as roots, not descended.
+fn enumerate_extension_require_paths(
+    list: &dyn Fn(&str) -> Vec<(String, bool)>,
+    roots: Vec<(String, String)>,
+    is_own: &dyn Fn(&str) -> bool,
+    out: &mut Vec<String>,
+) {
+    let mut budget = MAX_ENUMERATED_REQUIRE_PATHS;
+    let mut queue: std::collections::VecDeque<(String, String, usize)> = roots
+        .into_iter()
+        .map(|(req_dir, rel)| (req_dir, rel, 1))
+        .collect();
+    while let Some((req_dir, rel, depth)) = queue.pop_front() {
+        let mut entries = list(&format!("{req_dir}/{rel}"));
+        entries.sort();
+        for (name, is_dir) in entries {
+            if budget == 0 {
+                return;
+            }
+            if is_dir {
+                let child = format!("{rel}/{name}");
+                if is_own(&child) {
+                    out.push(child);
+                    budget -= 1;
+                } else if depth < MAX_ENUMERATION_DEPTH {
+                    queue.push_back((req_dir.clone(), child, depth + 1));
+                }
+            } else if let Some(stem) = name.strip_suffix(".rb") {
+                out.push(format!("{rel}/{stem}"));
+                budget -= 1;
+            }
+        }
     }
 }
 
-/// Read require_paths from a gem's .gemspec file (static parse).
+/// Read require_paths for a gem dir. Installed gems keep their spec at
+/// `<base>/specifications/<full_name>.gemspec`; git/path checkouts ship a
+/// `*.gemspec` in the gem dir itself.
 fn read_gemspec_require_paths(gem_dir: &Path) -> Option<Vec<String>> {
-    let entries = std::fs::read_dir(gem_dir).ok()?;
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("gemspec") {
-            continue;
-        }
-        if let Ok(content) = std::fs::read_to_string(&path) {
-            // Match: s.require_paths = ["lib", "ext"] or s.require_path = "lib"
-            static REQ_PATHS_ARRAY_RE: Lazy<Regex> =
-                Lazy::new(|| Regex::new(r#"(?s)require_paths?\s*=\s*\[([^\]]+)\]"#).unwrap());
-            static REQ_PATHS_PERCENT_RE: Lazy<Regex> = Lazy::new(|| {
-                Regex::new(r#"(?s)require_paths?\s*=\s*%[wW][\[\(\{]([^\]\)\}]+)[\]\)\}]"#).unwrap()
-            });
-            static REQ_PATH_SINGLE_RE: Lazy<Regex> =
-                Lazy::new(|| Regex::new(r#"require_path\s*=\s*['"]([^'"]+)['"]"#).unwrap());
-            if let Some(cap) = REQ_PATHS_ARRAY_RE.captures(&content) {
-                let paths = extract_quoted_strings(&cap[1]);
-                if !paths.is_empty() {
-                    return Some(paths);
-                }
-            }
-            if let Some(cap) = REQ_PATHS_PERCENT_RE.captures(&content) {
-                let paths: Vec<String> = cap[1]
-                    .split_whitespace()
-                    .filter(|s| !s.is_empty())
-                    .map(str::to_string)
-                    .collect();
-                if !paths.is_empty() {
-                    return Some(paths);
-                }
-            }
-            if let Some(cap) = REQ_PATH_SINGLE_RE.captures(&content) {
-                return Some(vec![cap[1].to_string()]);
-            }
+    if let (Some(full_name), Some(base)) =
+        (gem_dir.file_name(), gem_dir.parent().and_then(Path::parent))
+    {
+        let spec = base
+            .join("specifications")
+            .join(format!("{}.gemspec", full_name.to_string_lossy()));
+        if let Ok(content) = std::fs::read_to_string(&spec) {
+            return parse_gemspec_require_paths(&content);
         }
     }
-    None
+    let entries = std::fs::read_dir(gem_dir).ok()?;
+    let mut specs: Vec<PathBuf> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().and_then(|e| e.to_str()) == Some("gemspec"))
+        .collect();
+    specs.sort();
+    specs.into_iter().find_map(|path| {
+        std::fs::read_to_string(path)
+            .ok()
+            .and_then(|content| parse_gemspec_require_paths(&content))
+    })
+}
+
+/// Statically extract `require_paths` from gemspec Ruby source
+/// (`s.require_paths = ["lib".freeze]`, `%w[lib ext]`, `s.require_path = "lib"`).
+fn parse_gemspec_require_paths(content: &str) -> Option<Vec<String>> {
+    static REQ_PATHS_ARRAY_RE: Lazy<Regex> =
+        Lazy::new(|| Regex::new(r#"(?s)require_paths?\s*=\s*\[([^\]]+)\]"#).unwrap());
+    static REQ_PATHS_PERCENT_RE: Lazy<Regex> = Lazy::new(|| {
+        Regex::new(r#"(?s)require_paths?\s*=\s*%[wW][\[\(\{]([^\]\)\}]+)[\]\)\}]"#).unwrap()
+    });
+    static REQ_PATH_SINGLE_RE: Lazy<Regex> =
+        Lazy::new(|| Regex::new(r#"require_path\s*=\s*['"]([^'"]+)['"]"#).unwrap());
+    if let Some(cap) = REQ_PATHS_ARRAY_RE.captures(content) {
+        let paths = extract_quoted_strings(&cap[1]);
+        if !paths.is_empty() {
+            return Some(paths);
+        }
+    }
+    if let Some(cap) = REQ_PATHS_PERCENT_RE.captures(content) {
+        let paths: Vec<String> = cap[1].split_whitespace().map(str::to_string).collect();
+        if !paths.is_empty() {
+            return Some(paths);
+        }
+    }
+    REQ_PATH_SINGLE_RE
+        .captures(content)
+        .map(|cap| vec![cap[1].to_string()])
 }
 
 fn extract_quoted_strings(input: &str) -> Vec<String> {
@@ -1138,13 +1544,17 @@ fn extract_quoted_strings(input: &str) -> Vec<String> {
 ///   - `lib/<gem_name with - replaced by _>.rb`
 ///   - `lib/<first hyphen segment>.rb`
 ///
-/// Generic helper names (see `GENERIC_MODULE_BLACKLIST`) are filtered. The
+/// Only top-level declarations count (parsed with ruby-prism, so nested or
+/// reopened classes such as hashie's `Hashie::Array` are ignored). Ruby
+/// core/stdlib constants (`Array`, `Integer`, `TCPSocket`, ...), generic helper
+/// names (see `GENERIC_MODULE_BLACKLIST`) and constants owned by another gem
+/// (e.g. `ActionView` reopened by rails-html-sanitizer) are filtered. The
 /// caller (main.rs) UNIONs this with the curated `KNOWN_MODULE_NAMES` table,
-/// so canonical names for popular gems are still preserved when they would
-/// otherwise be filtered.
+/// so canonical names for popular gems are still preserved.
 pub fn discover_gem_module_names(
     gem_name: &str,
     gem_index: &HashMap<String, PathBuf>,
+    claims: &NamespaceClaims,
 ) -> Vec<String> {
     let gem_dir = match gem_index.get(gem_name) {
         Some(d) => d,
@@ -1174,36 +1584,282 @@ pub fn discover_gem_module_names(
         if !path.is_file() {
             continue;
         }
-        scan_rb_file_head_for_modules(&path, &MODULE_DECL_RE, &mut modules);
+        scan_rb_file_for_top_level_modules(&path, &mut modules);
     }
 
     let mut result: Vec<String> = modules
         .into_iter()
-        .filter(|n| !is_generic_module_name(n))
+        .filter(|n| {
+            !is_generic_module_name(n)
+                && !is_ruby_core_constant(n)
+                && !claims.module_owned_by_other(n, gem_name)
+        })
         .collect();
     result.sort();
     result
 }
 
-/// Read up to ~4KB from the head of a Ruby file and extract top-level
-/// `module`/`class` declarations. Top-level declarations conventionally
-/// appear at the file's top, so this avoids loading huge generated files.
-fn scan_rb_file_head_for_modules(path: &Path, re: &Regex, modules: &mut HashSet<String>) {
-    const HEAD_BYTES: usize = 4096;
-    let mut file = match std::fs::File::open(path) {
-        Ok(f) => f,
-        Err(_) => return,
+/// Ruby core and standard-library constants that gems commonly reopen or
+/// monkey-patch; they never identify a specific gem.
+const RUBY_CORE_CONSTANTS: &[&str] = &[
+    "Addrinfo",
+    "ArgumentError",
+    "Array",
+    "BasicObject",
+    "BasicSocket",
+    "Benchmark",
+    "Binding",
+    "Class",
+    "Comparable",
+    "Complex",
+    "ConditionVariable",
+    "Data",
+    "Date",
+    "DateTime",
+    "Dir",
+    "Encoding",
+    "Enumerable",
+    "Enumerator",
+    "Errno",
+    "Exception",
+    "FalseClass",
+    "Fiber",
+    "File",
+    "FileTest",
+    "FileUtils",
+    "Float",
+    "Forwardable",
+    "GC",
+    "Gem",
+    "Hash",
+    "IO",
+    "IPAddr",
+    "IPSocket",
+    "Integer",
+    "Kernel",
+    "Marshal",
+    "MatchData",
+    "Math",
+    "Method",
+    "Module",
+    "Monitor",
+    "Mutex",
+    "Net",
+    "Net::HTTP",
+    "NilClass",
+    "NoMethodError",
+    "Numeric",
+    "Object",
+    "ObjectSpace",
+    "OpenSSL",
+    "OpenStruct",
+    "Pathname",
+    "Proc",
+    "Process",
+    "Queue",
+    "Ractor",
+    "Random",
+    "Range",
+    "Rational",
+    "Regexp",
+    "RubyVM",
+    "RuntimeError",
+    "SOCKSSocket",
+    "Set",
+    "Signal",
+    "Singleton",
+    "Socket",
+    "StandardError",
+    "String",
+    "StringIO",
+    "Struct",
+    "Symbol",
+    "TCPServer",
+    "TCPSocket",
+    "Thread",
+    "Time",
+    "Timeout",
+    "TracePoint",
+    "TrueClass",
+    "UDPSocket",
+    "UNIXServer",
+    "UNIXSocket",
+    "URI",
+    "UnboundMethod",
+    "Warning",
+];
+
+fn is_ruby_core_constant(name: &str) -> bool {
+    RUBY_CORE_CONSTANTS.contains(&name.trim_start_matches("::"))
+}
+
+/// Largest entry file we parse for top-level declarations.
+const MAX_ENTRY_FILE_BYTES: u64 = 256 * 1024;
+
+/// Parse a Ruby file with ruby-prism and collect its top-level `module` /
+/// `class` declarations (also inside top-level `if`/`unless`/`begin` blocks).
+fn scan_rb_file_for_top_level_modules(path: &Path, modules: &mut HashSet<String>) {
+    let Ok(file) = std::fs::File::open(path) else {
+        return;
     };
-    let mut buf = vec![0u8; HEAD_BYTES];
-    let n = match file.read(&mut buf) {
-        Ok(n) => n,
-        Err(_) => return,
+    let Ok(source) = read_bounded(file, MAX_ENTRY_FILE_BYTES).or_else(|too_big| {
+        if too_big {
+            let mut head = Vec::new();
+            std::fs::File::open(path)
+                .and_then(|f| f.take(MAX_ENTRY_FILE_BYTES).read_to_end(&mut head))
+                .map(|_| head)
+                .map_err(|_| false)
+        } else {
+            Err(false)
+        }
+    }) else {
+        return;
     };
-    buf.truncate(n);
-    let content = String::from_utf8_lossy(&buf);
-    for cap in re.captures_iter(&content) {
-        modules.insert(cap[1].to_string());
+    modules.extend(top_level_constant_decls(&source));
+}
+
+fn top_level_constant_decls(source: &[u8]) -> Vec<String> {
+    let result = ruby_prism::parse(source);
+    let mut out = Vec::new();
+    if let Some(program) = result.node().as_program_node() {
+        for node in program.statements().body().iter() {
+            collect_top_level_decl(&node, 0, &mut out);
+        }
     }
+    out
+}
+
+fn collect_top_level_decl(node: &ruby_prism::Node<'_>, depth: usize, out: &mut Vec<String>) {
+    let constant_path = if let Some(module) = node.as_module_node() {
+        Some(module.constant_path())
+    } else {
+        node.as_class_node().map(|class| class.constant_path())
+    };
+    if let Some(constant_path) = constant_path {
+        let name = String::from_utf8_lossy(constant_path.location().as_slice())
+            .trim()
+            .trim_start_matches("::")
+            .to_string();
+        if name.starts_with(|c: char| c.is_ascii_uppercase())
+            && name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == ':')
+        {
+            out.push(name);
+        }
+        return;
+    }
+    if depth >= 3 {
+        return;
+    }
+    let mut visit_statements = |statements: Option<ruby_prism::StatementsNode<'_>>| {
+        if let Some(statements) = statements {
+            for child in statements.body().iter() {
+                collect_top_level_decl(&child, depth + 1, out);
+            }
+        }
+    };
+    if let Some(if_node) = node.as_if_node() {
+        visit_statements(if_node.statements());
+        if let Some(subsequent) = if_node.subsequent() {
+            collect_top_level_decl(&subsequent, depth + 1, out);
+        }
+    } else if let Some(unless_node) = node.as_unless_node() {
+        visit_statements(unless_node.statements());
+        if let Some(else_node) = unless_node.else_clause() {
+            visit_statements(else_node.statements());
+        }
+    } else if let Some(begin_node) = node.as_begin_node() {
+        visit_statements(begin_node.statements());
+    } else if let Some(else_node) = node.as_else_node() {
+        visit_statements(else_node.statements());
+    }
+}
+
+/// Limits for reading `.gem` tarballs from vendor/cache (untrusted input).
+const MAX_GEM_METADATA_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_GEM_DATA_BYTES: u64 = 256 * 1024 * 1024;
+const MAX_GEM_DATA_ENTRIES: usize = 50_000;
+
+/// Read at most `limit` bytes; `Err(true)` when the input exceeds the limit,
+/// `Err(false)` on I/O errors.
+fn read_bounded(reader: impl Read, limit: u64) -> Result<Vec<u8>, bool> {
+    let mut buf = Vec::new();
+    reader
+        .take(limit + 1)
+        .read_to_end(&mut buf)
+        .map_err(|_| false)?;
+    if buf.len() as u64 > limit {
+        Err(true)
+    } else {
+        Ok(buf)
+    }
+}
+
+/// Decompress and parse a `.gem`'s `metadata.gz` entry with size limits.
+fn read_metadata_entry(entry: impl Read, gem_path: &Path) -> Option<GemMetadata> {
+    let warn_limit = || {
+        eprintln!(
+            "Warning: skipping {}: metadata.gz exceeds {} MiB",
+            gem_path.display(),
+            MAX_GEM_METADATA_BYTES / (1024 * 1024)
+        );
+    };
+    let compressed = match read_bounded(entry, MAX_GEM_METADATA_BYTES) {
+        Ok(bytes) => bytes,
+        Err(true) => {
+            warn_limit();
+            return None;
+        }
+        Err(false) => return None,
+    };
+    let yaml = match read_bounded(
+        flate2::read::GzDecoder::new(&compressed[..]),
+        MAX_GEM_METADATA_BYTES,
+    ) {
+        Ok(bytes) => bytes,
+        Err(true) => {
+            warn_limit();
+            return None;
+        }
+        Err(false) => return None,
+    };
+    parse_gem_metadata_yaml(&String::from_utf8_lossy(&yaml))
+}
+
+/// List file paths inside a `.gem`'s `data.tar.gz`, bounded in decompressed
+/// bytes and entry count. A truncated listing is returned on overflow.
+fn list_data_tar_entry(entry: impl Read, gem_path: &Path) -> Vec<String> {
+    let decoder = flate2::read::GzDecoder::new(entry).take(MAX_GEM_DATA_BYTES);
+    let mut archive = tar::Archive::new(decoder);
+    let mut files = Vec::new();
+    let Ok(entries) = archive.entries() else {
+        return files;
+    };
+    for entry in entries {
+        let Ok(entry) = entry else {
+            eprintln!(
+                "Warning: {}: data.tar.gz unreadable or larger than {} MiB; listing truncated",
+                gem_path.display(),
+                MAX_GEM_DATA_BYTES / (1024 * 1024)
+            );
+            break;
+        };
+        if files.len() >= MAX_GEM_DATA_ENTRIES {
+            eprintln!(
+                "Warning: {}: more than {} files in data.tar.gz; listing truncated",
+                gem_path.display(),
+                MAX_GEM_DATA_ENTRIES
+            );
+            break;
+        }
+        if entry.header().entry_type().is_file() {
+            if let Ok(path) = entry.path() {
+                files.push(path.to_string_lossy().trim_start_matches("./").to_string());
+            }
+        }
+    }
+    files
 }
 
 /// Extract gemspec metadata from a .gem tarball (tar archive containing metadata.gz).
@@ -1211,18 +1867,68 @@ fn extract_gem_metadata(gem_path: &Path) -> Option<GemMetadata> {
     let file = std::fs::File::open(gem_path).ok()?;
     let mut archive = tar::Archive::new(file);
     for entry in archive.entries().ok()? {
-        let mut entry = entry.ok()?;
-        let path = entry.path().ok()?.to_string_lossy().to_string();
-        if path == "metadata.gz" {
-            let mut compressed = Vec::new();
-            entry.read_to_end(&mut compressed).ok()?;
-            let mut decoder = flate2::read::GzDecoder::new(&compressed[..]);
-            let mut yaml = String::new();
-            decoder.read_to_string(&mut yaml).ok()?;
-            return parse_gem_metadata_yaml(&yaml);
+        let entry = entry.ok()?;
+        if entry.path().ok()?.to_string_lossy() == "metadata.gz" {
+            return read_metadata_entry(entry, gem_path);
         }
     }
     None
+}
+
+/// Require names for a vendor/cache `.gem` that isn't installed: its
+/// `require_paths` (metadata.gz) resolved against the real file listing in
+/// data.tar.gz, using the same ownership rules as installed gems. Load-path
+/// dirs such as `lib`/`ext` are never returned as require names themselves.
+pub fn vendor_gem_require_paths(
+    gem_path: &Path,
+    gem_name: &str,
+    claims: &NamespaceClaims,
+) -> Option<Vec<String>> {
+    let file = std::fs::File::open(gem_path).ok()?;
+    let mut archive = tar::Archive::new(file);
+    let mut metadata = None;
+    let mut files = None;
+    for entry in archive.entries().ok()? {
+        let Ok(entry) = entry else { break };
+        let path = entry.path().ok()?.to_string_lossy().to_string();
+        match path.as_str() {
+            "metadata.gz" => metadata = read_metadata_entry(entry, gem_path),
+            "data.tar.gz" => files = Some(list_data_tar_entry(entry, gem_path)),
+            _ => {}
+        }
+        if metadata.is_some() && files.is_some() {
+            break;
+        }
+    }
+    let files = files?;
+    let require_dirs = metadata
+        .map(|meta| meta.require_paths)
+        .unwrap_or_else(|| vec!["lib".to_string()]);
+
+    let mut listing: HashMap<String, HashSet<(String, bool)>> = HashMap::new();
+    for file in &files {
+        let mut parent = String::new();
+        let mut parts = file.split('/').filter(|part| !part.is_empty()).peekable();
+        while let Some(part) = parts.next() {
+            let is_dir = parts.peek().is_some();
+            listing
+                .entry(parent.clone())
+                .or_default()
+                .insert((part.to_string(), is_dir));
+            if !parent.is_empty() {
+                parent.push('/');
+            }
+            parent.push_str(part);
+        }
+    }
+    let list = |rel: &str| -> Vec<(String, bool)> {
+        listing
+            .get(rel.trim_matches('/'))
+            .map(|entries| entries.iter().cloned().collect())
+            .unwrap_or_default()
+    };
+    let paths = require_names_from_listing(gem_name, &require_dirs, &list, claims);
+    (!paths.is_empty()).then_some(paths)
 }
 
 /// Parse the YAML gemspec metadata for require_paths and executables.
@@ -1727,7 +2433,7 @@ PLATFORMS
             source: Some(GemSource::Path(gem_dir.clone())),
         }];
         let mut index = HashMap::new();
-        index_declared_gem_sources(dir.path(), &gems, &mut index);
+        index_declared_gem_sources(dir.path(), &gems, &[], &mut index);
         assert_eq!(index.get("admin_tools"), Some(&gem_dir));
     }
 
@@ -1736,7 +2442,7 @@ PLATFORMS
         let dir = tempfile::tempdir().unwrap();
         let checkout = dir
             .path()
-            .join("vendor/bundle/ruby/3.4.0/bundler/gems/custom_gem-abc123");
+            .join("vendor/bundle/ruby/3.4.0/bundler/gems/custom_gem-abc123def456");
         std::fs::create_dir_all(checkout.join("lib")).unwrap();
         let gems = vec![GemEntry {
             name: "custom_gem".to_string(),
@@ -1750,7 +2456,7 @@ PLATFORMS
             )),
         }];
         let mut index = HashMap::new();
-        index_declared_gem_sources(dir.path(), &gems, &mut index);
+        index_declared_gem_sources(dir.path(), &gems, &[], &mut index);
         assert_eq!(index.get("custom_gem"), Some(&checkout));
     }
 
@@ -1758,8 +2464,8 @@ PLATFORMS
     fn index_declared_git_gem_sources_is_deterministic() {
         let dir = tempfile::tempdir().unwrap();
         let checkout_root = dir.path().join("vendor/bundle/ruby/3.4.0/bundler/gems");
-        let first = checkout_root.join("custom_gem-aaa");
-        let second = checkout_root.join("custom_gem-zzz");
+        let first = checkout_root.join("custom_gem-aaaaaaaaaaaa");
+        let second = checkout_root.join("custom_gem-ffffffffffff");
         std::fs::create_dir_all(first.join("lib")).unwrap();
         std::fs::create_dir_all(second.join("lib")).unwrap();
         let gems = vec![GemEntry {
@@ -1775,8 +2481,89 @@ PLATFORMS
         }];
 
         let mut index = HashMap::new();
-        index_declared_gem_sources(dir.path(), &gems, &mut index);
+        index_declared_gem_sources(dir.path(), &gems, &[], &mut index);
         assert_eq!(index.get("custom_gem"), Some(&first));
+    }
+
+    fn git_gem(name: &str, url: &str) -> GemEntry {
+        GemEntry {
+            name: name.to_string(),
+            groups: vec!["default".to_string()],
+            platforms: Vec::new(),
+            require_paths: Vec::new(),
+            module_names: Vec::new(),
+            require_false: false,
+            source: Some(GemSource::Git(url.to_string())),
+        }
+    }
+
+    #[test]
+    fn index_git_gem_requires_hex_revision_suffix() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("vendor/bundle/ruby/3.4.0/bundler/gems");
+        std::fs::create_dir_all(root.join("foo-bar-0a1b2c3d4e5f/lib")).unwrap();
+        std::fs::create_dir_all(root.join("foo-c0ffee123456/lib")).unwrap();
+        let gems = vec![
+            git_gem("foo", "https://example.com/foo.git"),
+            git_gem("foo-bar", "https://example.com/foo-bar.git"),
+        ];
+        let mut index = HashMap::new();
+        index_declared_gem_sources(dir.path(), &gems, &[], &mut index);
+        assert_eq!(index["foo"], root.join("foo-c0ffee123456"));
+        assert_eq!(index["foo-bar"], root.join("foo-bar-0a1b2c3d4e5f"));
+    }
+
+    #[test]
+    fn index_git_gem_from_gem_path_and_monorepo_gemspec() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("app");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(
+            project.join("Gemfile.lock"),
+            "GIT\n  remote: https://github.com/rails/rails.git\n  revision: 1234567890abcdef1234567890abcdef12345678\n  specs:\n    activesupport (8.1.0.alpha)\n      tzinfo (~> 2.0)\n\nGEM\n  remote: https://rubygems.org/\n  specs:\n    tzinfo (2.0.6)\n",
+        )
+        .unwrap();
+        let gem_home = dir.path().join("gem_home");
+        let checkouts = gem_home.join("bundler/gems");
+        let old = checkouts.join("rails-aaaaaaaaaaaa/activesupport");
+        let locked = checkouts.join("rails-1234567890ab/activesupport");
+        for path in [&old, &locked] {
+            std::fs::create_dir_all(path.join("lib")).unwrap();
+            std::fs::write(path.join("activesupport.gemspec"), "").unwrap();
+        }
+        let gems = vec![git_gem("activesupport", "https://github.com/rails/rails")];
+        let mut index = HashMap::new();
+        index_declared_gem_sources(&project, &gems, &[gem_home], &mut index);
+        assert_eq!(index["activesupport"], locked);
+    }
+
+    #[test]
+    fn index_git_gem_found_by_gemspec_when_repo_name_differs() {
+        let dir = tempfile::tempdir().unwrap();
+        let gem_home = dir.path().join("gem_home");
+        let checkout = gem_home.join("bundler/gems/ruby-client-abcdefabcdef");
+        std::fs::create_dir_all(checkout.join("lib")).unwrap();
+        std::fs::write(checkout.join("acme.gemspec"), "").unwrap();
+        let gems = vec![git_gem("acme", "git@example.com:org/acme-sdk.git")];
+        let mut index = HashMap::new();
+        index_declared_gem_sources(dir.path(), &gems, &[gem_home], &mut index);
+        assert_eq!(index["acme"], checkout);
+    }
+
+    #[test]
+    fn parse_locked_git_sources_and_basename() {
+        let sources = parse_locked_git_sources(
+            "GIT\n  remote: https://github.com/a/b.git\n  revision: abc\n  specs:\n    one (1.0)\n      dep (>= 0)\n    two (1.0)\n\nPATH\n  remote: .\n  specs:\n    three (1.0)\n",
+        );
+        assert_eq!(sources["one"].revision, "abc");
+        assert_eq!(sources["two"].remote, "https://github.com/a/b.git");
+        assert!(!sources.contains_key("dep"));
+        assert!(!sources.contains_key("three"));
+        assert_eq!(
+            git_repo_basename("git@github.com:org/repo.git/"),
+            Some("repo".into())
+        );
+        assert_eq!(git_repo_basename("https://x/y/z"), Some("z".into()));
     }
 
     // ── discover_gem_require_paths ──
@@ -1793,7 +2580,7 @@ PLATFORMS
         std::fs::create_dir(lib_dir.join("mygem")).unwrap();
 
         let index = build_gem_index(&[dir.path().to_path_buf()]);
-        let paths = discover_gem_require_paths("mygem", &index);
+        let paths = discover_gem_require_paths("mygem", &index, &NamespaceClaims::default());
         assert!(paths.is_some());
         let paths = paths.unwrap();
         assert!(paths.contains(&"mygem".to_string()));
@@ -1803,7 +2590,10 @@ PLATFORMS
     #[test]
     fn discover_require_paths_missing_gem() {
         let index = HashMap::new();
-        assert!(discover_gem_require_paths("nonexistent", &index).is_none());
+        assert!(
+            discover_gem_require_paths("nonexistent", &index, &NamespaceClaims::default())
+                .is_none()
+        );
     }
 
     #[test]
@@ -1816,25 +2606,230 @@ PLATFORMS
         std::fs::write(lib_dir.join("factory_bot_rails.rb"), "").unwrap();
 
         let index = HashMap::from([("factory_bot_rails".to_string(), gem_dir)]);
-        let paths = discover_gem_require_paths("factory_bot_rails", &index).unwrap();
+        let paths =
+            discover_gem_require_paths("factory_bot_rails", &index, &NamespaceClaims::default())
+                .unwrap();
         assert_eq!(paths, vec!["factory_bot_rails"]);
     }
 
     #[test]
-    fn discover_require_paths_preserves_public_directory_alias() {
+    fn discover_require_paths_lists_files_in_extension_dirs() {
+        // puma's lib/rack/ extends rack's namespace: only the files it ships
+        // are require paths, never the bare `rack` root.
         let dir = tempfile::tempdir().unwrap();
         let gem_dir = dir.path().join("puma-1.0.0");
         let lib_dir = gem_dir.join("lib");
-        std::fs::create_dir_all(lib_dir.join("rack")).unwrap();
+        std::fs::create_dir_all(lib_dir.join("rack/handler")).unwrap();
+        std::fs::write(lib_dir.join("rack/handler/puma.rb"), "").unwrap();
         std::fs::write(lib_dir.join("puma.rb"), "").unwrap();
 
         let index = HashMap::from([("puma".to_string(), gem_dir)]);
-        let paths = discover_gem_require_paths("puma", &index).unwrap();
+        let paths =
+            discover_gem_require_paths("puma", &index, &NamespaceClaims::default()).unwrap();
         assert!(paths.contains(&"puma".to_string()));
-        assert!(paths.contains(&"rack".to_string()));
+        assert!(paths.contains(&"rack/handler/puma".to_string()));
+        assert!(!paths.contains(&"rack".to_string()));
+    }
+
+    fn write_files(root: &Path, files: &[&str]) {
+        for file in files {
+            let path = root.join(file);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "").unwrap();
+        }
+    }
+
+    #[test]
+    fn discover_require_paths_namespace_extensions_do_not_claim_other_roots() {
+        let dir = tempfile::tempdir().unwrap();
+        let gems = dir.path().join("gems");
+        write_files(
+            &gems.join("solid_cache-1.0.0/lib"),
+            &[
+                "solid_cache.rb",
+                "solid_cache/store.rb",
+                "active_support/cache/solid_cache_store.rb",
+                "generators/solid_cache/install/install_generator.rb",
+            ],
+        );
+        write_files(
+            &gems.join("rubocop-performance-1.0.0/lib"),
+            &[
+                "rubocop-performance.rb",
+                "rubocop/performance.rb",
+                "rubocop/performance/version.rb",
+                "rubocop/cop/performance/caller.rb",
+            ],
+        );
+        write_files(
+            &gems.join("minitest-5.0.0/lib"),
+            &["minitest.rb", "minitest/autorun.rb", "hoe/minitest.rb"],
+        );
+        write_files(
+            &gems.join("activesupport-8.0.0/lib"),
+            &["active_support.rb", "active_support/all.rb"],
+        );
+        let index = build_gem_index(&[dir.path().to_path_buf()]);
+        let gemfile: Vec<String> = [
+            "solid_cache",
+            "rubocop-performance",
+            "minitest",
+            "activesupport",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let claims = NamespaceClaims::build(&gemfile, index.keys());
+
+        let paths = discover_gem_require_paths("solid_cache", &index, &claims).unwrap();
+        assert_eq!(
+            paths,
+            vec!["active_support/cache/solid_cache_store", "solid_cache"]
+        );
+
+        let paths = discover_gem_require_paths("rubocop-performance", &index, &claims).unwrap();
+        assert!(paths.contains(&"rubocop-performance".to_string()));
+        assert!(paths.contains(&"rubocop/performance".to_string()));
+        assert!(paths.contains(&"rubocop/cop/performance/caller".to_string()));
+        assert!(!paths.contains(&"rubocop".to_string()));
+
+        let paths = discover_gem_require_paths("minitest", &index, &claims).unwrap();
+        assert_eq!(paths, vec!["hoe/minitest", "minitest"]);
+
+        // A folder with its own `<folder>.rb` entry point is the gem's root.
+        let paths = discover_gem_require_paths("activesupport", &index, &claims).unwrap();
+        assert_eq!(paths, vec!["active_support"]);
+    }
+
+    #[test]
+    fn discover_require_paths_owned_root_yields_to_other_gemfile_gem() {
+        let dir = tempfile::tempdir().unwrap();
+        write_files(
+            &dir.path().join("gems/shim-1.0.0/lib"),
+            &["shim.rb", "puma.rb", "puma/plugin/shim.rb"],
+        );
+        let index = build_gem_index(&[dir.path().to_path_buf()]);
+        let lone = NamespaceClaims::build(&["shim".to_string()], index.keys());
+        let paths = discover_gem_require_paths("shim", &index, &lone).unwrap();
+        assert!(paths.contains(&"puma".to_string()));
+
+        let both = NamespaceClaims::build(&["shim".to_string(), "puma".to_string()], index.keys());
+        let paths = discover_gem_require_paths("shim", &index, &both).unwrap();
+        assert_eq!(paths, vec!["puma/plugin/shim", "shim"]);
+    }
+
+    #[test]
+    fn discover_require_paths_reads_installed_specification() {
+        let dir = tempfile::tempdir().unwrap();
+        write_files(
+            &dir.path()
+                .join("gems/concurrent-ruby-1.3.6/lib/concurrent-ruby"),
+            &["concurrent.rb", "concurrent/map.rb"],
+        );
+        std::fs::create_dir_all(dir.path().join("specifications")).unwrap();
+        std::fs::write(
+            dir.path().join("specifications/concurrent-ruby-1.3.6.gemspec"),
+            "Gem::Specification.new do |s|\n  s.name = \"concurrent-ruby\".freeze\n  s.require_paths = [\"lib/concurrent-ruby\".freeze]\nend\n",
+        )
+        .unwrap();
+        let index = build_gem_index(&[dir.path().to_path_buf()]);
+        let paths =
+            discover_gem_require_paths("concurrent-ruby", &index, &NamespaceClaims::default())
+                .unwrap();
+        assert_eq!(paths, vec!["concurrent"]);
+    }
+
+    #[test]
+    fn namespace_claims_longest_prefix_wins() {
+        let claims = NamespaceClaims::build(
+            &["rack".to_string(), "rack-attack".to_string()],
+            std::iter::empty(),
+        );
+        assert!(claims.module_owned_by_other("Rack", "rack-attack"));
+        assert!(claims.module_owned_by_other("Rack::Request", "rack-attack"));
+        assert!(!claims.module_owned_by_other("Rack::Attack", "rack-attack"));
+        assert!(!claims.module_owned_by_other("Rack", "rack"));
+        assert!(!claims.module_owned_by_other("Unclaimed", "rack"));
+        // Known table claims apply even when the owner isn't in the Gemfile.
+        assert!(claims.module_owned_by_other("ActionView::Helpers", "rack"));
+        assert!(claims.is_shared_name_prefix("google-cloud", "google-cloud-storage"));
+        assert!(claims.is_shared_name_prefix("rack", "rack-attack"));
+        assert!(!claims.is_shared_name_prefix("acme-widget", "acme-widget-tools"));
+    }
+
+    #[test]
+    fn namespace_claims_credit_undeclared_dependencies() {
+        let gemfile = vec!["factory_bot_rails".to_string()];
+        let deps = HashMap::from([(
+            "factory_bot_rails".to_string(),
+            vec!["factory_bot".to_string(), "railties".to_string()],
+        )]);
+        let claims =
+            NamespaceClaims::build(&gemfile, std::iter::empty()).with_lock_dependencies(&deps);
+        assert!(!claims.module_owned_by_other("FactoryBot", "factory_bot_rails"));
+        assert!(!claims.is_shared_name_prefix("factory_bot", "factory_bot_rails"));
+        assert!(claims.module_owned_by_other("ActionView", "factory_bot_rails"));
+
+        // Once factory_bot is declared in the Gemfile it takes the credit.
+        let gemfile = vec!["factory_bot_rails".to_string(), "factory_bot".to_string()];
+        let claims =
+            NamespaceClaims::build(&gemfile, std::iter::empty()).with_lock_dependencies(&deps);
+        assert!(claims.module_owned_by_other("FactoryBot", "factory_bot_rails"));
+        assert!(claims.is_shared_name_prefix("factory_bot", "factory_bot_rails"));
     }
 
     // ── discover_gem_module_names ──
+
+    #[test]
+    fn discover_module_names_only_top_level_and_not_core_or_foreign() {
+        let dir = tempfile::tempdir().unwrap();
+        let gems = dir.path().join("gems");
+        let write = |gem: &str, file: &str, body: &str| {
+            let lib = gems.join(gem).join("lib");
+            std::fs::create_dir_all(&lib).unwrap();
+            std::fs::write(lib.join(file), body).unwrap();
+        };
+        write(
+            "hashie-5.0.0",
+            "hashie.rb",
+            "module Hashie\n  module Extensions\n  end\n  module Array\n  end\nend\n",
+        );
+        write(
+            "abbrev-0.1.0",
+            "abbrev.rb",
+            "module Abbrev\nend\n\nclass Array\n  def abbrev; end\nend\n",
+        );
+        write(
+            "parallel-1.0.0",
+            "parallel.rb",
+            "module Parallel\nclass Worker\nend\nend\n",
+        );
+        write(
+            "resolv-replace-0.1.0",
+            "resolv-replace.rb",
+            "class TCPSocket < IPSocket\nend\nclass SOCKSSocket < TCPSocket\nend\n",
+        );
+        write(
+            "rails-html-sanitizer-1.0.0",
+            "rails-html-sanitizer.rb",
+            "module Rails\n  module HTML\n  end\nend\n\nmodule ActionView\n  module Helpers\n  end\nend\n",
+        );
+        write(
+            "guarded-1.0.0",
+            "guarded.rb",
+            "unless defined?(Guarded)\n  module Guarded\n    class Inner; end\n  end\nend\nclass Foo::Bar\nend\n",
+        );
+        let index = build_gem_index(&[dir.path().to_path_buf()]);
+        let gemfile: Vec<String> = index.keys().cloned().collect();
+        let claims = NamespaceClaims::build(&gemfile, index.keys());
+        let names = |gem: &str| discover_gem_module_names(gem, &index, &claims);
+        assert_eq!(names("hashie"), vec!["Hashie"]);
+        assert_eq!(names("abbrev"), vec!["Abbrev"]);
+        assert_eq!(names("parallel"), vec!["Parallel"]);
+        assert!(names("resolv-replace").is_empty());
+        assert!(names("rails-html-sanitizer").is_empty());
+        assert_eq!(names("guarded"), vec!["Foo::Bar", "Guarded"]);
+    }
 
     #[test]
     fn discover_module_names_basic() {
@@ -1846,7 +2841,7 @@ PLATFORMS
         std::fs::write(lib_dir.join("mygem.rb"), "module MyGem\nend\n").unwrap();
 
         let index = build_gem_index(&[dir.path().to_path_buf()]);
-        let modules = discover_gem_module_names("mygem", &index);
+        let modules = discover_gem_module_names("mygem", &index, &NamespaceClaims::default());
         assert!(modules.contains(&"MyGem".to_string()));
     }
 
@@ -1864,7 +2859,8 @@ PLATFORMS
         .unwrap();
 
         let index = build_gem_index(&[dir.path().to_path_buf()]);
-        let modules = discover_gem_module_names("google-cloud", &index);
+        let modules =
+            discover_gem_module_names("google-cloud", &index, &NamespaceClaims::default());
         assert!(modules.contains(&"Google::Cloud".to_string()));
     }
 
@@ -1883,7 +2879,7 @@ PLATFORMS
         std::fs::write(sub_dir.join("core.rb"), "class MyGem::Core\nend\n").unwrap();
 
         let index = build_gem_index(&[dir.path().to_path_buf()]);
-        let modules = discover_gem_module_names("mygem", &index);
+        let modules = discover_gem_module_names("mygem", &index, &NamespaceClaims::default());
         assert!(modules.is_empty());
     }
 
@@ -1907,7 +2903,7 @@ PLATFORMS
         .unwrap();
 
         let index = build_gem_index(&[dir.path().to_path_buf()]);
-        let modules = discover_gem_module_names("mygem", &index);
+        let modules = discover_gem_module_names("mygem", &index, &NamespaceClaims::default());
         assert_eq!(modules, vec!["MyGem".to_string()]);
     }
 
@@ -1922,7 +2918,8 @@ PLATFORMS
         std::fs::write(lib_dir.join("google_cloud.rb"), "module GoogleCloud\nend\n").unwrap();
 
         let index = build_gem_index(&[dir.path().to_path_buf()]);
-        let modules = discover_gem_module_names("google-cloud", &index);
+        let modules =
+            discover_gem_module_names("google-cloud", &index, &NamespaceClaims::default());
         assert!(modules.contains(&"GoogleCloud".to_string()));
     }
 
@@ -1937,7 +2934,7 @@ PLATFORMS
         std::fs::write(lib_dir.join("aws.rb"), "module Aws\nend\n").unwrap();
 
         let index = build_gem_index(&[dir.path().to_path_buf()]);
-        let modules = discover_gem_module_names("aws-sdk-s3", &index);
+        let modules = discover_gem_module_names("aws-sdk-s3", &index, &NamespaceClaims::default());
         assert!(modules.contains(&"Aws".to_string()));
     }
 
@@ -1957,7 +2954,7 @@ PLATFORMS
         .unwrap();
 
         let index = build_gem_index(&[dir.path().to_path_buf()]);
-        let modules = discover_gem_module_names("mygem", &index);
+        let modules = discover_gem_module_names("mygem", &index, &NamespaceClaims::default());
         assert!(modules.contains(&"MyGem".to_string()));
         assert!(!modules.contains(&"Configuration".to_string()));
         assert!(!modules.contains(&"Error".to_string()));
@@ -1981,7 +2978,7 @@ PLATFORMS
         .unwrap();
 
         let index = build_gem_index(&[dir.path().to_path_buf()]);
-        let modules = discover_gem_module_names("mygem", &index);
+        let modules = discover_gem_module_names("mygem", &index, &NamespaceClaims::default());
         // Only top-level scanned; version.rb is not.
         assert_eq!(modules, vec!["MyGem".to_string()]);
     }
@@ -1991,7 +2988,7 @@ PLATFORMS
     #[test]
     fn discover_module_names_missing_gem() {
         let index = HashMap::new();
-        let modules = discover_gem_module_names("nonexistent", &index);
+        let modules = discover_gem_module_names("nonexistent", &index, &NamespaceClaims::default());
         assert!(modules.is_empty());
     }
 
@@ -2002,7 +2999,7 @@ PLATFORMS
         std::fs::create_dir_all(gems_dir.join("mygem-1.0.0")).unwrap();
 
         let index = build_gem_index(&[dir.path().to_path_buf()]);
-        let modules = discover_gem_module_names("mygem", &index);
+        let modules = discover_gem_module_names("mygem", &index, &NamespaceClaims::default());
         assert!(modules.is_empty());
     }
 
@@ -2500,7 +3497,8 @@ PLATFORMS
         std::fs::write(ext_dir.join("native.rb"), "# native").unwrap();
 
         let index = build_gem_index(&[dir.path().to_path_buf()]);
-        let paths = discover_gem_require_paths("mygem", &index).unwrap();
+        let paths =
+            discover_gem_require_paths("mygem", &index, &NamespaceClaims::default()).unwrap();
         assert!(paths.contains(&"mygem".to_string()));
         assert!(paths.contains(&"native".to_string()));
     }
@@ -2519,7 +3517,7 @@ PLATFORMS
         .unwrap();
 
         let index = build_gem_index(&[dir.path().to_path_buf()]);
-        let paths = discover_gem_require_paths("mygem", &index);
+        let paths = discover_gem_require_paths("mygem", &index, &NamespaceClaims::default());
         assert!(paths.is_none());
     }
 
@@ -2536,7 +3534,8 @@ PLATFORMS
         std::fs::write(lib_dir.join("README.md"), "# readme").unwrap();
 
         let index = build_gem_index(&[dir.path().to_path_buf()]);
-        let paths = discover_gem_require_paths("mygem", &index).unwrap();
+        let paths =
+            discover_gem_require_paths("mygem", &index, &NamespaceClaims::default()).unwrap();
         assert!(paths.contains(&"mygem".to_string()));
         assert!(!paths.contains(&"README".to_string()));
     }
@@ -2573,6 +3572,71 @@ PLATFORMS
         let meta = meta.unwrap();
         assert_eq!(meta.require_paths, vec!["lib"]);
         assert_eq!(meta.executables, vec!["test_exe"]);
+    }
+
+    fn gz(data: &[u8]) -> Vec<u8> {
+        use std::io::Write;
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
+        encoder.write_all(data).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    fn tar_of(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut builder = tar::Builder::new(Vec::new());
+        for (path, data) in entries {
+            let mut header = tar::Header::new_gnu();
+            header.set_path(path).unwrap();
+            header.set_size(data.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder.append(&header, *data).unwrap();
+        }
+        builder.into_inner().unwrap()
+    }
+
+    #[test]
+    fn extract_gem_metadata_rejects_decompression_bomb() {
+        let dir = tempfile::tempdir().unwrap();
+        let gem_path = dir.path().join("bomb-1.0.0.gem");
+        let mut yaml = b"require_paths:\n- lib\n".to_vec();
+        yaml.resize((MAX_GEM_METADATA_BYTES + 1024) as usize, b' ');
+        let metadata = gz(&yaml);
+        assert!(metadata.len() < 1024 * 1024);
+        std::fs::write(&gem_path, tar_of(&[("metadata.gz", &metadata)])).unwrap();
+        assert!(extract_gem_metadata(&gem_path).is_none());
+        assert!(matches!(read_bounded(&b"abcdef"[..], 3), Err(true)));
+        assert_eq!(read_bounded(&b"abc"[..], 3).unwrap(), b"abc");
+    }
+
+    #[test]
+    fn vendor_gem_require_paths_lists_files_not_load_path_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        let gem_path = dir.path().join("weird-1.0.0.gem");
+        let metadata =
+            gz(b"--- !ruby/object:Gem::Specification\nname: weird\nrequire_paths:\n- lib\n- ext\n");
+        let data = gz(&tar_of(&[
+            ("lib/weird_core.rb", b""),
+            ("lib/weird/version.rb", b""),
+            ("lib/rack/handler/weird.rb", b""),
+            ("ext/weird_ext/extconf.rb", b""),
+        ]));
+        std::fs::write(
+            &gem_path,
+            tar_of(&[("metadata.gz", &metadata), ("data.tar.gz", &data)]),
+        )
+        .unwrap();
+        let paths =
+            vendor_gem_require_paths(&gem_path, "weird", &NamespaceClaims::default()).unwrap();
+        assert_eq!(
+            paths,
+            vec![
+                "rack/handler/weird",
+                "weird",
+                "weird_core",
+                "weird_ext/extconf"
+            ]
+        );
+        assert!(!paths.iter().any(|p| p == "ext" || p == "lib"));
     }
 
     #[test]
