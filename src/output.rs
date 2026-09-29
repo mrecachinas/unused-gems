@@ -418,6 +418,7 @@ mod tests {
             module_names: Vec::new(),
             require_false: false,
             source: None,
+            declarations: Vec::new(),
         }
     }
 

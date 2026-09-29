@@ -223,12 +223,18 @@ fn main() {
             lockfile::parse_gemfile_lock(&dir)
         }
     );
-    let needs_runtime_platform = gems.iter().any(|gem| !gem.platforms.is_empty())
+    let needs_runtime_platform = gems.iter().any(types::GemEntry::has_platform_constraints)
         || lockfile.has_platform_specific_registry_artifacts();
     let runtime_platform = needs_runtime_platform.then(|| platforms::resolve_current_runtime(&dir));
     let current_gem_platform = runtime_platform
         .as_ref()
         .and_then(platforms::RuntimePlatform::gem_platform);
+    // Declarations for other platforms never reach Bundler.require on this one.
+    if let Some(runtime_platform) = runtime_platform.as_ref() {
+        for gem in &mut gems {
+            gem.retain_declarations_for_platform(runtime_platform.dsl_tokens());
+        }
+    }
     let (
         ((mut gem_index, vendor_path_index), (mut scan_results, cache_updates)),
         (db_adapters, (cable_adapters, (storage_adapters, cache_config_adapters))),
@@ -1020,6 +1026,7 @@ mod tests {
             module_names: vec![],
             require_false: false,
             source: None,
+            declarations: vec![],
         }
     }
 

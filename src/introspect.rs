@@ -1217,6 +1217,7 @@ PLATFORMS
             module_names: Vec::new(),
             require_false: false,
             source: Some(GemSource::Path(gem_dir.clone())),
+            declarations: Vec::new(),
         }];
         let mut index = HashMap::new();
         index_declared_gem_sources(dir.path(), &gems, &mut index);
@@ -1240,6 +1241,7 @@ PLATFORMS
             source: Some(GemSource::Git(
                 "https://example.test/custom_gem.git".to_string(),
             )),
+            declarations: Vec::new(),
         }];
         let mut index = HashMap::new();
         index_declared_gem_sources(dir.path(), &gems, &mut index);
@@ -1264,6 +1266,7 @@ PLATFORMS
             source: Some(GemSource::Git(
                 "https://example.test/custom_gem.git".to_string(),
             )),
+            declarations: Vec::new(),
         }];
 
         let mut index = HashMap::new();
