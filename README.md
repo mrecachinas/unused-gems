@@ -84,8 +84,8 @@ unused-gems --diff baseline.json --fail-on new /path/to/project
 # Skip additional directories
 unused-gems --skip-dirs tmp,cache /path/to/project
 
-# Treat the test group as active for Bundler.require(*Rails.groups)
-unused-gems --rails-env test /path/to/project
+# Treat the development and test groups as active for Bundler.require(*Rails.groups)
+unused-gems --rails-env development,test /path/to/project
 
 # Scan a monorepo with multiple Gemfiles
 unused-gems --gemfile engines/a/Gemfile --gemfile engines/b/Gemfile /path/to/project
@@ -99,14 +99,31 @@ unused-gems --gemfile engines/a/Gemfile --gemfile engines/b/Gemfile /path/to/pro
 -v, --verbose             Show file locations and require paths
 -q, --quiet               Suppress progress messages
     --no-cache            Disable file scan cache
-    --ignore-file <PATH>  Path to ignore file (default: .unused_gems.yml)
+    --ignore-file <PATH>  Ignore file; relative paths resolve against the scanned directory (default: .unused_gems.yml)
     --gemfile <PATH>      Gemfile path to analyze; repeat for monorepos
                           (default: Gemfile, then gems.rb)
-    --diff <BASELINE>     Compare against previous JSON output
+    --diff <BASELINE>     Compare against previous JSON output (text, json or github per -o)
+    --fail-on <POLICY>    none (always 0), any (default: 1 if unused), new (1 only for new unused in --diff)
+    --sarif               Emit SARIF JSON (ignored with --diff)
     --skip-dirs <DIRS>    Additional directories to skip (comma-separated)
-    --rails-env <ENV>      Rails environment group considered active
+    --rails-env <ENVS>    Rails environment group(s) considered active (comma-separated or repeated)
+    --allow-missing-gemfile  Exit 0 with a notice when the Gemfile is missing
 -h, --help                Print help
 ```
+
+## Exit codes
+
+| Code | Meaning |
+|------|---------|
+| `0` | No unused gems (or `--fail-on none`, or `--fail-on new` without new unused gems) |
+| `1` | Unused gems found (per `--fail-on`) |
+| `2` | Fatal error: invalid directory, missing Gemfile, unreadable or invalid `--diff` baseline, bad CLI arguments |
+
+`--fail-on new` only has an effect together with `--diff`; without it a warning is printed
+and the exit code is `0`. With `-o json`, `--diff` prints
+`{"schema_version": "1", "diff": {"newly_unused": [...], "no_longer_unused": [...],
+"status_changed": [...], "added": [...], "removed": [...]}, "new_unused_count": N}`; with
+`-o github` it emits a warning annotation per newly unused gem.
 
 ## Gemfile semantics
 
@@ -163,7 +180,7 @@ declaration order.
 | `scanner.rs` | Parallel source tree scanning with hand-rolled byte scanners |
 | `introspect.rs` | Discovers gem require paths and module names from installed gems or vendor/cache tarballs |
 | `matcher.rs` | Matches gems against scan results to determine usage |
-| `scripts.rs` | Scans Makefiles, Dockerfiles, CI configs for gem references |
+| `scripts.rs` | Scans Rake tasks, Makefiles, Dockerfiles, Procfiles, CI configs for gem executables run as commands |
 | `lockfile.rs` | Parses Gemfile.lock / gems.locked for transitive dependency counting |
 | `cache.rs` | Bincode file cache — skips re-scanning unchanged files |
 | `output.rs` | Text, JSON, GitHub Actions output formatters |
@@ -190,7 +207,25 @@ adapters:
     custom_cache_store: custom-cache-gem
 ```
 
+`ignore` accepts a list of gem names (a single scalar name is also accepted). Missing
+explicit `--ignore-file` paths, malformed YAML and invalid entries produce warnings.
+
 Adapter entries map the value used in Rails config to the gem that provides it.
+
+Built-in mappings cover common database adapters (including `postgis`, `sqlserver`,
+`oracle_enhanced` and `cockroachdb`, which credit both the ActiveRecord adapter gem and
+its driver), static `url:` schemes in `config/database.yml` (`postgres://`, `mysql2://`,
+`sqlite3:`, `trilogy://`, or a literal default inside
+`<%= ENV.fetch("DATABASE_URL", "…") %>`), and unknown database adapters fall back to a
+gem named after the adapter or `activerecord-<adapter>-adapter`. Rails' built-in
+backends (`async`/`inline`/`test` cable adapters, `Disk`/`Mirror` storage services,
+`memory_store`/`file_store`/`null_store` caches) credit no gem.
+
+Rails system tests are recognised too: referencing `ActionDispatch::SystemTestCase`
+credits `capybara`, and `driven_by :selenium` (or `Capybara.default_driver =`/
+`javascript_driver = :selenium_*`, `:cuprite`, …) credits the driver gem. In JSON output
+this configuration evidence has `"type": "database_adapter"` (kept for compatibility)
+plus `kind` (`database`, `cable`, `storage`, `cache`, `system_test`) and `source` (file).
 
 ## Performance
 

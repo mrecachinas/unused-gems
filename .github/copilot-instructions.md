@@ -36,11 +36,11 @@ Parse Gemfile (ruby-prism AST)
 - `scanner.rs` — hand-rolled byte scanners (memchr/SIMD), no per-file regex
 - `introspect.rs` — discovers require paths and module names from installed gems or vendor/cache tarballs
 - `matcher.rs` — matches gems to scan results, produces evidence-backed results
-- `scripts.rs` — scans non-Ruby files (Rake, shell, CI) for gem references
+- `scripts.rs` — scans scripts (Rakefile/`*.rake`, shell, Make, Docker, Procfile, CI YAML) for gem executables run in command position (`bundle exec`, `bin/`, first word after `&&`/`;`/`|`…), mapping executables to gems via installed gemspecs, a curated table and `-`/`_` normalisation
 
 ## Key Conventions
 
-**Error handling:** No custom error types or error crates. Graceful degradation — missing gems, bad caches, etc. are logged via `eprintln!` and skipped. Only a missing Gemfile (or gems.rb) is fatal. Exit code is 0 if no unused gems found, 1 otherwise.
+**Error handling:** No custom error types or error crates. Graceful degradation — missing gems, bad caches, etc. are logged via `eprintln!` and skipped. Fatal errors (missing Gemfile/gems.rb, invalid directory, unreadable/invalid `--diff` baseline) exit 2. Otherwise the exit code is 0 if no unused gems were found and 1 if some were (subject to `--fail-on`).
 
 **Performance patterns:**
 - Byte-level scanning with `memchr::memmem::Finder` instead of regex in hot paths (scanner.rs)
@@ -48,11 +48,11 @@ Parse Gemfile (ruby-prism AST)
 - `rayon` for parallelism: `rayon::join()` for concurrent stages, `par_iter()` for batch operations
 - Bincode file cache keyed by mtime (nanosecond precision) + size to skip re-scanning unchanged files
 
-**Comment filtering:** All scanners (Ruby and non-Ruby) filter `#` comment lines. Ruby files additionally filter `=begin`/`=end` blocks, heredoc content, and inline comments (e.g., `x = 1 # require 'foo'`). Script scanning strips comment lines before regex matching.
+**Comment filtering:** All scanners (Ruby and non-Ruby) filter `#` comment lines. Ruby files additionally filter `=begin`/`=end` blocks, heredoc content, and inline comments (e.g., `x = 1 # require 'foo'`). Script scanning strips comment lines before extracting commands; only command words (not arguments) are matched against gems.
 
 **Require path resolution is multi-layered:** (1) introspect installed gem, (2) vendor/cache tarball metadata, (3) hard-coded `KNOWN_REQUIRE_PATHS` table in main.rs, (4) heuristic name transforms (hyphen→underscore, snake→PascalCase).
 
-**Bundler.require handling:** When `Bundler.require(*Rails.groups)` is detected, only `:default` group gems are marked `BundlerRequired`. Dev/test-only gems without direct code references are reported as `Unused`.
+**Bundler.require handling:** When `Bundler.require(*Rails.groups)` is detected, only `:default` group gems are marked `BundlerRequired`. Dev/test-only gems without direct code references are reported as `Unused` unless `--rails-env` (comma-separated/repeatable) activates their groups.
 
 **Gemspec parsing:** Root gemspecs are only parsed when a bare `gemspec` directive (without `path:`) is present in the Gemfile. Gemspecs with explicit `path:` args are parsed from those directories. Gemspec entries follow Bundler ≥ 2.6: the gem itself is `:default` on all platforms and development dependencies are only in `development_group`, ignoring enclosing `group`/`platforms` blocks.
 

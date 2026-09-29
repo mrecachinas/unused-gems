@@ -2,7 +2,6 @@ use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
-use aho_corasick::AhoCorasick;
 use memchr::memmem;
 use rayon::prelude::*;
 use regex::Regex;
@@ -22,6 +21,11 @@ pub(crate) fn is_script_file(rel_path: &str, file_name: &str) -> bool {
         "Taskfile.yml" | "Taskfile.yaml" => return true,
         "mise.toml" | ".mise.toml" | ".tool-versions" => return true,
         _ => {}
+    }
+    // Rake task files (e.g. lib/tasks/*.rake) shell out just like the Rakefile.
+    // They are also Ruby sources, so the walker scans them for requires too.
+    if file_name.ends_with(".rake") {
+        return true;
     }
     // Dockerfile.* / Procfile.* / Jenkinsfile.*
     if file_name.starts_with("Dockerfile.")
@@ -240,6 +244,104 @@ fn strip_comment_lines(content: &[u8]) -> Cow<'_, [u8]> {
     Cow::Owned(result)
 }
 
+fn is_ident_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
+}
+
+/// Extract the string argument of a quoted literal starting at `bytes[0]`.
+/// Returns the literal's content, or the rest of the line when unquoted.
+fn literal_argument(bytes: &[u8]) -> &[u8] {
+    let (open, close) = match bytes.first() {
+        Some(b'"') => (1, b'"'),
+        Some(b'\'') => (1, b'\''),
+        Some(b'%') => match bytes.get(1) {
+            Some(b'(') => (2, b')'),
+            Some(b'[') => (2, b']'),
+            Some(b'{') => (2, b'}'),
+            Some(b'w' | b'W' | b'q' | b'Q') => match bytes.get(2) {
+                Some(b'(') => (3, b')'),
+                Some(b'[') => (3, b']'),
+                Some(b'{') => (3, b'}'),
+                _ => return bytes,
+            },
+            _ => return bytes,
+        },
+        _ => return bytes,
+    };
+    let rest = &bytes[open..];
+    let mut i = 0;
+    while i < rest.len() {
+        if rest[i] == b'\\' {
+            i += 2;
+            continue;
+        }
+        if rest[i] == close {
+            return &rest[..i];
+        }
+        i += 1;
+    }
+    rest
+}
+
+/// Find shell-out calls in a line of Ruby/Groovy code: `sh "..."`, `system(...)`,
+/// `exec ...` and backtick literals. Only matches the keyword as a standalone
+/// identifier outside of string literals, so `desc "Flush redis cache"` or
+/// `task :sh` are not mistaken for commands.
+fn ruby_shell_calls<'a>(line: &'a [u8], keywords: &[&[u8]], backticks: bool) -> Vec<&'a [u8]> {
+    let mut calls = Vec::new();
+    let mut i = 0;
+    let mut quote: Option<u8> = None;
+    while i < line.len() {
+        let b = line[i];
+        if let Some(q) = quote {
+            if b == b'\\' {
+                i += 2;
+                continue;
+            }
+            if b == q {
+                quote = None;
+            }
+            i += 1;
+            continue;
+        }
+        match b {
+            b'"' | b'\'' => {
+                quote = Some(b);
+                i += 1;
+                continue;
+            }
+            b'`' if backticks => {
+                let rest = &line[i + 1..];
+                let end = memchr::memchr(b'`', rest).unwrap_or(rest.len());
+                calls.push(&rest[..end]);
+                i += end + 2;
+                continue;
+            }
+            _ => {}
+        }
+        let boundary = i == 0 || {
+            let prev = line[i - 1];
+            !is_ident_byte(prev) && !matches!(prev, b'.' | b':' | b'@' | b'$')
+        };
+        if boundary {
+            if let Some(kw) = keywords.iter().find(|kw| line[i..].starts_with(kw)) {
+                let after = i + kw.len();
+                if matches!(line.get(after), Some(b' ' | b'\t' | b'(')) {
+                    let mut j = after;
+                    while j < line.len() && matches!(line[j], b' ' | b'\t' | b'(') {
+                        j += 1;
+                    }
+                    calls.push(literal_argument(&line[j..]));
+                    i = after;
+                    continue;
+                }
+            }
+        }
+        i += 1;
+    }
+    calls
+}
+
 fn command_slices<'a>(rel_path: &str, content: &'a [u8]) -> Vec<&'a [u8]> {
     let normalized = rel_path.replace('\\', "/");
     let file_name = normalized.rsplit('/').next().unwrap_or(&normalized);
@@ -252,7 +354,8 @@ fn command_slices<'a>(rel_path: &str, content: &'a [u8]) -> Vec<&'a [u8]> {
                 || file_name.ends_with(".bats")));
     let is_make = matches!(file_name, "Makefile" | "makefile" | "GNUmakefile");
     let is_just = matches!(file_name, "Justfile" | "justfile" | ".justfile");
-    let is_rake = file_name == "Rakefile";
+    let is_rake = file_name == "Rakefile" || file_name.ends_with(".rake");
+    let is_jenkins = file_name == "Jenkinsfile" || file_name.starts_with("Jenkinsfile.");
     let is_procfile = file_name == "Procfile" || file_name.starts_with("Procfile.");
     let is_docker = file_name == "Dockerfile"
         || file_name.starts_with("Dockerfile.")
@@ -260,7 +363,8 @@ fn command_slices<'a>(rel_path: &str, content: &'a [u8]) -> Vec<&'a [u8]> {
     let is_yaml = file_name.ends_with(".yml") || file_name.ends_with(".yaml");
 
     let mut slices = Vec::new();
-    let mut yaml_block_indent = None;
+    // (indent of the line that opened the block, column of a compact list)
+    let mut yaml_block: Option<(usize, Option<usize>)> = None;
     for line in content.split(|b| *b == b'\n') {
         let indent = line
             .iter()
@@ -272,12 +376,13 @@ fn command_slices<'a>(rel_path: &str, content: &'a [u8]) -> Vec<&'a [u8]> {
         }
 
         if is_yaml {
-            if let Some(block_indent) = yaml_block_indent {
-                if indent > block_indent {
+            if let Some((block_indent, compact_col)) = yaml_block {
+                let compact_item = compact_col == Some(indent) && trimmed.starts_with(b"- ");
+                if indent > block_indent || compact_item {
                     slices.push(trimmed.strip_prefix(b"- ").unwrap_or(trimmed));
                     continue;
                 }
-                yaml_block_indent = None;
+                yaml_block = None;
             }
         }
 
@@ -286,17 +391,23 @@ fn command_slices<'a>(rel_path: &str, content: &'a [u8]) -> Vec<&'a [u8]> {
             continue;
         }
 
+        if is_rake {
+            slices.extend(ruby_shell_calls(
+                trimmed,
+                &[b"sh", b"system", b"exec"],
+                true,
+            ));
+            continue;
+        }
+        if is_jenkins {
+            slices.extend(ruby_shell_calls(trimmed, &[b"sh"], false));
+            continue;
+        }
+
         let Ok(text) = std::str::from_utf8(trimmed) else {
             continue;
         };
-        if is_rake {
-            if let Some(command) = ["sh ", "system ", "system(", "exec ", "exec("]
-                .iter()
-                .find_map(|prefix| text.split_once(prefix).map(|(_, command)| command))
-            {
-                slices.push(command.trim_start().as_bytes());
-            }
-        } else if is_docker {
+        if is_docker {
             if let Some(command) = ["RUN ", "CMD ", "ENTRYPOINT "]
                 .iter()
                 .find_map(|prefix| text.strip_prefix(prefix))
@@ -308,7 +419,10 @@ fn command_slices<'a>(rel_path: &str, content: &'a [u8]) -> Vec<&'a [u8]> {
                 slices.push(command.trim_start().as_bytes());
             }
         } else if is_yaml {
-            let item = text.strip_prefix("- ").unwrap_or(text);
+            let (item, item_offset) = match text.strip_prefix("- ") {
+                Some(item) => (item, 2),
+                None => (text, 0),
+            };
             if let Some(command) = ["run:", "script:", "cmds:", "command:", "entrypoint:"]
                 .iter()
                 .find_map(|key| item.strip_prefix(key))
@@ -323,23 +437,259 @@ fn command_slices<'a>(rel_path: &str, content: &'a [u8]) -> Vec<&'a [u8]> {
                                 .iter()
                                 .all(|b| b.is_ascii_digit() || *b == b'+' || *b == b'-')
                     });
-                if command.is_empty() || is_block {
-                    yaml_block_indent = Some(indent);
+                if is_block {
+                    yaml_block = Some((indent, None));
+                } else if command.is_empty() {
+                    // `script:` followed by a list may put its `- item`s at the
+                    // same column as the key (GitLab's compact style).
+                    yaml_block = Some((indent, Some(indent + item_offset)));
                 } else {
                     slices.push(command.as_bytes());
                 }
-            }
-        } else if file_name.starts_with("Jenkinsfile.") || file_name == "Jenkinsfile" {
-            if let Some((_, command)) = text.split_once("sh ") {
-                slices.push(command.trim_start().as_bytes());
             }
         }
     }
     slices
 }
 
+/// Wrappers that run the following word as the actual command.
+const COMMAND_PREFIXES: &[&str] = &[
+    "sudo", "time", "nohup", "exec", "env", "command", "nice", "then", "do", "else", "if", "elif",
+    "while", "until", "!", "{", "xargs",
+];
+
+/// Extract the words in command position from a shell-like command line:
+/// the first word and every word after `&&`, `||`, `;`, `|`, `(` or a
+/// backtick, skipping env assignments (`RAILS_ENV=test`), wrapper commands
+/// (`sudo`, `time`, `nohup`, `exec`, `bundle exec`, …) and their flags.
+/// Paths are reduced to their basename so `bin/rails` yields `rails`.
+fn command_words<'a>(command: &'a [u8]) -> Vec<&'a str> {
+    let Ok(command) = std::str::from_utf8(command) else {
+        return Vec::new();
+    };
+    let bytes = command.as_bytes();
+    let mut words = Vec::new();
+    let mut at_start = true;
+    let mut after_prefix = false;
+    let mut after_bundle = false;
+    let mut quote: Option<u8> = None;
+    let mut token_start: Option<usize> = None;
+
+    let mut finish =
+        |token: &'a str, at_start: &mut bool, after_prefix: &mut bool, after_bundle: &mut bool| {
+            let token = token.trim_matches(|c| matches!(c, '"' | '\'' | '[' | ']' | ',' | '@'));
+            if token.is_empty() {
+                return;
+            }
+            if *after_bundle {
+                *after_bundle = false;
+                if token == "exec" {
+                    *at_start = true;
+                    *after_prefix = true;
+                    return;
+                }
+            }
+            if !*at_start {
+                return;
+            }
+            if *after_prefix && token.starts_with('-') {
+                return;
+            }
+            let is_assignment = token.split_once('=').is_some_and(|(name, _)| {
+                !name.is_empty()
+                    && name.bytes().all(is_ident_byte)
+                    && !name.as_bytes()[0].is_ascii_digit()
+            });
+            if is_assignment {
+                return;
+            }
+            let word = token.rsplit('/').next().unwrap_or(token);
+            if COMMAND_PREFIXES.contains(&word) {
+                *after_prefix = true;
+                return;
+            }
+            *at_start = false;
+            *after_prefix = false;
+            if word == "bundle" {
+                *after_bundle = true;
+            }
+            if !word.is_empty() {
+                words.push(word);
+            }
+        };
+
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if let Some(q) = quote {
+            if b == b'\\' && q == b'"' {
+                i += 2;
+                continue;
+            }
+            if b == q {
+                quote = None;
+            }
+            i += 1;
+            continue;
+        }
+        let is_separator = matches!(b, b';' | b'|' | b'&' | b'(' | b')' | b'`' | b'\n');
+        if b.is_ascii_whitespace() || is_separator {
+            if let Some(start) = token_start.take() {
+                finish(
+                    &command[start..i],
+                    &mut at_start,
+                    &mut after_prefix,
+                    &mut after_bundle,
+                );
+            }
+            if is_separator {
+                at_start = true;
+                after_prefix = false;
+                after_bundle = false;
+            }
+        } else {
+            if b == b'"' || b == b'\'' {
+                quote = Some(b);
+            }
+            if token_start.is_none() {
+                token_start = Some(i);
+            }
+        }
+        i += 1;
+    }
+    if let Some(start) = token_start {
+        finish(
+            &command[start..],
+            &mut at_start,
+            &mut after_prefix,
+            &mut after_bundle,
+        );
+    }
+    words
+}
+
+/// Curated executable → gem mapping used when the providing gem is not
+/// installed locally (so its gemspec `executables` cannot be read). Every
+/// declared candidate is credited.
+static KNOWN_EXECUTABLES: &[(&str, &[&str])] = &[
+    ("annotate", &["annotate"]),
+    ("annotaterb", &["annotaterb"]),
+    ("appsignal", &["appsignal"]),
+    ("brakeman", &["brakeman"]),
+    ("bundle", &["bundler"]),
+    ("bundle-audit", &["bundler-audit"]),
+    ("bundler-audit", &["bundler-audit"]),
+    ("byebug", &["byebug"]),
+    ("cap", &["capistrano"]),
+    ("capify", &["capistrano"]),
+    ("cucumber", &["cucumber"]),
+    ("danger", &["danger"]),
+    ("derailed", &["derailed_benchmarks"]),
+    ("erb_lint", &["erb_lint"]),
+    ("erblint", &["erb_lint"]),
+    ("erd", &["rails-erd"]),
+    ("fastlane", &["fastlane"]),
+    ("foreman", &["foreman"]),
+    ("good_job", &["good_job"]),
+    ("guard", &["guard"]),
+    ("haml-lint", &["haml_lint"]),
+    ("htmlbeautifier", &["htmlbeautifier"]),
+    ("htmlproofer", &["html-proofer"]),
+    ("i18n-tasks", &["i18n-tasks"]),
+    ("kamal", &["kamal"]),
+    ("license_finder", &["license_finder"]),
+    ("mailcatcher", &["mailcatcher"]),
+    ("newrelic", &["newrelic_rpm"]),
+    ("overcommit", &["overcommit"]),
+    ("parallel_cucumber", &["parallel_tests"]),
+    ("parallel_rspec", &["parallel_tests"]),
+    ("parallel_test", &["parallel_tests"]),
+    ("pod", &["cocoapods"]),
+    ("pry", &["pry"]),
+    ("puma", &["puma"]),
+    ("pumactl", &["puma"]),
+    ("rackup", &["rackup", "rack"]),
+    ("rails", &["railties", "rails"]),
+    ("rake", &["rake"]),
+    ("rdbg", &["debug"]),
+    ("rdoc", &["rdoc"]),
+    ("reek", &["reek"]),
+    ("ri", &["rdoc"]),
+    ("rspec", &["rspec-core", "rspec", "rspec-rails"]),
+    ("rubocop", &["rubocop"]),
+    ("rubycritic", &["rubycritic"]),
+    ("rufo", &["rufo"]),
+    ("scss-lint", &["scss_lint"]),
+    ("shoryuken", &["shoryuken"]),
+    ("sidekiq", &["sidekiq"]),
+    ("sidekiqmon", &["sidekiq"]),
+    ("skylight", &["skylight"]),
+    ("slim-lint", &["slim_lint"]),
+    ("solargraph", &["solargraph"]),
+    ("spring", &["spring"]),
+    ("srb", &["sorbet"]),
+    ("srb-rbi", &["sorbet"]),
+    ("standardrb", &["standard"]),
+    ("steep", &["steep"]),
+    ("stree", &["syntax_tree"]),
+    ("tailwindcss", &["tailwindcss-ruby", "tailwindcss-rails"]),
+    ("tapioca", &["tapioca"]),
+    ("thrust", &["thruster"]),
+    ("unicorn", &["unicorn"]),
+    ("unicorn_rails", &["unicorn"]),
+    ("vite", &["vite_ruby"]),
+    ("whenever", &["whenever"]),
+    ("wheneverize", &["whenever"]),
+    ("yard", &["yard"]),
+    ("yardoc", &["yard"]),
+    ("yri", &["yard"]),
+];
+
+fn normalize_name(name: &str) -> String {
+    name.to_ascii_lowercase().replace('-', "_")
+}
+
+/// Resolves a command word to the declared gem(s) that provide it.
+struct CommandResolver<'a> {
+    gem_names: HashSet<&'a str>,
+    normalized: HashMap<String, &'a str>,
+    exe_to_gem: HashMap<String, String>,
+}
+
+impl<'a> CommandResolver<'a> {
+    fn new(gem_names: &'a [String], exe_to_gem: HashMap<String, String>) -> Self {
+        CommandResolver {
+            gem_names: gem_names.iter().map(String::as_str).collect(),
+            normalized: gem_names
+                .iter()
+                .map(|name| (normalize_name(name), name.as_str()))
+                .collect(),
+            exe_to_gem,
+        }
+    }
+
+    fn resolve(&self, command: &str, out: &mut Vec<String>) {
+        if self.gem_names.contains(command) {
+            out.push(command.to_string());
+        }
+        if let Some(gem) = self.exe_to_gem.get(command) {
+            out.push(gem.clone());
+        }
+        if let Some((_, gems)) = KNOWN_EXECUTABLES.iter().find(|(exe, _)| *exe == command) {
+            out.extend(
+                gems.iter()
+                    .filter(|gem| self.gem_names.contains(**gem))
+                    .map(|gem| gem.to_string()),
+            );
+        }
+        if let Some(gem) = self.normalized.get(&normalize_name(command)) {
+            out.push(gem.to_string());
+        }
+    }
+}
+
 /// Scan non-Ruby files (Makefile, Dockerfile, CI configs, scripts)
-/// for `bundle exec <gem>` invocations and bare gem CLI references.
+/// for `bundle exec <gem>` invocations and gem executables run as commands.
 /// Uses pre-collected script files from the source tree walk (single-walk mode).
 pub fn scan_scripts_for_gem_usage(
     _dir: &Path,
@@ -347,82 +697,44 @@ pub fn scan_scripts_for_gem_usage(
     gem_index: &HashMap<String, std::path::PathBuf>,
     script_files: &[(String, Vec<u8>)],
 ) -> HashMap<String, HashSet<String>> {
-    let gem_name_set: HashSet<&str> = gem_names.iter().map(|s| s.as_str()).collect();
-
     // Build executable→gem name mapping from installed gemspecs (parallel)
-    let exe_to_gem = build_exe_to_gem_map(gem_names, gem_index);
+    let resolver = CommandResolver::new(gem_names, build_exe_to_gem_map(gem_names, gem_index));
 
-    // Build AhoCorasick automaton for multi-pattern byte matching
-    let ac = AhoCorasick::new(gem_names).unwrap();
-
-    // Process pre-collected script files in parallel
-    let num_patterns = gem_names.len();
-    let per_file_refs: Vec<Vec<(String, String)>> = script_files
+    let per_file_refs: Vec<(String, Vec<String>)> = script_files
         .par_iter()
         .filter_map(|(rel_path, content)| {
-            let mut refs = Vec::new();
+            let mut gems = Vec::new();
 
             // Strip comment lines/inline comments to avoid matching gem names in comments
             let stripped = strip_comment_lines(content);
             let stripped: &[u8] = stripped.as_ref();
 
-            // Byte scanner: bundle exec
             for cmd in scan_bundle_exec(stripped) {
-                if gem_name_set.contains(cmd.as_str()) {
-                    refs.push((cmd, rel_path.clone()));
-                } else if let Some(gem_name) = exe_to_gem.get(&cmd) {
-                    refs.push((gem_name.clone(), rel_path.clone()));
-                }
+                resolver.resolve(&cmd, &mut gems);
             }
-
-            // Byte scanner: bin/ references
             for cmd in scan_bin_refs(stripped) {
-                if gem_name_set.contains(cmd.as_str()) {
-                    refs.push((cmd, rel_path.clone()));
-                } else if let Some(gem_name) = exe_to_gem.get(&cmd) {
-                    refs.push((gem_name.clone(), rel_path.clone()));
-                }
+                resolver.resolve(&cmd, &mut gems);
             }
-
-            // AhoCorasick: gem name byte match in executable command contexts.
-            // Treat `-` and `_` as part of the gem token so that "rack" inside
-            // "rack-mini-profiler" does NOT count as a match for the "rack" gem.
-            let mut seen = vec![false; num_patterns];
+            // Only words in command position count: arguments such as
+            // `apt-get install -y git curl` must not credit `git`/`curl` gems.
             for command in command_slices(rel_path, stripped) {
-                for mat in ac.find_overlapping_iter(command) {
-                    let pid = mat.pattern().as_usize();
-                    if seen[pid] {
-                        continue;
-                    }
-                    let start = mat.start();
-                    let end = mat.end();
-                    let before_ok = start == 0 || {
-                        let b = command[start - 1];
-                        !b.is_ascii_alphanumeric() && b != b'_' && b != b'-'
-                    };
-                    let after_ok = end >= command.len() || {
-                        let b = command[end];
-                        !b.is_ascii_alphanumeric() && b != b'_' && b != b'-'
-                    };
-                    if before_ok && after_ok {
-                        seen[pid] = true;
-                        refs.push((gem_names[pid].clone(), rel_path.clone()));
-                    }
+                for word in command_words(command) {
+                    resolver.resolve(word, &mut gems);
                 }
             }
 
-            if refs.is_empty() {
+            if gems.is_empty() {
                 None
             } else {
-                Some(refs)
+                Some((rel_path.clone(), gems))
             }
         })
         .collect();
 
     let mut gem_refs: HashMap<String, HashSet<String>> = HashMap::new();
-    for refs in per_file_refs {
-        for (gem_name, file) in refs {
-            gem_refs.entry(gem_name).or_default().insert(file);
+    for (file, gems) in per_file_refs {
+        for gem_name in gems {
+            gem_refs.entry(gem_name).or_default().insert(file.clone());
         }
     }
 
@@ -740,12 +1052,17 @@ mod tests {
 
     #[test]
     fn script_scan_regex_match() {
-        let script_files = vec![("Dockerfile".to_string(), b"RUN gem install puma\n".to_vec())];
-        let gem_names = vec!["puma".to_string()];
+        // Installing a gem is an argument, not a use; running it is.
+        let script_files = vec![(
+            "Dockerfile".to_string(),
+            b"RUN gem install puma foreman\nCMD puma -C config/puma.rb\n".to_vec(),
+        )];
+        let gem_names = vec!["puma".to_string(), "foreman".to_string()];
         let gem_index = HashMap::new();
         let results =
             scan_scripts_for_gem_usage(Path::new("."), &gem_names, &gem_index, &script_files);
         assert!(results.contains_key("puma"));
+        assert!(!results.contains_key("foreman"));
     }
 
     #[test]
@@ -1222,5 +1539,144 @@ mod tests {
             results.contains_key("rack"),
             "standalone rack reference must still match"
         );
+    }
+
+    fn scan(files: &[(&str, &str)], gems: &[&str]) -> HashMap<String, HashSet<String>> {
+        let script_files: Vec<(String, Vec<u8>)> = files
+            .iter()
+            .map(|(path, content)| (path.to_string(), content.as_bytes().to_vec()))
+            .collect();
+        let gem_names: Vec<String> = gems.iter().map(|g| g.to_string()).collect();
+        scan_scripts_for_gem_usage(Path::new("."), &gem_names, &HashMap::new(), &script_files)
+    }
+
+    // ── C8: *.rake task files ──
+
+    #[test]
+    fn script_file_rake_tasks() {
+        assert!(is_script_file("lib/tasks/lint.rake", "lint.rake"));
+        assert!(is_script_file("engines/a/lib/tasks/x.rake", "x.rake"));
+    }
+
+    #[test]
+    fn script_scan_rake_task_shell_outs() {
+        let results = scan(
+            &[(
+                "lib/tasks/lint.rake",
+                "task :lint do\n  sh \"bundle exec rubocop\"\n  sh \"bundle exec haml-lint app/views\"\n  system(\"standardrb --fix\")\n  `erblint --lint-all`\nend\n",
+            )],
+            &["rubocop", "haml_lint", "standard", "erb_lint", "rails"],
+        );
+        for gem in ["rubocop", "haml_lint", "standard", "erb_lint"] {
+            assert!(results.contains_key(gem), "{gem} should be credited");
+        }
+        assert!(!results.contains_key("rails"));
+    }
+
+    #[test]
+    fn script_scan_rake_ignores_keywords_inside_strings() {
+        let results = scan(
+            &[(
+                "Rakefile",
+                "desc \"Flush redis cache\"\ntask :flush do\n  puts 'run system redis'\nend\ntask :sh\n",
+            )],
+            &["redis", "cache"],
+        );
+        assert!(results.is_empty(), "got {results:?}");
+    }
+
+    // ── C21: only command words count ──
+
+    #[test]
+    fn script_scan_ignores_command_arguments() {
+        let results = scan(
+            &[(
+                "Dockerfile",
+                "FROM ruby:3.3\nRUN apt-get update && apt-get install -y git curl sqlite3\n",
+            )],
+            &["git", "curl", "sqlite3"],
+        );
+        assert!(results.is_empty(), "got {results:?}");
+    }
+
+    #[test]
+    fn command_words_skip_prefixes_and_assignments() {
+        assert_eq!(
+            command_words(b"RAILS_ENV=test bundle exec rake db:setup && sudo -E foreman start"),
+            vec!["bundle", "rake", "foreman"]
+        );
+        assert_eq!(
+            command_words(b"time nohup ./bin/sidekiq -q default | tee log; exec puma"),
+            vec!["sidekiq", "tee", "puma"]
+        );
+        assert_eq!(
+            command_words(b"echo \"a; rubocop\" || env FOO=1 brakeman -q"),
+            vec!["echo", "brakeman"]
+        );
+        assert_eq!(
+            command_words(br#"["./bin/thrust", "./bin/rails", "server"]"#),
+            vec!["thrust"]
+        );
+    }
+
+    // ── C22: curated executable fallback ──
+
+    #[test]
+    fn script_scan_known_executable_fallback() {
+        let results = scan(
+            &[
+                (
+                    ".github/workflows/ci.yml",
+                    "jobs:\n  t:\n    steps:\n      - run: bundle exec cap production deploy\n      - run: rdbg -c -- bin/rails test\n",
+                ),
+                ("Dockerfile", "CMD [\"./bin/thrust\", \"./bin/rails\", \"server\"]\n"),
+                ("Procfile", "web: bundle exec pumactl start\nlint: haml-lint\n"),
+            ],
+            &["capistrano", "debug", "thruster", "railties", "puma", "haml_lint"],
+        );
+        for gem in [
+            "capistrano",
+            "debug",
+            "thruster",
+            "railties",
+            "puma",
+            "haml_lint",
+        ] {
+            assert!(results.contains_key(gem), "{gem} should be credited");
+        }
+    }
+
+    #[test]
+    fn normalizes_hyphen_and_underscore() {
+        let results = scan(&[("bin/lint", "i18n_tasks health\n")], &["i18n-tasks"]);
+        assert!(results.contains_key("i18n-tasks"));
+    }
+
+    // ── C11: GitLab compact YAML lists ──
+
+    #[test]
+    fn script_scan_gitlab_compact_list() {
+        let results = scan(
+            &[(
+                ".gitlab-ci.yml",
+                "lint:\n  script:\n  - rubocop\n  - brakeman -q\n  tags:\n  - puma\n",
+            )],
+            &["rubocop", "brakeman", "puma"],
+        );
+        assert!(results.contains_key("rubocop"));
+        assert!(results.contains_key("brakeman"));
+        assert!(!results.contains_key("puma"), "tags list is not a script");
+    }
+
+    #[test]
+    fn script_scan_block_scalar_does_not_capture_sibling_steps() {
+        let results = scan(
+            &[(
+                ".github/workflows/ci.yml",
+                "steps:\n  - run: |\n      echo hi\n  - name: puma\n",
+            )],
+            &["puma"],
+        );
+        assert!(!results.contains_key("puma"));
     }
 }

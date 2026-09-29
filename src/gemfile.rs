@@ -26,7 +26,7 @@ pub fn parse_gemfile(dir: &Path) -> Vec<GemEntry> {
     let gemfile_path = default_gemfile_path(dir);
     if !gemfile_path.exists() {
         eprintln!("Error: No Gemfile or gems.rb found in {}", dir.display());
-        std::process::exit(1);
+        std::process::exit(2);
     }
 
     parse_gemfiles(dir, &[gemfile_path])
