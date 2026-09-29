@@ -22,6 +22,8 @@ pub enum GemSource {
 pub struct FileResult {
     pub rel_path: String,
     pub requires: Vec<String>,
+    /// Unique constant names referenced by this file (reused for cache entries).
+    pub modules: Vec<String>,
     pub bundler_groups: Vec<String>,
     pub bundler_require_all: bool,
 }

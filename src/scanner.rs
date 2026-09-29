@@ -1681,12 +1681,91 @@ fn scan_gem_bin_filtered(bytes: &[u8], mask: &[u8], results: &mut Vec<String>) {
     }
 }
 
+/// Small, fast non-cryptographic hasher (FxHash) for short per-file keys.
+/// Inputs are local source files, so HashDoS resistance is not needed.
+#[derive(Default, Clone, Copy)]
+struct FxHasher {
+    hash: u64,
+}
+
+impl FxHasher {
+    #[inline]
+    fn add(&mut self, word: u64) {
+        const SEED: u64 = 0x51_7c_c1_b7_27_22_0a_95;
+        self.hash = (self.hash.rotate_left(5) ^ word).wrapping_mul(SEED);
+    }
+}
+
+impl std::hash::Hasher for FxHasher {
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        let (chunks, rest) = bytes.as_chunks::<8>();
+        for chunk in chunks {
+            self.add(u64::from_le_bytes(*chunk));
+        }
+        if !rest.is_empty() {
+            let mut word = [0u8; 8];
+            word[..rest.len()].copy_from_slice(rest);
+            self.add(u64::from_le_bytes(word));
+        }
+    }
+
+    #[inline]
+    fn write_usize(&mut self, value: usize) {
+        self.add(value as u64);
+    }
+
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.hash
+    }
+}
+
+/// Per-file set of unique constant names, borrowed from the file bytes so
+/// repeated occurrences never allocate.
+type FileModuleSet<'a> = HashSet<&'a [u8], std::hash::BuildHasherDefault<FxHasher>>;
+
+/// Merge a file's unique constant names into a module map. When `keep_list` is
+/// set the owned names are also returned (reused for the file's cache entry).
+fn merge_file_modules(
+    names: FileModuleSet<'_>,
+    modules: &mut HashMap<String, HashSet<Arc<str>>>,
+    rel_path: &Arc<str>,
+    keep_list: bool,
+) -> Vec<String> {
+    let mut owned = Vec::with_capacity(if keep_list { names.len() } else { 0 });
+    for name in names {
+        // Constant names are ASCII by construction; middleware strings may not be.
+        let Ok(name) = std::str::from_utf8(name) else {
+            continue;
+        };
+        if let Some(files) = modules.get_mut(name) {
+            files.insert(Arc::clone(rel_path));
+        } else {
+            let mut files = HashSet::with_capacity(1);
+            files.insert(Arc::clone(rel_path));
+            modules.insert(name.to_string(), files);
+        }
+        if keep_list {
+            owned.push(name.to_string());
+        }
+    }
+    owned
+}
+
+#[cfg(test)]
 fn scan_modules_filtered_into(
     bytes: &[u8],
     mask: &[u8],
     modules: &mut HashMap<String, HashSet<Arc<str>>>,
     rel_path: &Arc<str>,
 ) {
+    let mut names = FileModuleSet::default();
+    collect_module_names(bytes, mask, &mut names);
+    merge_file_modules(names, modules, rel_path, false);
+}
+
+fn collect_module_names<'a>(bytes: &'a [u8], mask: &[u8], names: &mut FileModuleSet<'a>) {
     let mut i = 0;
     let len = bytes.len();
     while i < len {
@@ -1745,15 +1824,7 @@ fn scan_modules_filtered_into(
                 continue;
             }
             if match_end > start {
-                let slice = &bytes[start..match_end];
-                if let Ok(name) = std::str::from_utf8(slice) {
-                    // Use entry().or_default() to avoid double lookup;
-                    // rel_path is an Arc<str> so the clone is a refcount bump.
-                    modules
-                        .entry(name.to_string())
-                        .or_default()
-                        .insert(Arc::clone(rel_path));
-                }
+                names.insert(&bytes[start..match_end]);
             }
             if i <= match_end {
                 i = match_end;
@@ -1934,12 +2005,19 @@ fn strip_inline_comment(s: &str) -> String {
 
 /// Scan for middleware string-literal references (e.g. `config.middleware.use "Bullet::Rack"`)
 /// and insert each quoted module name into `modules`.
+#[cfg(test)]
 fn scan_middleware_refs(
     bytes: &[u8],
     mask: &[u8],
     modules: &mut HashMap<String, HashSet<Arc<str>>>,
     rel_path: &Arc<str>,
 ) {
+    let mut names = FileModuleSet::default();
+    collect_middleware_refs(bytes, mask, &mut names);
+    merge_file_modules(names, modules, rel_path, false);
+}
+
+fn collect_middleware_refs<'a>(bytes: &'a [u8], mask: &[u8], names: &mut FileModuleSet<'a>) {
     let has_candidate = memmem::find(bytes, b".middleware.").is_some()
         || memmem::find(bytes, b"middleware_stack").is_some()
         || memmem::find(bytes, b"Rack::Builder").is_some();
@@ -1980,15 +2058,10 @@ fn scan_middleware_refs(
                     end += 1;
                 }
                 if end < eol {
-                    if let Ok(name) = std::str::from_utf8(&bytes[start..end]) {
-                        let name = name.trim();
-                        // Only insert if it looks like a module name (starts with uppercase)
-                        if !name.is_empty() && name.as_bytes()[0].is_ascii_uppercase() {
-                            modules
-                                .entry(name.to_string())
-                                .or_default()
-                                .insert(Arc::clone(rel_path));
-                        }
+                    let name = bytes[start..end].trim_ascii();
+                    // Only insert if it looks like a module name (starts with uppercase)
+                    if !name.is_empty() && name[0].is_ascii_uppercase() {
+                        names.insert(name);
                     }
                     i = end + 1;
                 } else {
@@ -2203,21 +2276,21 @@ pub fn scan_source_tree_with_threads_and_explicit_skips(
                         if let Some(entry) = cache_hit {
                             // Cache hit: reconstruct FileResult + modules without rescanning.
                             let rel: Arc<str> = Arc::from(rel_path_cow.as_ref());
-                            // Clone modules so we can both (a) insert into local_modules and
-                            // (b) reinsert the original entry back into the cache map.
-                            let entry_modules = entry.modules.clone();
-                            for m in entry_modules {
-                                flush_buf
-                                    .local_modules
-                                    .entry(m)
-                                    .or_default()
-                                    .insert(Arc::clone(&rel));
+                            for m in &entry.modules {
+                                if let Some(files) = flush_buf.local_modules.get_mut(m.as_str()) {
+                                    files.insert(Arc::clone(&rel));
+                                } else {
+                                    flush_buf
+                                        .local_modules
+                                        .insert(m.clone(), HashSet::from([Arc::clone(&rel)]));
+                                }
                             }
                             // Build FileResult by cloning small Vec<String>s; reinsert
                             // owned entry back into cache so durability is preserved.
                             let file_result = FileResult {
                                 rel_path: rel.to_string(),
                                 requires: entry.requires.clone(),
+                                modules: Vec::new(),
                                 bundler_groups: entry.bundler_groups.clone(),
                                 bundler_require_all: entry.bundler_require_all,
                             };
@@ -2226,26 +2299,23 @@ pub fn scan_source_tree_with_threads_and_explicit_skips(
                         } else {
                             // Cache miss: scan file
 
-                            if let Some(file_result) =
-                                scan_file(&path_str, &dir_ref, &mut flush_buf.local_modules)
-                            {
-                                // Collect new modules added by this file for cache
+                            if let Some(mut file_result) = scan_file_with(
+                                &path_str,
+                                &dir_ref,
+                                &mut flush_buf.local_modules,
+                                use_cache,
+                            ) {
+                                // The file's own unique module list doubles as its
+                                // cache entry (no scan of the thread-wide map).
+                                let file_modules = std::mem::take(&mut file_result.modules);
                                 if use_cache {
                                     if let Some(ref md) = metadata {
-                                        let rel_for_filter: Arc<str> =
-                                            Arc::from(file_result.rel_path.as_str());
-                                        let new_modules: Vec<String> = flush_buf
-                                            .local_modules
-                                            .iter()
-                                            .filter(|(_, files)| files.contains(&rel_for_filter))
-                                            .map(|(name, _)| name.clone())
-                                            .collect();
                                         flush_buf.cache_buf.push((
                                             file_result.rel_path.clone(),
                                             cache_timestamp,
                                             md.len(),
                                             file_result.requires.clone(),
-                                            new_modules,
+                                            file_modules,
                                             file_result.bundler_groups.clone(),
                                             file_result.bundler_require_all,
                                         ));
@@ -2429,21 +2499,44 @@ fn is_scannable(_path: &str, full_path: &Path) -> bool {
 
 // (FileContent enum removed — plain read() is faster for single sequential reads)
 
+#[cfg(test)]
 fn scan_file(
     path: &str,
     dir: &str,
     thread_modules: &mut HashMap<String, HashSet<Arc<str>>>,
 ) -> Option<FileResult> {
-    // Plain read() is faster than mmap for single sequential reads (no VMA/TLB overhead)
-    let bytes = std::fs::read(path).ok()?;
-    scan_file_bytes(path, dir, &bytes, thread_modules)
+    scan_file_with(path, dir, thread_modules, true)
 }
 
+/// `keep_module_list` fills `FileResult::modules` with the file's unique
+/// constant names (needed only when the result is written to the cache).
+fn scan_file_with(
+    path: &str,
+    dir: &str,
+    thread_modules: &mut HashMap<String, HashSet<Arc<str>>>,
+    keep_module_list: bool,
+) -> Option<FileResult> {
+    // Plain read() is faster than mmap for single sequential reads (no VMA/TLB overhead)
+    let bytes = std::fs::read(path).ok()?;
+    scan_file_bytes_with(path, dir, &bytes, thread_modules, keep_module_list)
+}
+
+#[allow(dead_code)]
 fn scan_file_bytes(
     path: &str,
     dir: &str,
     bytes: &[u8],
     thread_modules: &mut HashMap<String, HashSet<Arc<str>>>,
+) -> Option<FileResult> {
+    scan_file_bytes_with(path, dir, bytes, thread_modules, true)
+}
+
+fn scan_file_bytes_with(
+    path: &str,
+    dir: &str,
+    bytes: &[u8],
+    thread_modules: &mut HashMap<String, HashSet<Arc<str>>>,
+    keep_module_list: bool,
 ) -> Option<FileResult> {
     if bytes.is_empty() {
         return None;
@@ -2505,9 +2598,12 @@ fn scan_file_bytes(
     // files — YAML keys/values like `UserNotFound:` would otherwise be
     // extracted as module references. The explicit YAML regex extractors
     // below still pick up rubocop/plugins/inherit_gem/require: entries.
+    let mut file_modules = Vec::new();
     if !is_yaml {
-        scan_modules_filtered_into(bytes, &mask, thread_modules, &rel_path_arc);
-        scan_middleware_refs(bytes, &mask, thread_modules, &rel_path_arc);
+        let mut names = FileModuleSet::default();
+        collect_module_names(bytes, &mask, &mut names);
+        collect_middleware_refs(bytes, &mask, &mut names);
+        file_modules = merge_file_modules(names, thread_modules, &rel_path_arc, keep_module_list);
     }
 
     // YAML config patterns (keep regex — rarely hit, complex multiline patterns).
@@ -2553,6 +2649,7 @@ fn scan_file_bytes(
     Some(FileResult {
         rel_path,
         requires,
+        modules: file_modules,
         bundler_groups,
         bundler_require_all,
     })
@@ -3758,6 +3855,56 @@ require 'real_regex'
     fn default_walker_threads_is_capped_at_four() {
         assert!(default_walker_threads() >= 1);
         assert!(default_walker_threads() <= 4);
+    }
+
+    #[test]
+    fn scan_file_reports_unique_modules_per_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let rb = dir.path().join("a.rb");
+        std::fs::write(&rb, "Foo.a\nFoo.b\nBar::Baz.c\nFoo.d\n").unwrap();
+        let mut modules = HashMap::new();
+        let result = scan_file(
+            rb.to_str().unwrap(),
+            dir.path().to_str().unwrap(),
+            &mut modules,
+        )
+        .unwrap();
+        let mut own = result.modules.clone();
+        own.sort();
+        assert_eq!(own, vec!["Bar::Baz", "Foo"]);
+        assert_eq!(modules["Foo"].len(), 1);
+    }
+
+    #[test]
+    fn cold_cache_scan_is_not_quadratic_in_module_count() {
+        // Regression: on a cache miss the walker used to scan the entire
+        // per-thread module map to find the current file's modules, making a
+        // cold cached scan quadratic in the number of files.
+        let dir = tempfile::tempdir().unwrap();
+        let app = dir.path().join("app");
+        std::fs::create_dir_all(&app).unwrap();
+        for i in 0..1500 {
+            let body: String = (0..60).map(|j| format!("Const{i}x{j}.call\n")).collect();
+            std::fs::write(app.join(format!("f{i}.rb")), body).unwrap();
+        }
+        let started = std::time::Instant::now();
+        let disabled = Arc::new(crate::cache::FileCache::disabled());
+        let (uncached, _) = scan_source_tree_with_threads(dir.path(), &[], disabled, Some(1));
+        let uncached_time = started.elapsed();
+
+        let started = std::time::Instant::now();
+        let cache = Arc::new(crate::cache::FileCache::load(dir.path()));
+        let (cached, updates) = scan_source_tree_with_threads(dir.path(), &[], cache, Some(1));
+        let cached_time = started.elapsed();
+
+        assert_eq!(uncached.modules.len(), 90_000);
+        assert_eq!(cached.modules.len(), 90_000);
+        assert_eq!(updates.len(), 1500);
+        assert!(updates.iter().all(|update| update.4.len() == 60));
+        assert!(
+            cached_time <= uncached_time * 4 + std::time::Duration::from_millis(500),
+            "cold cached scan {cached_time:?} vs uncached {uncached_time:?}"
+        );
     }
 
     // ── Filtered scanner edge cases ──
