@@ -675,10 +675,31 @@ fn previous_significant(bytes: &[u8], mask: &[u8], start: usize, mut i: usize) -
     None
 }
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum LiteralStart {
+    /// Division / modulo operator.
+    Operator,
+    /// Unambiguous value position (after an operator, keyword or `(`).
+    Value,
+    /// `ident /x` or `ident %(x)`: probably a command argument, but it may be a
+    /// division by a local variable, so such literals must close on one line.
+    CommandArgument,
+}
+
 fn is_regex_start(bytes: &[u8], mask: &[u8], start: usize, i: usize) -> bool {
+    literal_start(bytes, mask, start, i) != LiteralStart::Operator
+}
+
+fn literal_start(bytes: &[u8], mask: &[u8], start: usize, i: usize) -> LiteralStart {
+    use LiteralStart::*;
     let Some(prev) = previous_significant(bytes, mask, start, i) else {
-        return true;
+        return Value;
     };
+    // `:/` (and `:%`) directly after a colon is an operator symbol, e.g.
+    // `reduce(:/)`, not the start of a literal.
+    if bytes[prev] == b':' && prev + 1 == i && (prev == start || bytes[prev - 1] != b':') {
+        return Operator;
+    }
     if matches!(
         bytes[prev],
         b'=' | b'('
@@ -700,14 +721,18 @@ fn is_regex_start(bytes: &[u8], mask: &[u8], start: usize, i: usize) -> bool {
             | b'<'
             | b'>'
     ) {
-        return true;
+        return Value;
     }
     if !is_word_char(bytes[prev]) {
-        return false;
+        return Operator;
     }
     let mut word_start = prev;
     while word_start > start && is_word_char(bytes[word_start - 1]) {
         word_start -= 1;
+    }
+    // `def /(other)` / `def %(other)` define operator methods.
+    if &bytes[word_start..=prev] == b"def" {
+        return Operator;
     }
     if matches!(
         &bytes[word_start..=prev],
@@ -725,12 +750,17 @@ fn is_regex_start(bytes: &[u8], mask: &[u8], start: usize, i: usize) -> bool {
             | b"do"
             | b"case"
     ) {
-        return true;
+        return Value;
     }
-    prev + 1 < i
+    if prev + 1 < i
         && i + 1 < bytes.len()
         && bytes[prev].is_ascii_lowercase()
         && !bytes[i + 1].is_ascii_whitespace()
+    {
+        CommandArgument
+    } else {
+        Operator
+    }
 }
 
 fn find_delimited_end(
@@ -1009,32 +1039,39 @@ fn mask_ruby_range_cached(
     let mut pending_heredoc_body: Option<(usize, usize)> = None;
     let mut i = start;
     while i < end {
+        // Heredoc bodies were already lexed (with their interpolations) when
+        // the opener was parsed; resume after the last terminator.
+        if let Some((opener_line_end, next_body)) = pending_heredoc_body {
+            if i > opener_line_end {
+                pending_heredoc_body = None;
+                if i < next_body {
+                    i = next_body;
+                    continue;
+                }
+            }
+        }
         if mask[i] != 0 {
             i += 1;
             continue;
         }
         let line_start = i == 0 || bytes[i - 1] == b'\n';
-        if line_start && bytes[i..end].starts_with(b"=begin") {
-            let after = i + 6;
-            if after == end || bytes[after].is_ascii_whitespace() {
-                let block_end = memmem::find(&bytes[after..end], b"\n=end")
-                    .map(|n| {
-                        let end_marker = after + n + 5;
-                        memchr::memchr(b'\n', &bytes[end_marker..end])
-                            .map(|tail| end_marker + tail)
-                            .unwrap_or(end)
-                    })
-                    .unwrap_or(end);
-                set_mask(mask, i, block_end, true);
-                i = block_end;
-                continue;
-            }
+        if line_start && is_embedded_doc_marker(bytes, i, end, b"=begin") {
+            let block_end = find_embedded_doc_end(bytes, i + 6, end);
+            set_mask(mask, i, block_end, true);
+            i = block_end;
+            continue;
+        }
+        if line_start && is_data_marker(bytes, i, end) {
+            // Everything after `__END__` is DATA, not code.
+            set_mask(mask, i, end, true);
+            break;
         }
         match bytes[i] {
             b'?' if i + 1 < end && !bytes[i + 1].is_ascii_whitespace() => {
-                i += if bytes[i + 1] == b'\\' { 3 } else { 2 };
-                i = i.min(end);
+                i += char_literal_len(bytes, mask, start, i, end);
             }
+            // Punctuation globals such as `$"` (loaded features), `$'`, `$/`.
+            b'$' if i + 1 < end && is_special_global_char(bytes[i + 1]) => i += 2,
             b'#' => {
                 let eol = memchr::memchr(b'\n', &bytes[i..end])
                     .map(|n| i + n)
@@ -1047,7 +1084,14 @@ fn mask_ruby_range_cached(
                 let content_start = i + 1;
                 let mut close = content_start;
                 let mut found_close = false;
+                // A literal never extends into bytes already masked (e.g. template
+                // text between ERB tags, or heredoc bodies).
+                let mut stop = end;
                 while close < end {
+                    if mask[close] != 0 {
+                        stop = close;
+                        break;
+                    }
                     if bytes[close] == b'\\' {
                         close = (close + 2).min(end);
                     } else if quote == b'"'
@@ -1074,15 +1118,59 @@ fn mask_ruby_range_cached(
                 let literal_end = if found_close {
                     close
                 } else {
-                    memchr::memchr(b'\n', &bytes[content_start..end])
+                    memchr::memchr(b'\n', &bytes[content_start..stop])
                         .map(|offset| content_start + offset)
-                        .unwrap_or(end)
+                        .unwrap_or(stop)
                 };
                 set_mask(mask, content_start, literal_end, true);
                 if quote == b'"' {
                     expose_interpolations(bytes, mask, content_start, literal_end, cache);
                 }
                 i = if found_close { close + 1 } else { literal_end };
+            }
+            // Bare `%(...)` literals behave like `%Q(...)`; only in value
+            // position, so `x % (y)` / `a %[b]` style modulo is left alone.
+            b'%' if i + 1 < end
+                && matches!(bytes[i + 1], b'(' | b'[' | b'{' | b'<' | b'|')
+                && is_regex_start(bytes, mask, start, i) =>
+            {
+                let open = bytes[i + 1];
+                let close = match open {
+                    b'(' => b')',
+                    b'[' => b']',
+                    b'{' => b'}',
+                    b'<' => b'>',
+                    _ => open,
+                };
+                let content_start = i + 2;
+                let line_end = memchr::memchr(b'\n', &bytes[content_start..end])
+                    .map(|offset| content_start + offset)
+                    .unwrap_or(end);
+                // `ident %(x)` may be a modulo by a local variable: bound it.
+                let limit = if literal_start(bytes, mask, start, i) == LiteralStart::Value {
+                    end
+                } else {
+                    line_end
+                };
+                if let Some(literal_end) = find_percent_literal_end(
+                    bytes,
+                    i + 1,
+                    content_start,
+                    limit,
+                    open,
+                    close,
+                    false,
+                    cache,
+                ) {
+                    set_mask(mask, content_start, literal_end, true);
+                    expose_interpolations(bytes, mask, content_start, literal_end, cache);
+                    i = literal_end + 1;
+                } else if limit == end {
+                    set_mask(mask, content_start, line_end, true);
+                    i = line_end;
+                } else {
+                    i += 1;
+                }
             }
             b'%' if i + 2 < end
                 && is_percent_literal_type(bytes[i + 1])
@@ -1126,7 +1214,12 @@ fn mask_ruby_range_cached(
                 }
             }
             b'/' if is_regex_start(bytes, mask, start, i) => {
-                if let Some(regex_end) = find_delimited_end(bytes, i + 1, end, b'/', b'/', true) {
+                let regex_end = if literal_start(bytes, mask, start, i) == LiteralStart::Value {
+                    find_delimited_end(bytes, i + 1, end, b'/', b'/', true)
+                } else {
+                    find_regex_literal_end(bytes, i, end)
+                };
+                if let Some(regex_end) = regex_end {
                     set_mask(mask, i + 1, regex_end, true);
                     expose_interpolations(bytes, mask, i + 1, regex_end, cache);
                     i = regex_end + 1;
@@ -1163,6 +1256,108 @@ fn mask_ruby_range_cached(
             _ => i += 1,
         }
     }
+}
+
+/// `=begin` / `=end` markers must start a line and be followed by whitespace
+/// or EOL (`=ending` is not `=end`).
+fn is_embedded_doc_marker(bytes: &[u8], i: usize, end: usize, marker: &[u8]) -> bool {
+    bytes[i..end].starts_with(marker)
+        && bytes
+            .get(i + marker.len())
+            .is_none_or(|b| i + marker.len() >= end || b.is_ascii_whitespace())
+}
+
+/// End (exclusive, at the newline) of an `=begin` block whose body starts at
+/// `from`, or `end` when the block is unterminated.
+fn find_embedded_doc_end(bytes: &[u8], mut from: usize, end: usize) -> usize {
+    while let Some(n) = memmem::find(&bytes[from..end], b"\n=end") {
+        let marker = from + n + 1;
+        if is_embedded_doc_marker(bytes, marker, end, b"=end") {
+            return memchr::memchr(b'\n', &bytes[marker..end])
+                .map(|tail| marker + tail)
+                .unwrap_or(end);
+        }
+        from = marker;
+    }
+    end
+}
+
+/// A line consisting exactly of `__END__` (optionally followed by `\r`).
+fn is_data_marker(bytes: &[u8], i: usize, end: usize) -> bool {
+    const MARKER: &[u8] = b"__END__";
+    if !bytes[i..end].starts_with(MARKER) {
+        return false;
+    }
+    let rest = &bytes[i + MARKER.len()..end];
+    rest.is_empty() || rest.starts_with(b"\n") || rest.starts_with(b"\r\n") || rest == b"\r"
+}
+
+/// Punctuation that forms a special global variable after `$`.
+#[inline]
+fn is_special_global_char(b: u8) -> bool {
+    matches!(
+        b,
+        b'\''
+            | b'"'
+            | b'`'
+            | b'!'
+            | b'@'
+            | b'&'
+            | b'+'
+            | b'~'
+            | b'='
+            | b'/'
+            | b'\\'
+            | b','
+            | b';'
+            | b'.'
+            | b'<'
+            | b'>'
+            | b'*'
+            | b'$'
+            | b'?'
+            | b':'
+    )
+}
+
+/// Number of bytes to advance at a `?` (never 0). `?a`, `?'` and `?\n` are
+/// character literals; `empty?`, `c ?'a':'b'` and `x ?y:z` are method-name
+/// suffixes or ternaries, where the `?` alone is consumed so a following
+/// quote still opens a string.
+fn char_literal_len(bytes: &[u8], mask: &[u8], start: usize, i: usize, end: usize) -> usize {
+    let after_word = i > start && mask[i - 1] == 0 && is_word_char(bytes[i - 1]);
+    if after_word {
+        return 1;
+    }
+    if bytes[i + 1] == b'\\' {
+        return 3.min(end - i);
+    }
+    if i + 2 < end && is_word_char(bytes[i + 2]) {
+        return 1;
+    }
+    2
+}
+
+/// Closing `/` of a regex literal in command-argument position (`x /2`). The
+/// literal must close on the same line unless it is an extended (`/x`) regex,
+/// so a division by a local variable never masks the following lines.
+fn find_regex_literal_end(bytes: &[u8], open: usize, end: usize) -> Option<usize> {
+    let line_end = memchr::memchr(b'\n', &bytes[open..end])
+        .map(|n| open + n)
+        .unwrap_or(end);
+    if let Some(close) = find_delimited_end(bytes, open + 1, line_end, b'/', b'/', true) {
+        return Some(close);
+    }
+    if line_end == end {
+        return None;
+    }
+    let close = find_delimited_end(bytes, open + 1, end, b'/', b'/', true)?;
+    let flags = bytes[close + 1..end]
+        .iter()
+        .take_while(|b| b.is_ascii_alphabetic())
+        .copied()
+        .collect::<Vec<u8>>();
+    flags.contains(&b'x').then_some(close)
 }
 
 fn mask_non_ruby(bytes: &[u8], mask: &mut [u8], line_kind: LineCommentKind) {
@@ -3306,6 +3501,118 @@ mod tests {
             modules.contains_key("MyRealModule"),
             "MyRealModule outside heredoc should be found"
         );
+    }
+
+    fn ruby_findings(input: &[u8]) -> (Vec<String>, HashSet<String>) {
+        let mask = build_skip_mask(input, true, LineCommentKind::Hash);
+        let mut requires = Vec::new();
+        scan_requires_filtered(input, &mask, &mut requires);
+        let mut modules = HashMap::new();
+        let path: Arc<str> = Arc::from("test.rb");
+        scan_modules_filtered_into(input, &mask, &mut modules, &path);
+        (requires, modules.into_keys().collect())
+    }
+
+    fn assert_alpha_and_beta_visible(input: &[u8]) {
+        let (requires, modules) = ruby_findings(input);
+        let text = String::from_utf8_lossy(input);
+        assert_eq!(requires, vec!["alpha"], "{text}");
+        assert!(modules.contains("Beta"), "{text}: {modules:?}");
+    }
+
+    #[test]
+    fn bare_percent_literals_are_strings() {
+        assert_alpha_and_beta_visible(
+            b"x = %(don't panic)\nrequire \"alpha\"\nBeta.call\ny = 'z'\n",
+        );
+        assert_alpha_and_beta_visible(b"x = %{it's}\nrequire \"alpha\"\nBeta.call\ny = 'z'\n");
+        assert_alpha_and_beta_visible(
+            b"x = %[it's]\ny = %<it's>\nz = %|it's|\nrequire \"alpha\"\nBeta.call\nw = 'z'\n",
+        );
+        let (_, modules) = ruby_findings(b"x = %(Gamma #{Beta})\n");
+        assert!(!modules.contains("Gamma"));
+        assert!(modules.contains("Beta"));
+        // Modulo stays an operator.
+        let (_, modules) = ruby_findings(b"x = 10 %(3)\ny = n % (Beta)\n");
+        assert!(modules.contains("Beta"));
+    }
+
+    #[test]
+    fn question_mark_before_quote_in_ternary_is_not_char_literal() {
+        assert_alpha_and_beta_visible(
+            b"c = true\nx = c ?'a':'b'\nrequire \"alpha\"\nBeta.call\ny = 'q'\n",
+        );
+        assert_alpha_and_beta_visible(b"ok = valid?'x'\nrequire \"alpha\"\nBeta.call\ny = 'q'\n");
+        // Real character literals still mask the quote character.
+        assert_alpha_and_beta_visible(b"q = ?'\nd = ?\"\nrequire \"alpha\"\nBeta.call\n");
+    }
+
+    #[test]
+    fn punctuation_globals_do_not_open_strings() {
+        assert_alpha_and_beta_visible(
+            b"$\".include?(1)\nrequire \"alpha\"\nBeta.call\nz = \"q\"\n",
+        );
+        assert_alpha_and_beta_visible(b"m = $'\nrequire \"alpha\"\nBeta.call\nz = 'q'\n");
+    }
+
+    #[test]
+    fn slash_operators_do_not_start_regexes() {
+        assert_alpha_and_beta_visible(
+            b"x = [4,2].reduce(:/)\nrequire \"alpha\"\nBeta.call\ny = 4 / 2\n",
+        );
+        assert_alpha_and_beta_visible(
+            b"class V\n  def /(o)\n    self\n  end\nend\nrequire \"alpha\"\nBeta.call\nz = 4 / 2\n",
+        );
+        assert_alpha_and_beta_visible(
+            b"x = 10\ny = x /2\nrequire \"alpha\"\nBeta.call\nz = 4/ 2\n",
+        );
+        // Real regexes (including multi-line extended ones) are still masked.
+        let (_, modules) =
+            ruby_findings(b"a = x.match /Static/\nb = /\n  Extended\n/x\nBeta.call\n");
+        assert!(!modules.contains("Static"));
+        assert!(!modules.contains("Extended"));
+        assert!(modules.contains("Beta"));
+    }
+
+    #[test]
+    fn data_section_after_end_marker_is_ignored() {
+        let (requires, modules) = ruby_findings(b"puts 1\n__END__\nrequire \"alpha\"\nBeta.call\n");
+        assert!(requires.is_empty());
+        assert!(!modules.contains("Beta"));
+        let (requires, _) = ruby_findings(b"puts 1\r\n__END__\r\nrequire \"alpha\"\r\n");
+        assert!(requires.is_empty());
+        // Not a marker when anything else is on the line.
+        assert_alpha_and_beta_visible(b"x = __END__x\nrequire \"alpha\"\nBeta.call\n");
+    }
+
+    #[test]
+    fn embedded_doc_end_marker_requires_word_boundary() {
+        let (_, modules) =
+            ruby_findings(b"x = 1\n=begin\nfoo\n=ending stuff\nBeta.call\n=end\nAfter.call\n");
+        assert!(!modules.contains("Beta"));
+        assert!(modules.contains("After"));
+        let (_, modules) = ruby_findings(b"=beginning\nBeta.call\n");
+        assert!(modules.contains("Beta"));
+    }
+
+    #[test]
+    fn erb_string_does_not_extend_into_template_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("x.erb");
+        std::fs::write(
+            &file,
+            "<p>it's</p>\n<%= %(don't) %>\n<%= Beta.x %>\n<p>isn't</p>\n<%= x ? 'a : 'b' %>\n<%= Alpha.y %>\n",
+        )
+        .unwrap();
+        let mut modules = HashMap::new();
+        scan_file(
+            file.to_str().unwrap(),
+            dir.path().to_str().unwrap(),
+            &mut modules,
+        )
+        .unwrap();
+        assert!(modules.contains_key("Beta"));
+        assert!(modules.contains_key("Alpha"));
     }
 
     #[test]
