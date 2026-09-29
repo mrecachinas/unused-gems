@@ -91,7 +91,7 @@ pub fn print_results_text(
     }
 
     if !cats.ignored.is_empty() {
-        println!("🔇 Ignored via .unused_gems.yml ({})", cats.ignored.len());
+        println!("🔇 Ignored via ignore file ({})", cats.ignored.len());
         println!();
         let names: Vec<&str> = cats.ignored.iter().map(|(n, _)| *n).collect();
         println!("  {}", names.join(", "));

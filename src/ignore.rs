@@ -11,11 +11,14 @@ pub struct IgnoreConfig {
 
 pub fn load_ignore_file(dir: &Path, override_path: Option<&str>) -> IgnoreConfig {
     let path = match override_path {
-        Some(p) => std::path::PathBuf::from(p),
+        Some(p) => resolve_override_path(dir, p),
         None => dir.join(".unused_gems.yml"),
     };
 
     if !path.exists() {
+        if override_path.is_some() {
+            eprintln!("Warning: Ignore file not found: {}", path.display());
+        }
         return IgnoreConfig {
             ignored: HashSet::new(),
             adapter_overrides: AdapterOverrides::default(),
@@ -28,14 +31,7 @@ pub fn load_ignore_file(dir: &Path, override_path: Option<&str>) -> IgnoreConfig
     match std::fs::read_to_string(&path) {
         Ok(content) => match serde_yaml::from_str::<serde_yaml::Value>(&content) {
             Ok(yaml) => {
-                let mut ignored = HashSet::new();
-                if let Some(ignore_list) = yaml.get("ignore").and_then(|v| v.as_sequence()) {
-                    for item in ignore_list {
-                        if let Some(s) = item.as_str() {
-                            ignored.insert(s.to_string());
-                        }
-                    }
-                }
+                let ignored = parse_ignore_list(&yaml, &path_str);
                 let adapter_overrides = parse_adapter_overrides(&yaml, &path_str);
                 IgnoreConfig {
                     ignored,
@@ -61,6 +57,52 @@ pub fn load_ignore_file(dir: &Path, override_path: Option<&str>) -> IgnoreConfig
             }
         }
     }
+}
+
+/// Relative `--ignore-file` paths resolve against the scanned directory (like
+/// `--gemfile`), falling back to the working directory for compatibility.
+fn resolve_override_path(dir: &Path, override_path: &str) -> std::path::PathBuf {
+    let path = std::path::PathBuf::from(override_path);
+    if path.is_absolute() {
+        return path;
+    }
+    let in_dir = dir.join(&path);
+    if in_dir.exists() || !path.exists() {
+        in_dir
+    } else {
+        path
+    }
+}
+
+fn parse_ignore_list(yaml: &serde_yaml::Value, path: &str) -> HashSet<String> {
+    let mut ignored = HashSet::new();
+    match yaml.get("ignore") {
+        None | Some(serde_yaml::Value::Null) => {}
+        Some(serde_yaml::Value::String(name)) => {
+            ignored.insert(name.clone());
+        }
+        Some(serde_yaml::Value::Sequence(items)) => {
+            for item in items {
+                match item.as_str() {
+                    Some(name) => {
+                        ignored.insert(name.to_string());
+                    }
+                    None => eprintln!(
+                        "Warning: Ignoring non-string entry in ignore list of {}",
+                        path
+                    ),
+                }
+            }
+        }
+        Some(_) => eprintln!(
+            "Warning: Ignoring invalid ignore section in {} (expected a list of gem names)",
+            path
+        ),
+    }
+    if !yaml.is_mapping() && !yaml.is_null() {
+        eprintln!("Warning: Expected a mapping at the top level of {}", path);
+    }
+    ignored
 }
 
 fn parse_adapter_overrides(yaml: &serde_yaml::Value, path: &str) -> AdapterOverrides {
@@ -210,5 +252,33 @@ mod tests {
             config.adapter_overrides.cache.get("custom_cache_store"),
             Some(&"custom-cache-gem".to_string())
         );
+    }
+
+    #[test]
+    fn relative_override_resolves_against_target_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("custom.yml"), "ignore:\n  - bar-unused\n").unwrap();
+        let config = load_ignore_file(dir.path(), Some("custom.yml"));
+        assert!(config.ignored.contains("bar-unused"));
+        assert_eq!(
+            config.path.as_deref(),
+            Some(dir.path().join("custom.yml").display().to_string().as_str())
+        );
+    }
+
+    #[test]
+    fn missing_explicit_override_returns_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = load_ignore_file(dir.path(), Some("does-not-exist.yml"));
+        assert!(config.ignored.is_empty());
+        assert!(config.path.is_none());
+    }
+
+    #[test]
+    fn scalar_ignore_is_single_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".unused_gems.yml"), "ignore: foo-unused\n").unwrap();
+        let config = load_ignore_file(dir.path(), None);
+        assert_eq!(config.ignored, HashSet::from(["foo-unused".to_string()]));
     }
 }

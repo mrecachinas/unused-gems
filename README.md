@@ -99,7 +99,7 @@ unused-gems --gemfile engines/a/Gemfile --gemfile engines/b/Gemfile /path/to/pro
 -v, --verbose             Show file locations and require paths
 -q, --quiet               Suppress progress messages
     --no-cache            Disable file scan cache
-    --ignore-file <PATH>  Path to ignore file (default: .unused_gems.yml)
+    --ignore-file <PATH>  Ignore file; relative paths resolve against the scanned directory (default: .unused_gems.yml)
     --gemfile <PATH>      Gemfile path to analyze; repeat for monorepos
     --diff <BASELINE>     Compare against previous JSON output
     --skip-dirs <DIRS>    Additional directories to skip (comma-separated)
@@ -165,6 +165,9 @@ adapters:
   cache:
     custom_cache_store: custom-cache-gem
 ```
+
+`ignore` accepts a list of gem names (a single scalar name is also accepted). Missing
+explicit `--ignore-file` paths, malformed YAML and invalid entries produce warnings.
 
 Adapter entries map the value used in Rails config to the gem that provides it.
 

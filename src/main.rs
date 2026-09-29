@@ -46,7 +46,8 @@ struct Cli {
     #[arg(short, long)]
     quiet: bool,
 
-    /// Path to ignore file (default: .unused_gems.yml in project root)
+    /// Path to ignore file (default: .unused_gems.yml in project root). Relative
+    /// paths resolve against the scanned directory.
     #[arg(long)]
     ignore_file: Option<String>,
 
