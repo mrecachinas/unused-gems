@@ -1901,8 +1901,8 @@ fn scan_autoloads(bytes: &[u8], results: &mut Vec<String>) {
     }
 }
 
-/// Scan for `Gem.bin_path('name')` or `Gem.activate_bin_path('name')`
-/// Matches regex: `Gem\.(?:activate_)?bin_path\s*\(\s*['"]([^'"]+)['"]`
+/// Scan for `Gem.bin_path('name')` or `Gem.activate_bin_path 'name'`
+/// Matches regex: `Gem\.(?:activate_)?bin_path\s*\(?\s*['"]([^'"]+)['"]`
 #[cfg(test)]
 fn scan_gem_bin(bytes: &[u8], results: &mut Vec<String>) {
     let finder = memmem::Finder::new(b"Gem.");
@@ -1919,14 +1919,12 @@ fn scan_gem_bin(bytes: &[u8], results: &mut Vec<String>) {
             pos = abs + 1;
             continue;
         }
+        // Optional `(`: `Gem.activate_bin_path "x", "y"` is common in binstubs.
         i = skip_whitespace(bytes, i);
-        // Expect (
-        if i >= bytes.len() || bytes[i] != b'(' {
-            pos = abs + 1;
-            continue;
+        if i < bytes.len() && bytes[i] == b'(' {
+            i += 1;
+            i = skip_whitespace(bytes, i);
         }
-        i += 1;
-        i = skip_whitespace(bytes, i);
         if let Some((s, _end)) = extract_quoted(bytes, i) {
             if let Ok(name) = std::str::from_utf8(s) {
                 results.push(name.to_string());
@@ -2159,13 +2157,12 @@ fn scan_gem_bin_filtered(bytes: &[u8], mask: &[u8], results: &mut Vec<String>) {
             pos = abs + 1;
             continue;
         }
+        // Optional `(`: `Gem.activate_bin_path "x", "y"` is common in binstubs.
         i = skip_whitespace(bytes, i);
-        if i >= bytes.len() || bytes[i] != b'(' {
-            pos = abs + 1;
-            continue;
+        if i < bytes.len() && bytes[i] == b'(' {
+            i += 1;
+            i = skip_whitespace(bytes, i);
         }
-        i += 1;
-        i = skip_whitespace(bytes, i);
         if let Some((s, _end)) = extract_quoted(bytes, i) {
             if let Ok(name) = std::str::from_utf8(s) {
                 results.push(name.to_string());
@@ -2259,6 +2256,18 @@ fn scan_modules_filtered_into(
     merge_file_modules(names, modules, rel_path, false);
 }
 
+/// An uppercase word at `i` is not a constant reference when it names an
+/// instance/class/global variable (`@Beta`, `@@Beta`, `$Alpha`) or a symbol
+/// (`:Beta`; `::Beta` is a top-level constant).
+#[inline]
+fn can_start_constant(bytes: &[u8], i: usize) -> bool {
+    match i.checked_sub(1).map(|prev| bytes[prev]) {
+        Some(b'@' | b'$') => false,
+        Some(b':') => i >= 2 && bytes[i - 2] == b':',
+        _ => true,
+    }
+}
+
 fn collect_module_names<'a>(bytes: &'a [u8], mask: &[u8], names: &mut FileModuleSet<'a>) {
     let mut i = 0;
     let len = bytes.len();
@@ -2271,8 +2280,7 @@ fn collect_module_names<'a>(bytes: &'a [u8], mask: &[u8], names: &mut FileModule
             break;
         }
         if i == 0 || !is_word_char(bytes[i - 1]) {
-            if is_skipped(mask, i) {
-                // Skip rest of masked region (just advance by 1 — mask is per-byte)
+            if is_skipped(mask, i) || !can_start_constant(bytes, i) {
                 i += 1;
                 continue;
             }
@@ -2317,7 +2325,10 @@ fn collect_module_names<'a>(bytes: &'a [u8], mask: &[u8], names: &mut FileModule
                 }
                 continue;
             }
-            if match_end > start {
+            // `Alpha: 1` is a hash key / keyword label, not a constant.
+            let is_label =
+                bytes.get(match_end) == Some(&b':') && bytes.get(match_end + 1) != Some(&b':');
+            if match_end > start && !is_label {
                 names.insert(&bytes[start..match_end]);
             }
             if i <= match_end {
@@ -2606,34 +2617,111 @@ fn collect_middleware_refs<'a>(bytes: &'a [u8], mask: &[u8], names: &mut FileMod
             continue;
         }
 
-        // Extract all quoted string literals from the rest of the line.
-        // NOTE: we walk raw bytes here (not the mask) because string interiors
-        // are exactly what the middleware scanner cares about — masking them
-        // would defeat the purpose.
-        let mut i = line_start + candidate;
-        while i < eol {
-            if bytes[i] == b'"' || bytes[i] == b'\'' {
-                let quote = bytes[i];
-                let start = i + 1;
-                let mut end = start;
-                while end < eol && bytes[end] != quote {
-                    end += 1;
-                }
-                if end < eol {
+        collect_middleware_call_strings(bytes, mask, line_start + candidate, eol, names);
+        line_start = if eol < bytes.len() { eol + 1 } else { eol };
+    }
+}
+
+/// Collect string-literal middleware names passed to middleware-stack calls
+/// between `from` and `eol`. Only the argument slots that name a middleware
+/// are considered (`use X, *args` → first; `insert_before pos, X` / `swap`
+/// → first two), and the walk stops at a comment, so strings in trailing
+/// conditions, constructor arguments or comments are ignored.
+fn collect_middleware_call_strings<'a>(
+    bytes: &'a [u8],
+    mask: &[u8],
+    from: usize,
+    eol: usize,
+    names: &mut FileModuleSet<'a>,
+) {
+    // (max middleware-naming args, current arg index, paren depth of the call)
+    let mut call: Option<(usize, usize, i32)> = None;
+    let mut at_arg_start = false;
+    let mut depth = 0i32;
+    let mut i = from;
+    while i < eol {
+        let b = bytes[i];
+        if is_skipped(mask, i) {
+            // A comment (string interiors are consumed with their quotes).
+            return;
+        }
+        if b == b'"' || b == b'\'' {
+            let start = i + 1;
+            let mut end = start;
+            while end < eol && bytes[end] != b {
+                end += if bytes[end] == b'\\' { 2 } else { 1 };
+            }
+            if end >= eol {
+                return;
+            }
+            if let Some((max_args, arg, _)) = call {
+                if at_arg_start && arg < max_args {
                     let name = bytes[start..end].trim_ascii();
-                    // Only insert if it looks like a module name (starts with uppercase)
-                    if !name.is_empty() && name[0].is_ascii_uppercase() {
+                    if name.first().is_some_and(u8::is_ascii_uppercase) {
                         names.insert(name);
                     }
-                    i = end + 1;
-                } else {
-                    break;
                 }
-            } else {
-                i += 1;
             }
+            at_arg_start = false;
+            i = end + 1;
+            continue;
         }
-        line_start = if eol < bytes.len() { eol + 1 } else { eol };
+        if is_word_char(b) && (i == 0 || !is_word_char(bytes[i - 1])) {
+            let mut word_end = i;
+            while word_end < eol && is_word_char(bytes[word_end]) {
+                word_end += 1;
+            }
+            let max_args = match &bytes[i..word_end] {
+                b"use" | b"unshift" | b"push" | b"append" | b"prepend" => Some(1),
+                b"insert" | b"insert_before" | b"insert_after" | b"swap" | b"move_before"
+                | b"move_after" => Some(2),
+                _ => None,
+            };
+            if let Some(max_args) = max_args.filter(|_| bytes.get(word_end) != Some(&b':')) {
+                call = Some((max_args, 0, depth));
+                at_arg_start = true;
+            } else {
+                at_arg_start = false;
+            }
+            i = word_end;
+            continue;
+        }
+        match b {
+            b'<' if bytes.get(i + 1) == Some(&b'<') => {
+                call = Some((1, 0, depth));
+                at_arg_start = true;
+                i += 2;
+                continue;
+            }
+            b' ' | b'\t' | b'\r' => {}
+            b'(' if at_arg_start && call.is_some_and(|(_, arg, d)| arg == 0 && d == depth) => {
+                depth += 1;
+                if let Some(call) = call.as_mut() {
+                    call.2 = depth;
+                }
+            }
+            b'(' | b'[' | b'{' => {
+                depth += 1;
+                at_arg_start = false;
+            }
+            b')' | b']' | b'}' => {
+                if call.is_some_and(|(_, _, d)| d == depth) {
+                    call = None;
+                }
+                depth -= 1;
+                at_arg_start = false;
+            }
+            b',' => {
+                if let Some(call) = call.as_mut().filter(|call| call.2 == depth) {
+                    call.1 += 1;
+                    at_arg_start = true;
+                } else {
+                    at_arg_start = false;
+                }
+            }
+            _ => at_arg_start = false,
+        }
+        i += 1;
     }
 }
 
@@ -4262,7 +4350,8 @@ require 'real_regex'
 
     #[test]
     fn non_ruby_module_comment_is_filtered() {
-        let input = b"# MyOldModule was removed\nMyNewModule:\n  key: value\n";
+        // (`MyNewModule:` would be a hash-key label, which is not a reference.)
+        let input = b"# MyOldModule was removed\nMyNewModule.configure\n  key: value\n";
         let _block_ranges: Vec<(usize, usize)> = Vec::new();
         let mut modules: HashMap<String, HashSet<Arc<str>>> = HashMap::new();
         {
@@ -5238,10 +5327,16 @@ require 'real_regex'
     }
 
     #[test]
-    fn gem_bin_missing_paren() {
+    fn gem_bin_without_paren() {
         let mut results = Vec::new();
         scan_gem_bin(b"Gem.bin_path 'foo'\n", &mut results);
-        assert!(results.is_empty());
+        assert_eq!(results, vec!["foo"]);
+
+        let input = b"Gem.activate_bin_path \"beta\", \"b\"\nGem.bin_path(\"alpha\", \"a\")\n";
+        let mask = build_skip_mask(input, true, LineCommentKind::Hash);
+        let mut results = Vec::new();
+        scan_gem_bin_filtered(input, &mask, &mut results);
+        assert_eq!(results, vec!["beta", "alpha"]);
     }
 
     // ── scan_modules (unfiltered) ──
@@ -5938,6 +6033,64 @@ require 'real_regex'
             modules.contains_key("BatchLoader::Middleware"),
             "should detect string arg in insert_before"
         );
+    }
+
+    #[test]
+    fn middleware_only_takes_middleware_argument_slots() {
+        for (input, expected, unexpected) in [
+            (
+                &b"config.middleware.use Foo # was \"Beta::Rack\"\n"[..],
+                None,
+                "Beta::Rack",
+            ),
+            (
+                &b"config.middleware.use \"Beta::Rack\" if x == \"Alpha\"\n"[..],
+                Some("Beta::Rack"),
+                "Alpha",
+            ),
+            (
+                &b"config.middleware.use \"Beta::Rack\", \"Option\"\n"[..],
+                Some("Beta::Rack"),
+                "Option",
+            ),
+            (
+                &b"config.middleware.insert_before(\"Rack::Runtime\", \"Beta::Rack\", \"Arg\")\n"[..],
+                Some("Beta::Rack"),
+                "Arg",
+            ),
+        ] {
+            let mask = build_skip_mask(input, true, LineCommentKind::Hash);
+            let mut modules: HashMap<String, HashSet<Arc<str>>> = HashMap::new();
+            let rel: Arc<str> = Arc::from("test.rb");
+            scan_middleware_refs(input, &mask, &mut modules, &rel);
+            let text = String::from_utf8_lossy(input);
+            if let Some(expected) = expected {
+                assert!(modules.contains_key(expected), "{text}");
+            }
+            assert!(!modules.contains_key(unexpected), "{text}");
+        }
+    }
+
+    #[test]
+    fn symbols_labels_and_variables_are_not_constants() {
+        let (_, modules) = ruby_findings(
+            b"x = :Beta
+h = { Alpha: 1 }
+@Gamma = 1
+@@Delta = 2
+$Epsilon = 3
+foo(Zeta: 1)
+y = ::Top::Level
+z = Foo::Bar
+w = cond ? Eta : Theta
+",
+        );
+        for excluded in ["Beta", "Alpha", "Gamma", "Delta", "Epsilon", "Zeta"] {
+            assert!(!modules.contains(excluded), "{excluded}: {modules:?}");
+        }
+        for included in ["Top::Level", "Foo::Bar", "Eta", "Theta"] {
+            assert!(modules.contains(included), "{included}: {modules:?}");
+        }
     }
 
     #[test]
