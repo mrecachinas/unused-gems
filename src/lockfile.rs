@@ -296,31 +296,21 @@ fn normalize_os_versioned_platform(platform: &str) -> Option<String> {
         .then(|| base.to_string())
 }
 
+/// Number of unique gems reachable from `gem_name` (excluding the gem itself).
 pub fn count_transitive_deps(gem_name: &str, lock_deps: &HashMap<String, Vec<String>>) -> usize {
-    let mut visited = HashSet::new();
-    count_inner(gem_name, lock_deps, &mut visited)
-}
-
-fn count_inner(
-    gem_name: &str,
-    lock_deps: &HashMap<String, Vec<String>>,
-    visited: &mut HashSet<String>,
-) -> usize {
-    if visited.contains(gem_name) {
-        return 0;
+    let mut visited: HashSet<&str> = HashSet::new();
+    let mut stack: Vec<&str> = vec![gem_name];
+    visited.insert(gem_name);
+    while let Some(current) = stack.pop() {
+        if let Some(deps) = lock_deps.get(current) {
+            for dep in deps {
+                if visited.insert(dep.as_str()) {
+                    stack.push(dep.as_str());
+                }
+            }
+        }
     }
-    visited.insert(gem_name.to_string());
-
-    let direct = match lock_deps.get(gem_name) {
-        Some(deps) => deps,
-        None => return 0,
-    };
-
-    let mut count = direct.len();
-    for dependency in direct {
-        count += count_inner(dependency, lock_deps, visited);
-    }
-    count
+    visited.len() - 1
 }
 
 #[cfg(test)]
@@ -494,7 +484,18 @@ GIT
         let mut deps = HashMap::new();
         deps.insert("a".to_string(), vec!["b".to_string()]);
         deps.insert("b".to_string(), vec!["a".to_string()]);
-        assert_eq!(count_transitive_deps("a", &deps), 2);
+        // Only `b` is a dependency of `a`; the cycle back to `a` is not a new gem.
+        assert_eq!(count_transitive_deps("a", &deps), 1);
+    }
+
+    #[test]
+    fn count_transitive_deps_counts_shared_nodes_once() {
+        let mut deps = HashMap::new();
+        deps.insert("a".to_string(), vec!["b".to_string(), "c".to_string()]);
+        deps.insert("b".to_string(), vec!["d".to_string()]);
+        deps.insert("c".to_string(), vec!["d".to_string()]);
+        deps.insert("d".to_string(), vec!["a".to_string()]);
+        assert_eq!(count_transitive_deps("a", &deps), 3);
     }
 
     #[test]
