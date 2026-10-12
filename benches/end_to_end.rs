@@ -5,6 +5,8 @@ use std::time::Duration;
 use criterion::{criterion_group, criterion_main, Criterion};
 use tempfile::TempDir;
 
+mod support;
+
 fn create_project(files: usize, gems: usize) -> TempDir {
     let dir = TempDir::new().unwrap();
     let mut gemfile = String::from("source \"https://rubygems.org\"\n");
@@ -44,11 +46,11 @@ fn create_project(files: usize, gems: usize) -> TempDir {
 }
 
 fn binary_path() -> std::path::PathBuf {
-    std::env::var_os("UNUSED_GEMS_BIN")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| {
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/release/unused-gems")
-        })
+    support::binary_path(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")),
+        std::env::var_os("UNUSED_GEMS_BIN").as_deref(),
+        std::env::var_os("CARGO_TARGET_DIR").as_deref(),
+    )
 }
 
 fn run(binary: &std::path::Path, project: &std::path::Path, no_cache: bool) {
@@ -75,7 +77,8 @@ fn bench_end_to_end(c: &mut Criterion) {
     let binary = binary_path();
     assert!(
         binary.is_file(),
-        "build the release binary first with `cargo build --release`"
+        "binary not found at {}; build it with `cargo build --release` or set UNUSED_GEMS_BIN",
+        binary.display()
     );
     let project = create_project(2_000, 200);
 
