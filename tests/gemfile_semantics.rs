@@ -276,6 +276,36 @@ fn missing_locked_sources_do_not_supply_usage_evidence_and_warn_once() {
 }
 
 #[test]
+fn bundler_require_multiline_string_groups_and_trailing_code() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        &root.join("Gemfile"),
+        "source 'https://rubygems.org'\n\
+         gem 'issue27default'\n\
+         group :assets do\n  gem 'issue27assets'\nend\n\
+         group :test do\n  gem 'issue27test'\nend\n",
+    );
+    write(
+        &root.join("config/application.rb"),
+        "Bundler.require(\n  :default,\n  \"assets\"\n); foo(:test)\n",
+    );
+    let results = run_tool(root);
+    assert_eq!(status_of(&results, "issue27default"), "bundler_required");
+    assert_eq!(status_of(&results, "issue27assets"), "bundler_required");
+    assert_eq!(status_of(&results, "issue27test"), "unused");
+
+    write(
+        &root.join("config/application.rb"),
+        "Bundler.require(:default); foo(:test)\n",
+    );
+    let results = run_tool(root);
+    assert_eq!(status_of(&results, "issue27default"), "bundler_required");
+    assert_eq!(status_of(&results, "issue27assets"), "unused");
+    assert_eq!(status_of(&results, "issue27test"), "unused");
+}
+
+#[test]
 fn nested_eval_gemfile_context_and_resolution() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();

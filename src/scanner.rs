@@ -2035,41 +2035,14 @@ fn scan_modules(bytes: &[u8], results: &mut Vec<String>) {
     }
 }
 
-/// Scan for `Bundler.require` and extract the rest of the line.
-/// Matches regex: `Bundler\.require\b(.*)`
-/// Returns (rest_of_line, ...) for each match.
 #[cfg(test)]
 fn scan_bundler_require(
     bytes: &[u8],
     bundler_groups: &mut Vec<String>,
     bundler_require_all: &mut bool,
 ) {
-    let finder = memmem::Finder::new(b"Bundler.require");
-    let mut pos = 0;
-    while let Some(idx) = finder.find(&bytes[pos..]) {
-        let abs = pos + idx;
-        let after = abs + 15; // skip "Bundler.require"
-                              // Word boundary: must not be followed by a word char
-        if after < bytes.len() && is_word_char(bytes[after]) {
-            pos = abs + 1;
-            continue;
-        }
-        // Extract rest of line
-        let mut end = after;
-        while end < bytes.len() && bytes[end] != b'\n' {
-            end += 1;
-        }
-        let rest_owned =
-            strip_inline_comment(std::str::from_utf8(&bytes[after..end]).unwrap_or(""));
-        apply_bundler_require_args(
-            rest_owned.trim(),
-            bytes,
-            &[],
-            bundler_groups,
-            bundler_require_all,
-        );
-        pos = abs + 1;
-    }
+    let mask = build_skip_mask(bytes, true, LineCommentKind::Hash);
+    scan_bundler_require_filtered(bytes, &mask, bundler_groups, bundler_require_all);
 }
 
 /// Filtered wrappers that skip matches in commented/string/heredoc regions
@@ -2380,19 +2353,28 @@ fn scan_bundler_require_filtered(
             pos = abs + 1;
             continue;
         }
-        let mut end = after;
-        while end < bytes.len() && bytes[end] != b'\n' {
+        let mut start = skip_whitespace_inline(bytes, after);
+        let parenthesized = bytes.get(start) == Some(&b'(');
+        if parenthesized {
+            start += 1;
+        }
+        let mut end = start;
+        let mut depth = 0usize;
+        while end < bytes.len() {
+            if !is_skipped(mask, end) {
+                match bytes[end] {
+                    b'(' | b'[' | b'{' => depth += 1,
+                    b')' if depth == 0 => break,
+                    b')' | b']' | b'}' => depth = depth.saturating_sub(1),
+                    b'\n' | b';' if !parenthesized && depth == 0 => break,
+                    _ => {}
+                }
+            }
             end += 1;
         }
-        let raw = std::str::from_utf8(&bytes[after..end]).unwrap_or("").trim();
-        // Fix #2: strip an inline `#` comment from the captured tail before
-        // applying GROUP_SYM_RE so that
-        //   Bundler.require(:default) # :test removed
-        // does not capture `:test` from the comment. We must respect string
-        // literals so a `#` inside `"..."` / `'...'` doesn't terminate.
-        let rest_owned = strip_inline_comment(raw);
         apply_bundler_require_args(
-            rest_owned.trim(),
+            &bytes[start..end],
+            &mask[start..end],
             bytes,
             mask,
             bundler_groups,
@@ -2402,84 +2384,108 @@ fn scan_bundler_require_filtered(
     }
 }
 
-/// Interpret the argument text following `Bundler.require` (inline comment
-/// already stripped). Explicit group symbols are always recorded, including
+/// Interpret the bounded arguments of `Bundler.require`.
+/// Explicit group literals are always recorded, including
 /// alongside `Rails.env` (`Bundler.require(:default, :assets, Rails.env)`);
 /// `Rails.groups(...)` conditions are recorded separately and are not treated
 /// as unconditional groups.
 fn apply_bundler_require_args(
-    rest: &str,
+    args: &[u8],
+    args_mask: &[u8],
     bytes: &[u8],
     mask: &[u8],
     bundler_groups: &mut Vec<String>,
     bundler_require_all: &mut bool,
 ) {
-    static GROUP_SYM_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?:^|[^:\w]):(\w+)").unwrap());
-    let rest_inner = rest.strip_prefix('(').map(|s| s.trim()).unwrap_or(rest);
-
-    // Fix #1: `Bundler.require`, `Bundler.require()`, `Bundler.require( )`
-    // and `Bundler.require(\n)` all mean "auto-require the :default group".
-    let is_empty_call = rest.is_empty() || rest == "(" || rest == "()" || rest == "( )" || {
-        let r = rest_inner.trim_start();
-        let r = r.strip_prefix(')').map(|s| s.trim()).unwrap_or(r);
-        rest.starts_with('(') && r.is_empty()
-    };
-
-    if rest.contains("Rails.groups") {
-        push_rails_group_conditions(rest, bundler_groups);
-        *bundler_require_all = true;
-    } else if rest.contains("Rails.env") {
-        *bundler_require_all = true;
-    } else if is_empty_call || rest_inner.starts_with('*') {
-        bundler_groups.push("default".to_string());
-        if let Some(var) = splat_var_name(rest_inner) {
-            if push_rails_groups_for_splat_var(bytes, mask, var, bundler_groups) {
-                *bundler_require_all = true;
+    let mut start = 0;
+    let mut depth = 0usize;
+    let mut has_args = false;
+    let mut explicit = Vec::new();
+    for end in 0..=args.len() {
+        if end < args.len() && !is_skipped(args_mask, end) {
+            match args[end] {
+                b'(' | b'[' | b'{' => depth += 1,
+                b')' | b']' | b'}' => depth = depth.saturating_sub(1),
+                _ => {}
+            }
+        }
+        if end != args.len() && (args[end] != b',' || depth != 0 || is_skipped(args_mask, end)) {
+            continue;
+        }
+        let mut arg_start = start;
+        let mut arg_end = end;
+        start = end + 1;
+        while arg_start < arg_end
+            && (args[arg_start].is_ascii_whitespace() || is_skipped(args_mask, arg_start))
+        {
+            arg_start += 1;
+        }
+        while arg_end > arg_start
+            && (args[arg_end - 1].is_ascii_whitespace() || is_skipped(args_mask, arg_end - 1))
+        {
+            arg_end -= 1;
+        }
+        let Ok(arg) = std::str::from_utf8(&args[arg_start..arg_end]) else {
+            continue;
+        };
+        if arg.is_empty() {
+            continue;
+        }
+        has_args = true;
+        let value = arg.strip_prefix('*').map(str::trim_start).unwrap_or(arg);
+        if value.starts_with("Rails.groups") {
+            push_rails_group_conditions(arg, bundler_groups);
+            *bundler_require_all = true;
+        } else if value == "Rails.env" {
+            *bundler_require_all = true;
+        } else if arg.starts_with('*') {
+            explicit.push("default".to_string());
+            if let Some(var) = splat_var_name(arg) {
+                if push_rails_groups_for_splat_var(bytes, mask, var, bundler_groups) {
+                    *bundler_require_all = true;
+                }
+            }
+        } else {
+            let literal = arg.strip_prefix(':').unwrap_or(arg);
+            if literal.starts_with(['\'', '"']) {
+                // Prism decodes escapes and rejects interpolated/dynamic names.
+                let parsed = ruby_prism::parse(arg.as_bytes());
+                if parsed.errors().next().is_some() {
+                    continue;
+                }
+                let node = parsed.node();
+                if let Some(program) = node.as_program_node() {
+                    let statements = program.statements();
+                    let mut body = statements.body().iter();
+                    if let Some(value) = body.next().filter(|_| body.next().is_none()) {
+                        let name = value
+                            .as_string_node()
+                            .map(|s| String::from_utf8_lossy(s.unescaped()).into_owned())
+                            .or_else(|| {
+                                value
+                                    .as_symbol_node()
+                                    .map(|s| String::from_utf8_lossy(s.unescaped()).into_owned())
+                            });
+                        if let Some(name) = name {
+                            explicit.push(name);
+                        }
+                    }
+                }
+            } else {
+                let name = arg
+                    .strip_prefix(':')
+                    .filter(|name| !name.is_empty() && name.bytes().all(is_word_char))
+                    .map(str::to_string);
+                if let Some(name) = name {
+                    explicit.push(name);
+                }
             }
         }
     }
-    let explicit = strip_rails_groups_calls(rest);
-    for g in GROUP_SYM_RE.captures_iter(&explicit) {
-        bundler_groups.push(g[1].to_string());
+    if !has_args {
+        explicit.push("default".to_string());
     }
-}
-
-/// Remove `Rails.groups(...)` calls (balanced parentheses) so their
-/// conditional hash keys are not mistaken for unconditional group symbols.
-fn strip_rails_groups_calls(source: &str) -> std::borrow::Cow<'_, str> {
-    const CALL: &str = "Rails.groups";
-    if !source.contains(CALL) {
-        return std::borrow::Cow::Borrowed(source);
-    }
-    let mut out = String::with_capacity(source.len());
-    let mut rest = source;
-    while let Some(index) = rest.find(CALL) {
-        out.push_str(&rest[..index]);
-        let after = &rest[index + CALL.len()..];
-        let args = after.trim_start();
-        rest = if args.starts_with('(') {
-            let mut depth = 0usize;
-            let mut close = args.len();
-            for (offset, ch) in args.char_indices() {
-                match ch {
-                    '(' => depth += 1,
-                    ')' => {
-                        depth -= 1;
-                        if depth == 0 {
-                            close = offset + 1;
-                            break;
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            &args[close..]
-        } else {
-            after
-        };
-    }
-    out.push_str(rest);
-    std::borrow::Cow::Owned(out)
+    bundler_groups.extend(explicit);
 }
 
 fn splat_var_name(rest_inner: &str) -> Option<&str> {
@@ -2564,37 +2570,6 @@ fn push_rails_group_conditions(source: &str, bundler_groups: &mut Vec<String>) {
             &cap[1]
         ));
     }
-}
-
-/// Strip an inline `#` comment from `s`, respecting single- and double-quoted
-/// string literals so a `#` inside a string is preserved.
-fn strip_inline_comment(s: &str) -> String {
-    let bytes = s.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        let b = bytes[i];
-        if b == b'\'' || b == b'"' {
-            let q = b;
-            i += 1;
-            while i < bytes.len() {
-                if bytes[i] == b'\\' && i + 1 < bytes.len() {
-                    i += 2;
-                    continue;
-                }
-                if bytes[i] == q {
-                    i += 1;
-                    break;
-                }
-                i += 1;
-            }
-            continue;
-        }
-        if b == b'#' {
-            return std::str::from_utf8(&bytes[..i]).unwrap_or("").to_string();
-        }
-        i += 1;
-    }
-    s.to_string()
 }
 
 /// Scan for middleware string-literal references (e.g. `config.middleware.use "Bullet::Rack"`)
@@ -4824,6 +4799,37 @@ require 'real_regex'
         scan_bundler_require_filtered(input, &mask, &mut groups, &mut require_all);
         assert!(require_all);
         assert_eq!(groups, vec!["default", "assets"]);
+    }
+
+    #[test]
+    fn bundler_require_bounded_literal_arguments() {
+        let cases: &[(&[u8], &[&str], bool)] = &[
+            (b"Bundler.require(\n :default,\n \"assets\",\n 'test'\n)\n", &["default", "assets", "test"], false),
+            (b"Bundler.require(:default); foo(:test, 'assets')\n", &["default"], false),
+            (b"Bundler.require(:default) if Rails.env.test?\n", &["default"], false),
+            (b"Bundler.require :default, \"assets\"; foo(:test)\n", &["default", "assets"], false),
+            (b"Bundler.require(\n # :test, \"ignored\"\n :default, # ) :test\n \"assets\" # :test\n)\n", &["default", "assets"], false),
+            (b"Bundler.require(\"assets)prod\", 'hash#group', ':test')\n", &["assets)prod", "hash#group", ":test"], false),
+            (b"Bundler.require(:'assets', \"as\\x73ets\", \"#{dynamic}\")\n", &["assets", "assets"], false),
+            (b"Bundler.require(:default, helper(:test), \"assets\")\n", &["default", "assets"], false),
+            (b"Bundler.require(\n \"default\",\n 'assets',\n Rails.env\n); foo(:test)\n", &["default", "assets"], true),
+            (b"Bundler.require(\n :default,\n *Rails.groups(\n :assets => %w(development test)\n )\n); foo(:test)\n", &["__rails_group_condition__:assets:development,test", "default"], true),
+            (b"Bundler.require(\n # no arguments\n); foo(:test)\n", &["default"], false),
+            (b"Bundler.require(:default); Bundler.require(\"assets\")\n", &["default", "assets"], false),
+        ];
+        for &(input, expected, expected_all) in cases {
+            let mask = build_skip_mask(input, true, LineCommentKind::Hash);
+            let mut groups = Vec::new();
+            let mut require_all = false;
+            scan_bundler_require_filtered(input, &mask, &mut groups, &mut require_all);
+            assert_eq!(groups, expected, "{}", String::from_utf8_lossy(input));
+            assert_eq!(
+                require_all,
+                expected_all,
+                "{}",
+                String::from_utf8_lossy(input)
+            );
+        }
     }
 
     #[test]

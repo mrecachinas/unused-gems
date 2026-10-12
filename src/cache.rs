@@ -6,7 +6,7 @@ use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Serialize};
 
-const CACHE_VERSION: u32 = 9; // bumped: storage services include lexically filtered config selections
+const CACHE_VERSION: u32 = 10; // bumped: bounded Bundler.require literal groups
 const CACHE_FILE: &str = ".unused_gems_cache";
 
 #[derive(Serialize, Deserialize)]
