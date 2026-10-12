@@ -3337,19 +3337,19 @@ fn is_scannable(_path: &str, full_path: &Path) -> bool {
                 use std::io::Read;
                 let mut buf = [0u8; 64];
                 if let Ok(n) = f.read(&mut buf) {
-                    if let Some(nl) = memchr::memchr(b'\n', &buf[..n]) {
-                        if n >= 2 && buf[0] == b'#' && buf[1] == b'!' {
-                            return buf[..nl].windows(4).any(|w| w == b"ruby");
-                        }
-                    } else if n >= 2 && buf[0] == b'#' && buf[1] == b'!' {
-                        return buf[..n].windows(4).any(|w| w == b"ruby");
-                    }
+                    return has_ruby_shebang(&buf[..n]);
                 }
             }
         }
     }
 
     false
+}
+
+fn has_ruby_shebang(bytes: &[u8]) -> bool {
+    let prefix = &bytes[..bytes.len().min(64)];
+    let end = memchr::memchr(b'\n', prefix).unwrap_or(prefix.len());
+    prefix.starts_with(b"#!") && prefix[..end].windows(4).any(|w| w == b"ruby")
 }
 
 /// Extensionless names that are never Ruby scripts even though they cannot be
@@ -3439,7 +3439,7 @@ fn scan_file_bytes_with(
     let rel_path_arc: Arc<str> = Arc::from(rel_path.as_str());
 
     let full_path = Path::new(path);
-    let (is_ruby, is_yaml, template_kind) = classify_file(full_path);
+    let (is_ruby, is_yaml, template_kind) = classify_file(full_path, bytes);
     let is_slim = template_kind == TemplateKind::Slim;
     let is_haml = template_kind == TemplateKind::Haml;
 
@@ -3706,8 +3706,8 @@ fn rubocop_config_gems_fallback(bytes: &[u8], gems: &mut Vec<String>) {
     }
 }
 
-/// Classify a path into Ruby, YAML, and template dialects in one pass.
-fn classify_file(full_path: &Path) -> (bool, bool, TemplateKind) {
+/// Classify Ruby, YAML, and template dialects using the path and already-read bytes.
+fn classify_file(full_path: &Path, bytes: &[u8]) -> (bool, bool, TemplateKind) {
     if let Some(ext) = full_path.extension() {
         let ext_bytes = ext.as_encoded_bytes();
         match ext_bytes.len() {
@@ -3776,7 +3776,8 @@ fn classify_file(full_path: &Path) -> (bool, bool, TemplateKind) {
         .unwrap_or(b"");
     let is_ruby = SCANNABLE_FILENAMES
         .iter()
-        .any(|f| f.as_bytes() == name_bytes);
+        .any(|f| f.as_bytes() == name_bytes)
+        || (full_path.extension().is_none() && has_ruby_shebang(bytes));
     (is_ruby, false, TemplateKind::None)
 }
 
@@ -5015,6 +5016,67 @@ require 'real_regex'
         let (results, _updates) = scan_source_tree(dir.path(), &[], cache);
         assert!(results.requires.contains_key("foo"));
         assert!(results.modules.contains_key("Foo"));
+    }
+
+    #[test]
+    fn scan_source_tree_ruby_shebang_filters_heredoc_requires() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("bin")).unwrap();
+        for (name, shebang) in [
+            ("tool", "#!/usr/bin/env ruby"),
+            ("direct", "#!/usr/bin/ruby"),
+        ] {
+            std::fs::write(
+                dir.path().join("bin").join(name),
+                format!(
+                    "{shebang}\ntext = <<~TEXT\nrequire 'heredoc_only'\nTEXT\nrequire 'real'\n"
+                ),
+            )
+            .unwrap();
+        }
+        let cache = std::sync::Arc::new(crate::cache::FileCache::disabled());
+        let (results, _) = scan_source_tree(dir.path(), &[], cache);
+        assert!(!results.requires.contains_key("heredoc_only"));
+        assert_eq!(
+            results.requires["real"]
+                .iter()
+                .map(Path::new)
+                .collect::<HashSet<_>>(),
+            HashSet::from([Path::new("bin/direct"), Path::new("bin/tool")])
+        );
+
+        let cache = Arc::new(crate::cache::FileCache::load(dir.path()));
+        let (cold, updates) = scan_source_tree(dir.path(), &[], cache);
+        assert_eq!(cold.requires, results.requires);
+        assert_eq!(updates.len(), 2);
+        let mut cache = crate::cache::FileCache::load(dir.path());
+        for update in updates {
+            cache.put(update);
+        }
+        cache.save();
+        let cache = Arc::new(crate::cache::FileCache::load(dir.path()));
+        let (warm, updates) = scan_source_tree(dir.path(), &[], cache);
+        assert!(updates.is_empty());
+        assert_eq!(warm.requires, results.requires);
+    }
+
+    #[test]
+    fn scan_file_bytes_ruby_shebang_uses_full_lexical_filtering() {
+        let bytes = br#"#!/usr/bin/env ruby
+=begin
+require 'block_comment'
+=end
+text = "require 'string_only'"
+text = %q{require 'percent_only'}
+pattern = /require 'regex_only'/
+x = 1 # require 'inline_comment'
+require 'real'
+__END__
+require 'data_only'
+"#;
+        let mut modules = HashMap::new();
+        let result = scan_file_bytes("bin/tool", "", bytes, &mut modules).unwrap();
+        assert_eq!(result.requires, vec!["real"]);
     }
 
     #[test]
