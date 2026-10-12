@@ -785,9 +785,8 @@ fn capitalize(s: &str) -> String {
 }
 
 /// Read a YAML config file, falling back to its `.yml.erb` variant if the plain
-/// `.yml` is absent. Many Rails apps template their config files with ERB; the
-/// scanners below only match static `key: value` lines, which work fine on raw
-/// `.yml.erb` source.
+/// `.yml` is absent. ERB blocks are blanked out so scanners can inspect the
+/// remaining static configuration without evaluating Ruby.
 fn read_yaml_or_erb(yml_path: &std::path::Path) -> Option<String> {
     read_yaml_or_erb_raw(yml_path).map(|c| strip_erb_blocks(&c))
 }
@@ -907,12 +906,12 @@ fn scan_cable_adapters(
 }
 
 /// Scan config/storage.yml (or .yml.erb) for service: values and map them to gem names.
-/// Services are selected by `config.active_storage.service` settings and by the
-/// attachment `service:` names collected during the source walk.
+/// Services are selected by configuration and attachment declarations collected
+/// during the source walk. Mirror services credit their backing adapters.
 fn scan_storage_adapters(
     dir: &std::path::Path,
     overrides: &adapters::AdapterOverrides,
-    attachment_services: &HashSet<String>,
+    selected_services: &HashSet<String>,
 ) -> std::collections::HashMap<String, String> {
     let storage_yml = dir.join("config").join("storage.yml");
     let content = match read_yaml_or_erb(&storage_yml) {
@@ -920,61 +919,50 @@ fn scan_storage_adapters(
         None => return std::collections::HashMap::new(),
     };
 
-    static SELECTED_SERVICE_RE: once_cell::sync::Lazy<regex::Regex> =
-        once_cell::sync::Lazy::new(|| {
-            regex::Regex::new(r"(?m)^[ \t]*config\.active_storage\.service\s*=\s*:(\w+)").unwrap()
-        });
-
-    let mut selected = HashSet::new();
-    let mut config_files = vec![dir.join("config").join("application.rb")];
-    let envs_dir = dir.join("config").join("environments");
-    if let Ok(entries) = std::fs::read_dir(envs_dir) {
-        config_files.extend(
-            entries
-                .flatten()
-                .map(|entry| entry.path())
-                .filter(|path| path.extension().is_some_and(|ext| ext == "rb")),
-        );
-    }
-    for file in config_files {
-        let Ok(config) = std::fs::read_to_string(file) else {
-            continue;
-        };
-        for cap in SELECTED_SERVICE_RE.captures_iter(&config) {
-            selected.insert(cap[1].to_string());
-        }
-    }
-    selected.extend(attachment_services.iter().cloned());
-
-    let mut services = std::collections::HashMap::new();
-    let mut current = None;
-    for line in content.lines() {
-        if !line.starts_with([' ', '\t']) {
-            current = line.trim().strip_suffix(':').map(|name| name.to_string());
-            continue;
-        }
-        let Some(service) = line.trim().strip_prefix("service:") else {
-            continue;
-        };
-        if let Some(name) = current.as_ref() {
-            services.insert(
-                name.clone(),
-                service
-                    .trim()
-                    .trim_matches(|c| c == '\'' || c == '"')
-                    .to_string(),
+    let mut services = match serde_yaml::from_str::<serde_yaml::Value>(&content) {
+        Ok(services) => services,
+        Err(error) => {
+            eprintln!(
+                "Warning: could not parse {}: {error}",
+                storage_yml.display()
             );
+            return std::collections::HashMap::new();
         }
+    };
+    if let Err(error) = services.apply_merge() {
+        eprintln!(
+            "Warning: could not merge {}: {error}",
+            storage_yml.display()
+        );
+        return std::collections::HashMap::new();
     }
 
     let mut adapters = std::collections::HashMap::new();
-    for name in selected {
-        let Some(service) = services.get(&name) else {
+    let mut pending: Vec<&str> = selected_services.iter().map(String::as_str).collect();
+    let mut visited = HashSet::new();
+    while let Some(name) = pending.pop() {
+        if !visited.insert(name) {
+            continue;
+        }
+        let Some(config) = services.get(name) else {
             continue;
         };
-        let gem_name = adapters::storage_gem(service, overrides);
-        if let Some(gem) = gem_name {
-            adapters.insert(gem.to_string(), service.clone());
+        let Some(service) = config.get("service").and_then(serde_yaml::Value::as_str) else {
+            continue;
+        };
+        if let Some(gem) = adapters::storage_gem(service, overrides) {
+            adapters.insert(gem, service.to_string());
+        }
+        if service == "Mirror" {
+            if let Some(primary) = config.get("primary").and_then(serde_yaml::Value::as_str) {
+                pending.push(primary);
+            }
+            if let Some(mirrors) = config
+                .get("mirrors")
+                .and_then(serde_yaml::Value::as_sequence)
+            {
+                pending.extend(mirrors.iter().filter_map(serde_yaml::Value::as_str));
+            }
         }
     }
     adapters
@@ -1511,12 +1499,141 @@ mod tests {
         )
         .unwrap();
 
-        let adapters = scan_storage_adapters(
+        let adapters = storage_adapters_after_walk(tmp.path());
+        assert_eq!(adapters.get("aws-sdk-s3").map(|s| s.as_str()), Some("S3"));
+    }
+
+    #[test]
+    fn scan_storage_adapters_decodes_comments_aliases_and_merges() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = tmp.path().join("config");
+        std::fs::create_dir_all(&cfg).unwrap();
+        std::fs::write(
+            cfg.join("storage.yml"),
+            r#"defaults: &defaults
+  service: &s3 S3 # production
+amazon:
+  <<: *defaults
+alias:
+  service: *s3
+direct:
+  service: S3 # production
+"quoted": {service: "GCS"} # inline mapping
+unused: {service: AzureStorage}
+"#,
+        )
+        .unwrap();
+        for name in ["amazon", "alias", "direct", "quoted"] {
+            std::fs::write(
+                cfg.join("application.rb"),
+                format!("config.active_storage.service = :{name}\n"),
+            )
+            .unwrap();
+            let adapters = storage_adapters_after_walk(tmp.path());
+            let (gem, service) = if name == "quoted" {
+                ("google-cloud-storage", "GCS")
+            } else {
+                ("aws-sdk-s3", "S3")
+            };
+            assert_eq!(adapters.len(), 1, "{adapters:?}");
+            assert_eq!(adapters.get(gem).map(String::as_str), Some(service));
+        }
+    }
+
+    #[test]
+    fn scan_storage_adapters_resolves_nested_mirrors_and_cycles() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = tmp.path().join("config");
+        std::fs::create_dir_all(&cfg).unwrap();
+        std::fs::write(
+            cfg.join("storage.yml"),
+            r#"mirror:
+  service: Mirror
+  primary: nested
+  mirrors: [google, missing, mirror]
+nested:
+  service: Mirror
+  primary: amazon
+  mirrors: [mirror, local]
+amazon: {service: S3}
+google: {service: GCS}
+local: {service: Disk}
+unused: {service: AzureStorage}
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            cfg.join("application.rb"),
+            "config.active_storage.service = :mirror\n",
+        )
+        .unwrap();
+        let adapters = storage_adapters_after_walk(tmp.path());
+        assert_eq!(adapters.len(), 2, "{adapters:?}");
+        assert_eq!(adapters.get("aws-sdk-s3").map(String::as_str), Some("S3"));
+        assert_eq!(
+            adapters.get("google-cloud-storage").map(String::as_str),
+            Some("GCS")
+        );
+
+        std::fs::remove_file(cfg.join("application.rb")).unwrap();
+        let models = tmp.path().join("app/models");
+        std::fs::create_dir_all(&models).unwrap();
+        std::fs::write(
+            models.join("user.rb"),
+            "has_one_attached :avatar, service: :mirror\n",
+        )
+        .unwrap();
+        assert_eq!(storage_adapters_after_walk(tmp.path()), adapters);
+    }
+
+    #[test]
+    fn scan_storage_adapters_ignores_inactive_ruby_selections() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = tmp.path().join("config/environments");
+        std::fs::create_dir_all(&cfg).unwrap();
+        std::fs::write(
+            tmp.path().join("config/storage.yml"),
+            "amazon: {service: S3}\nlocal: {service: Disk}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            cfg.join("production.rb"),
+            r##"# config.active_storage.service = :amazon
+text = <<~DOC
+config.active_storage.service = :amazon
+DOC
+text = "
+config.active_storage.service = :amazon
+"
+text = %q{
+config.active_storage.service = :amazon
+}
+pattern = /
+config.active_storage.service = :amazon
+/
+=begin
+config.active_storage.service = :amazon
+=end
+config.active_storage.service = :local # config.active_storage.service = :amazon
+__END__
+config.active_storage.service = :amazon
+"##,
+        )
+        .unwrap();
+        assert!(storage_adapters_after_walk(tmp.path()).is_empty());
+    }
+
+    #[test]
+    fn scan_storage_adapters_skips_invalid_yaml() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("config")).unwrap();
+        std::fs::write(tmp.path().join("config/storage.yml"), "amazon: [\n").unwrap();
+        assert!(scan_storage_adapters(
             tmp.path(),
             &adapters::AdapterOverrides::default(),
-            &HashSet::new(),
-        );
-        assert_eq!(adapters.get("aws-sdk-s3").map(|s| s.as_str()), Some("S3"));
+            &HashSet::from(["amazon".to_string()])
+        )
+        .is_empty());
     }
 
     fn storage_adapters_after_walk(dir: &std::path::Path) -> HashMap<String, String> {

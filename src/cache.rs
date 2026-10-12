@@ -6,7 +6,7 @@ use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Serialize};
 
-const CACHE_VERSION: u32 = 8; // bumped: entries carry Active Storage attachment services
+const CACHE_VERSION: u32 = 9; // bumped: storage services include lexically filtered config selections
 const CACHE_FILE: &str = ".unused_gems_cache";
 
 #[derive(Serialize, Deserialize)]

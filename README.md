@@ -226,6 +226,12 @@ gem named after the adapter or `activerecord-<adapter>-adapter`. Rails' built-in
 backends (`async`/`inline`/`test` cable adapters, `Disk`/`Mirror` storage services,
 `memory_store`/`file_store`/`null_store` caches) credit no gem.
 
+Active Storage selections in `config/application.rb`, `config/environments/*.rb`
+and attachment `service:` options credit the selected backends in `config/storage.yml`
+(or `.yml.erb`). YAML comments, aliases and merge keys are supported, and `Mirror`
+services recursively credit their `primary` and `mirrors` backends with cycle
+protection. Ruby selections inside comments, heredocs and literal text are ignored.
+
 Rails system tests are recognised too: referencing `ActionDispatch::SystemTestCase`
 credits `capybara`, and `driven_by :selenium` (or `Capybara.default_driver =`/
 `javascript_driver = :selenium_*`, `:cuprite`, …) credits the driver gem. In JSON output

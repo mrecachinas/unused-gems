@@ -19,7 +19,7 @@ Set `BENCH=1` to log per-step timing via the `timed!` macro in main.rs.
 ```
 Parse Gemfile (ruby-prism AST)
   → [parallel] Build gem index + Scan source tree (rayon::join)
-  → Scan storage adapters (config/storage.yml + attachment `service:` names from the walk)
+  → Scan storage adapters (config/storage.yml + config selections/attachment `service:` names from the walk; recursively resolve Mirrors)
   → Resolve require_paths per gem (parallel, multi-layer heuristics)
   → Match gem usage against scan results
   → Scan database adapters (config/database.yml)
@@ -47,7 +47,7 @@ Parse Gemfile (ruby-prism AST)
 - Byte-level scanning with `memchr::memmem::Finder` instead of regex in hot paths (scanner.rs)
 - `once_cell::sync::Lazy` for static regex and lookup table initialization
 - `rayon` for parallelism: `rayon::join()` for concurrent stages, `par_iter()` for batch operations
-- Bincode file cache keyed by mtime (nanosecond precision) + size to skip re-scanning unchanged files; entries hold everything a file contributes (requires, its unique constant names, bundler groups, attachment storage services), unvisited entries are pruned on save, and the file is written atomically (temp file + rename). Bump `CACHE_VERSION` when entry contents change
+- Bincode file cache keyed by mtime (nanosecond precision) + size to skip re-scanning unchanged files; entries hold everything a file contributes (requires, its unique constant names, bundler groups, config/attachment storage services), unvisited entries are pruned on save, and the file is written atomically (temp file + rename). Bump `CACHE_VERSION` when entry contents change
 - Never re-read source files outside the walker: collect new per-file facts in `scan_file_bytes_with` and expose them via `FileResult`/`ScanResults`
 - Per-file dedup (borrowed `&[u8]` sets) before touching thread-wide maps; lexer memo caches (`LexCache`) keep malformed input linear
 
