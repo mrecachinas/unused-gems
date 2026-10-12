@@ -5349,10 +5349,11 @@ require 'data_only'
     #[test]
     fn path_gem_ownership_is_recomputed_on_cache_hits() {
         let dir = tempfile::tempdir().unwrap();
-        let gem_dir = dir.path().join("engines/foopath");
+        let gem_dir = dir.path().join("engines").join("foopath");
+        let gem_file = gem_dir.join("foopath.rb");
         std::fs::create_dir_all(&gem_dir).unwrap();
         std::fs::write(
-            gem_dir.join("foopath.rb"),
+            &gem_file,
             "require 'foopath/internal'\nmodule Foopath\nend\n",
         )
         .unwrap();
@@ -5374,7 +5375,8 @@ require 'data_only'
         let (warm, updates) =
             scan_source_tree_with_path_gems(dir.path(), &[], &[], cache, None, &gems);
         assert!(updates.is_empty());
-        assert!(warm.file_is_owned_by("engines/foopath/foopath.rb", "foopath"));
+        let rel_path = gem_file.strip_prefix(dir.path()).unwrap().to_string_lossy();
+        assert!(warm.file_is_owned_by(&rel_path, "foopath"));
         let (cold, _) = scan_source_tree_with_path_gems(
             dir.path(),
             &[],

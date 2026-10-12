@@ -429,11 +429,14 @@ fn main() {
     for (gem_name, (store, source)) in &cache_config_adapters {
         adapter_evidence.push((gem_name, store, "cache", source));
     }
-    let system_test_gems = scan_system_test_drivers(&dir, &scan_results.modules);
+    let system_test_gems = scan_system_test_drivers(&dir, &scan_results);
     for (gem_name, (driver, source)) in &system_test_gems {
         adapter_evidence.push((gem_name, driver, "system_test", source));
     }
     for (gem_name, adapter, kind, source) in adapter_evidence {
+        if scan_results.file_is_owned_by(source, gem_name) {
+            continue;
+        }
         if let Some(result) = results.get_mut(gem_name) {
             result.evidence.push(types::Evidence::DatabaseAdapter {
                 adapter: adapter.to_string(),
@@ -1041,7 +1044,7 @@ fn scan_cache_config(
 /// `Capybara` are read. Maps gem → (driver or base class, relative file).
 fn scan_system_test_drivers(
     dir: &Path,
-    modules: &HashMap<String, HashSet<String>>,
+    scan_results: &types::ScanResults,
 ) -> HashMap<String, (String, String)> {
     static DRIVER_RE: once_cell::sync::Lazy<regex::Regex> = once_cell::sync::Lazy::new(|| {
         regex::Regex::new(
@@ -1053,13 +1056,17 @@ fn scan_system_test_drivers(
 
     let mut found = HashMap::new();
     let mut files: Vec<&String> = Vec::new();
-    for (module, module_files) in modules {
+    for (module, module_files) in &scan_results.modules {
         if module == SYSTEM_TEST_CASE || module == "Capybara" || module.starts_with("Capybara::") {
             files.extend(module_files);
         }
     }
-    if let Some(module_files) = modules.get(SYSTEM_TEST_CASE) {
-        if let Some(file) = module_files.iter().min() {
+    if let Some(module_files) = scan_results.modules.get(SYSTEM_TEST_CASE) {
+        if let Some(file) = module_files
+            .iter()
+            .filter(|file| !scan_results.file_is_owned_by(file, "capybara"))
+            .min()
+        {
             found.insert(
                 "capybara".to_string(),
                 (SYSTEM_TEST_CASE.to_string(), file.clone()),
@@ -1082,6 +1089,9 @@ fn scan_system_test_drivers(
                 "playwright" => "capybara-playwright-driver",
                 _ => continue,
             };
+            if scan_results.file_is_owned_by(file, gem) {
+                continue;
+            }
             found
                 .entry(gem.to_string())
                 .or_insert_with(|| (cap[1].to_string(), file.clone()));
@@ -1786,7 +1796,11 @@ config.active_storage.service = :amazon
             HashSet::from(["test/application_system_test_case.rb".to_string()]),
         )]);
 
-        let found = scan_system_test_drivers(tmp.path(), &modules);
+        let scan_results = types::ScanResults {
+            modules,
+            ..types::ScanResults::default()
+        };
+        let found = scan_system_test_drivers(tmp.path(), &scan_results);
         let file = "test/application_system_test_case.rb".to_string();
         assert_eq!(
             found.get("capybara"),
@@ -1796,7 +1810,7 @@ config.active_storage.service = :amazon
             found.get("selenium-webdriver"),
             Some(&("selenium".to_string(), file))
         );
-        assert!(scan_system_test_drivers(tmp.path(), &HashMap::new()).is_empty());
+        assert!(scan_system_test_drivers(tmp.path(), &types::ScanResults::default()).is_empty());
     }
 
     #[test]
