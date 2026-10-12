@@ -139,6 +139,9 @@ pub enum GemSource {
 #[derive(Debug, Clone, Default)]
 pub struct FileResult {
     pub rel_path: String,
+    /// Local path gems whose implementation directories contain this file.
+    /// Recomputed during each walk, not persisted in the content cache.
+    pub owners: Vec<String>,
     pub requires: Vec<String>,
     /// Unique constant names referenced by this file (reused for cache entries).
     pub modules: Vec<String>,
@@ -152,12 +155,21 @@ pub struct FileResult {
 pub struct ScanResults {
     pub requires: HashMap<String, HashSet<String>>,
     pub modules: HashMap<String, HashSet<String>>,
+    pub file_owners: HashMap<String, Vec<String>>,
     pub bundler_groups: HashSet<String>,
     pub bundler_require_all: bool,
     /// Script file contents collected during the walk: (rel_path, content_bytes)
     pub script_files: Vec<(String, Vec<u8>)>,
     /// Active Storage services selected by config settings or attachment declarations.
     pub storage_services: HashSet<String>,
+}
+
+impl ScanResults {
+    pub fn file_is_owned_by(&self, file: &str, gem: &str) -> bool {
+        self.file_owners
+            .get(file)
+            .is_some_and(|owners| owners.iter().any(|owner| owner == gem))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]

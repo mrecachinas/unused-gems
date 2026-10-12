@@ -198,6 +198,223 @@ fn status_of(results: &BTreeMap<String, (String, Vec<String>)>, gem: &str) -> St
         .clone()
 }
 
+fn path_gem_project(root: &Path) {
+    write(
+        &root.join("Gemfile"),
+        "gem 'foopath', path: 'engines/foopath', require: false\n",
+    );
+    write(
+        &root.join("engines/foopath/foopath.gemspec"),
+        "Gem::Specification.new do |s|\n  s.name = 'foopath'\n  s.version = '1.0'\nend\n",
+    );
+    write(
+        &root.join("engines/foopath/lib/foopath.rb"),
+        "module Foopath\nend\n",
+    );
+}
+
+fn relative_path(path: &str) -> String {
+    path.split('/')
+        .collect::<std::path::PathBuf>()
+        .to_string_lossy()
+        .into_owned()
+}
+
+#[test]
+fn path_gem_cannot_use_its_own_requires_declarations_or_constants() {
+    for code in [
+        "require 'foopath'\n",
+        "require 'foopath/internal'\n",
+        "module Foopath::Internal\nend\n",
+        "Foopath::Internal.new\n",
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        path_gem_project(dir.path());
+        write(&dir.path().join("engines/foopath/lib/internal.rb"), code);
+        let results = run_json(dir.path(), &[]);
+        assert_eq!(results["foopath"]["status"], "unused", "{code}");
+        assert!(results["foopath"].get("evidence").is_none(), "{code}");
+        assert!(results["foopath"].get("files").is_none(), "{code}");
+    }
+}
+
+#[test]
+fn path_gem_is_used_by_app_requires_or_constants_only() {
+    for code in [
+        "require 'foopath'\n",
+        "require 'foopath/internal'\n",
+        "Foopath::Internal.new\n",
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        path_gem_project(dir.path());
+        write(
+            &dir.path().join("engines/foopath/lib/internal.rb"),
+            "require 'foopath'\nrequire 'foopath/internal'\nFoopath::Internal.new\n",
+        );
+        write(&dir.path().join("app/usage.rb"), code);
+        let results = run_json(dir.path(), &[]);
+        assert_eq!(results["foopath"]["status"], "used", "{code}");
+        assert_eq!(
+            results["foopath"]["files"],
+            serde_json::json!([relative_path("app/usage.rb")])
+        );
+        for evidence in results["foopath"]["evidence"].as_array().unwrap() {
+            assert_eq!(evidence["file"], relative_path("app/usage.rb"));
+        }
+    }
+}
+
+#[test]
+fn path_gem_files_still_credit_other_gems() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    path_gem_project(root);
+    write(
+        &root.join("Gemfile"),
+        "gem 'foopath', path: 'engines/foopath', require: false\n\
+         gem 'json', require: false\n\
+         gem 'redis', require: false\n",
+    );
+    write(
+        &root.join("engines/foopath/lib/internal.rb"),
+        "require 'json'\nRedis.new\n",
+    );
+    let results = run_json(root, &[]);
+    assert_eq!(results["foopath"]["status"], "unused");
+    for gem in ["json", "redis"] {
+        assert_eq!(results[gem]["status"], "used");
+        assert_eq!(
+            results[gem]["files"],
+            serde_json::json!([relative_path("engines/foopath/lib/internal.rb")])
+        );
+    }
+}
+
+#[test]
+fn path_gem_directory_boundary_does_not_exclude_sibling_files() {
+    let dir = tempfile::tempdir().unwrap();
+    path_gem_project(dir.path());
+    write(
+        &dir.path().join("engines/foopath_extra/usage.rb"),
+        "Foopath.new\n",
+    );
+    let results = run_json(dir.path(), &[]);
+    assert_eq!(results["foopath"]["status"], "used");
+    assert_eq!(
+        results["foopath"]["files"],
+        serde_json::json!([relative_path("engines/foopath_extra/usage.rb")])
+    );
+}
+
+#[test]
+fn path_gem_scripts_only_credit_external_dependencies() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    path_gem_project(root);
+    write(
+        &root.join("Gemfile"),
+        "gem 'foopath', path: 'engines/foopath', require: false\n\
+         gem 'rake', require: false\n",
+    );
+    write(
+        &root.join("engines/foopath/Makefile"),
+        "check:\n\tbundle exec foopath && bundle exec rake\n",
+    );
+    let results = run_json(root, &[]);
+    assert_eq!(results["foopath"]["status"], "unused");
+    assert_eq!(results["rake"]["status"], "used");
+    assert_eq!(
+        results["rake"]["files"],
+        serde_json::json!([relative_path("engines/foopath/Makefile")])
+    );
+    write(&root.join("Makefile"), "check:\n\tbundle exec foopath\n");
+    let results = run_json(root, &[]);
+    assert_eq!(results["foopath"]["status"], "used");
+    assert_eq!(results["foopath"]["files"], serde_json::json!(["Makefile"]));
+}
+
+#[test]
+fn path_gem_system_test_evidence_excludes_own_files() {
+    for (owned_gem, other_gem) in [
+        ("capybara", "selenium-webdriver"),
+        ("selenium-webdriver", "capybara"),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(
+            &root.join("Gemfile"),
+            &format!(
+                "gem '{owned_gem}', path: 'engines/driver', require: false\n\
+                 gem '{other_gem}', require: false\n"
+            ),
+        );
+        write(
+            &root.join("engines/driver/driver.gemspec"),
+            &format!(
+                "Gem::Specification.new do |s|\n  s.name = '{owned_gem}'\n  s.version = '1.0'\nend\n"
+            ),
+        );
+        let system_test =
+            "class SystemTest < ActionDispatch::SystemTestCase\n  driven_by :selenium\nend\n";
+        write(&root.join("engines/driver/test/system.rb"), system_test);
+        let results = run_json(root, &[]);
+        assert_eq!(results[owned_gem]["status"], "unused", "{owned_gem}");
+        assert!(results[owned_gem].get("evidence").is_none(), "{owned_gem}");
+        assert_eq!(results[other_gem]["status"], "used", "{other_gem}");
+        assert_eq!(
+            results[other_gem]["files"],
+            serde_json::json!([relative_path("engines/driver/test/system.rb")])
+        );
+
+        // The owned file sorts first; it must not hide the later external match.
+        write(
+            &root.join("test/application_system_test_case.rb"),
+            system_test,
+        );
+        let results = run_json(root, &[]);
+        assert_eq!(results[owned_gem]["status"], "used", "{owned_gem}");
+        assert_eq!(
+            results[owned_gem]["files"],
+            serde_json::json!([relative_path("test/application_system_test_case.rb")])
+        );
+    }
+}
+
+#[test]
+fn root_project_path_gems_are_exempt_from_self_evidence_filtering() {
+    for gemfile in ["gem 'foopath', path: '.', require: false\n", "gemspec\n"] {
+        let dir = tempfile::tempdir().unwrap();
+        write(&dir.path().join("Gemfile"), gemfile);
+        write(
+            &dir.path().join("foopath.gemspec"),
+            "Gem::Specification.new do |s|\n  s.name = 'foopath'\n  s.version = '1.0'\nend\n",
+        );
+        write(&dir.path().join("lib/foopath.rb"), "module Foopath\nend\n");
+        let results = run_json(dir.path(), &[]);
+        assert_eq!(results["foopath"]["status"], "used", "{gemfile}");
+        assert_eq!(
+            results["foopath"]["files"],
+            serde_json::json!([relative_path("lib/foopath.rb")])
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn path_gem_ownership_follows_symlink_aliases() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    path_gem_project(root);
+    std::os::unix::fs::symlink(root.join("engines/foopath"), root.join("linked_foopath")).unwrap();
+    write(
+        &root.join("Gemfile"),
+        "gem 'foopath', path: 'linked_foopath', require: false\n",
+    );
+    let results = run_json(root, &[]);
+    assert_eq!(results["foopath"]["status"], "unused");
+    assert!(results["foopath"].get("evidence").is_none());
+}
+
 #[test]
 fn missing_locked_sources_do_not_supply_usage_evidence_and_warn_once() {
     for git in [false, true] {
