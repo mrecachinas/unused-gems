@@ -148,6 +148,11 @@ precedence over `group:` and `platform:` over `platforms:`. `install_if` conditi
 `nil`: a statically false condition is never `Bundler.require`d; any other condition is
 treated as possibly true.
 
+`Bundler.require` accepts explicit symbol or string group names, including multiline
+parenthesized calls. Only arguments inside the call are considered; trailing code
+and comments do not activate groups. `Rails.groups` conditions and `Rails.env`
+continue to use the active environments selected by `--rails-env`.
+
 A gem's source comes from `path:`, `git:`, the `github:`/`gitlab:`/`gist:`/`bitbucket:`
 shorthands, any custom `git_source(:name)` key, or an enclosing `path`/`git`/`github`
 block (`source` blocks reset it; `eval_gemfile` inherits it). Gems in a path source
