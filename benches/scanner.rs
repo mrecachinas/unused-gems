@@ -1,5 +1,3 @@
-#![allow(dead_code, unused_imports)]
-
 use std::fs;
 use std::sync::Arc;
 use std::time::Duration;
@@ -7,14 +5,7 @@ use std::time::Duration;
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use tempfile::TempDir;
 
-#[path = "../src/cache.rs"]
-mod cache;
-#[path = "../src/scanner.rs"]
-mod scanner;
-#[path = "../src/scripts.rs"]
-mod scripts;
-#[path = "../src/types.rs"]
-mod types;
+use unused_gems::{cache, scanner};
 
 struct Corpus {
     _dir: TempDir,

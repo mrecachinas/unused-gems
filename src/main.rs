@@ -1,18 +1,3 @@
-mod adapters;
-mod cache;
-mod diff;
-mod gemfile;
-mod ignore;
-mod introspect;
-mod known;
-mod lockfile;
-mod matcher;
-mod output;
-mod platforms;
-mod scanner;
-mod scripts;
-mod types;
-
 use std::collections::{HashMap, HashSet};
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
@@ -21,7 +6,11 @@ use std::sync::Arc;
 use clap::Parser;
 use rayon::prelude::*;
 
-use types::GemStatus;
+use unused_gems::types::GemStatus;
+use unused_gems::{
+    adapters, cache, diff, gemfile, ignore, introspect, known, lockfile, matcher, output,
+    platforms, scanner, scripts, types,
+};
 
 /// Exit codes: 0 = no unused gems, 1 = unused gems found, 2 = fatal error.
 const EXIT_ERROR: i32 = 2;

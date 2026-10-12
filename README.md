@@ -45,7 +45,7 @@ gh release download --repo mrecachinas/unused-gems --pattern 'unused-gems-x86_64
 
 ### Build from source
 
-Requires [Rust](https://www.rust-lang.org/tools/install) 1.70+.
+Requires [Rust](https://www.rust-lang.org/tools/install) 1.88+ (also tested in CI).
 
 ```bash
 # Install to ~/.cargo/bin
@@ -269,3 +269,7 @@ cargo bench -- --baseline main
 
 It covers cold and warm end-to-end runs, source-tree scaling,
 comment/heredoc-heavy Ruby, and gitignored generated-source trees.
+The end-to-end benchmark uses `UNUSED_GEMS_BIN` when set; otherwise it looks in
+`$CARGO_TARGET_DIR/release` or `<manifest>/target/release`, with the platform's
+executable suffix. Use `UNUSED_GEMS_BIN` for other profiles, cross-compilation,
+or target directories configured only through Cargo configuration files.

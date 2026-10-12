@@ -71,6 +71,6 @@ Parse Gemfile (ruby-prism AST)
 
 **Gemfile discovery:** `Gemfile`, then `gems.rb`; each Gemfile's lockfile is `gems.locked` (for `gems.rb`) or `<gemfile>.lock`.
 
-**Module organization:** Flat structure under `src/`, function-based design (no traits). Shared state uses `Arc<Mutex<>>` (e.g., file cache in scanner).
+**Module organization:** Flat structure under `src/`, exposed by the `unused_gems` library in `src/lib.rs`; `main.rs`, integration tests, and scanner benchmarks import that library instead of recompiling or copying its modules. Function-based design (no traits). Shared state uses `Arc<Mutex<>>` (e.g., file cache in scanner).
 
-**Testing:** Integration tests in `tests/` validate byte scanner correctness against regex baselines. Unit tests in each module cover edge cases: inline comments, heredocs, YAML comments, bundler group handling, and gemspec directive detection.
+**Testing:** Integration tests in `tests/` exercise the production scanner, using regex baselines only as comparison oracles and explicitly asserting intentional differences. Unit tests in each module cover edge cases: inline comments, heredocs, YAML comments, bundler group handling, and gemspec directive detection. Rust 1.88 is the MSRV; CI builds and tests the locked dependencies on that toolchain.

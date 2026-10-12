@@ -102,7 +102,7 @@ impl FileCache {
     /// Check cache for a file. Returns a borrowed CacheEntry clone on hit.
     /// Kept for tests / external readers; scanner uses `take()` to avoid clones.
     #[allow(dead_code)]
-    pub fn get(&self, rel_path: &str, mtime: SystemTime, size: u64) -> Option<CacheEntry> {
+    pub(crate) fn get(&self, rel_path: &str, mtime: SystemTime, size: u64) -> Option<CacheEntry> {
         let state = self.state.lock().unwrap();
         let entry = state.entries.get(rel_path)?;
         let duration = mtime.duration_since(SystemTime::UNIX_EPOCH).ok()?;
@@ -132,7 +132,7 @@ impl FileCache {
     /// If validation fails, the entry is left in place.
     /// Every lookup records `rel_path` as visited so `save` can prune entries
     /// for files that no longer exist (or are no longer scanned).
-    pub fn take(
+    pub(crate) fn take(
         &self,
         rel_path: &str,
         mtime: SystemTime,
