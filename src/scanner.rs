@@ -5038,8 +5038,11 @@ require 'real_regex'
         let (results, _) = scan_source_tree(dir.path(), &[], cache);
         assert!(!results.requires.contains_key("heredoc_only"));
         assert_eq!(
-            results.requires["real"],
-            HashSet::from(["bin/direct".to_string(), "bin/tool".to_string()])
+            results.requires["real"]
+                .iter()
+                .map(Path::new)
+                .collect::<HashSet<_>>(),
+            HashSet::from([Path::new("bin/direct"), Path::new("bin/tool")])
         );
 
         let cache = Arc::new(crate::cache::FileCache::load(dir.path()));
