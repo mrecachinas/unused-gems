@@ -342,6 +342,44 @@ fn ruby_shell_calls<'a>(line: &'a [u8], keywords: &[&[u8]], backticks: bool) -> 
     calls
 }
 
+fn mise_commands(rel_path: &str, content: &[u8]) -> Vec<String> {
+    let text = match std::str::from_utf8(content) {
+        Ok(text) => text,
+        Err(error) => {
+            eprintln!("Warning: cannot read mise tasks in {rel_path}: {error}");
+            return Vec::new();
+        }
+    };
+    let config = match text.parse::<toml::Value>() {
+        Ok(config) => config,
+        Err(error) => {
+            eprintln!("Warning: cannot parse mise tasks in {rel_path}: {error}");
+            return Vec::new();
+        }
+    };
+    let mut commands = Vec::new();
+    if let Some(tasks) = config.get("tasks").and_then(toml::Value::as_table) {
+        for task in tasks.values() {
+            let run = if task.is_table() {
+                task.get("run")
+            } else {
+                Some(task)
+            };
+            match run {
+                Some(toml::Value::String(command)) => commands.push(command.clone()),
+                Some(toml::Value::Array(entries)) => commands.extend(
+                    entries
+                        .iter()
+                        .filter_map(toml::Value::as_str)
+                        .map(str::to_owned),
+                ),
+                _ => {}
+            }
+        }
+    }
+    commands
+}
+
 fn command_slices<'a>(rel_path: &str, content: &'a [u8]) -> Vec<&'a [u8]> {
     let normalized = rel_path.replace('\\', "/");
     let file_name = normalized.rsplit('/').next().unwrap_or(&normalized);
@@ -423,9 +461,16 @@ fn command_slices<'a>(rel_path: &str, content: &'a [u8]) -> Vec<&'a [u8]> {
                 Some(item) => (item, 2),
                 None => (text, 0),
             };
-            if let Some(command) = ["run:", "script:", "cmds:", "command:", "entrypoint:"]
-                .iter()
-                .find_map(|key| item.strip_prefix(key))
+            if let Some(command) = [
+                "run:",
+                "script:",
+                "cmds:",
+                "commands:",
+                "command:",
+                "entrypoint:",
+            ]
+            .iter()
+            .find_map(|key| item.strip_prefix(key))
             {
                 let command = command.trim_start();
                 let is_block = command
@@ -704,21 +749,50 @@ pub fn scan_scripts_for_gem_usage(
         .par_iter()
         .filter_map(|(rel_path, content)| {
             let mut gems = Vec::new();
+            let normalized = rel_path.replace('\\', "/");
+            let file_name = normalized.rsplit('/').next().unwrap_or(&normalized);
+            let is_mise = matches!(file_name, "mise.toml" | ".mise.toml");
+            let is_drone = matches!(normalized.as_str(), ".drone.yml" | ".drone.yaml");
 
-            // Strip comment lines/inline comments to avoid matching gem names in comments
-            let stripped = strip_comment_lines(content);
+            // Parse TOML before stripping shell comments so multiline strings
+            // and escapes retain their TOML meaning.
+            let mise = is_mise.then(|| mise_commands(rel_path, content));
+            let stripped = if is_mise {
+                Cow::Borrowed(content.as_slice())
+            } else {
+                strip_comment_lines(content)
+            };
             let stripped: &[u8] = stripped.as_ref();
 
-            for cmd in scan_bundle_exec(stripped) {
-                resolver.resolve(&cmd, &mut gems);
-            }
-            for cmd in scan_bin_refs(stripped) {
-                resolver.resolve(&cmd, &mut gems);
+            // Structured configs must not credit invocations in metadata.
+            if !is_mise && !is_drone {
+                for cmd in scan_bundle_exec(stripped) {
+                    resolver.resolve(&cmd, &mut gems);
+                }
+                for cmd in scan_bin_refs(stripped) {
+                    resolver.resolve(&cmd, &mut gems);
+                }
             }
             // Only words in command position count: arguments such as
             // `apt-get install -y git curl` must not credit `git`/`curl` gems.
-            for command in command_slices(rel_path, stripped) {
-                for word in command_words(command) {
+            let commands = match &mise {
+                Some(commands) => commands.iter().map(|command| command.as_bytes()).collect(),
+                None => command_slices(rel_path, stripped),
+            };
+            for command in commands {
+                let command = if is_drone && matches!(command.first(), Some(b'"' | b'\'')) {
+                    match serde_yaml::from_slice::<String>(command) {
+                        Ok(command) => Cow::Owned(command.into_bytes()),
+                        Err(error) => {
+                            eprintln!("Warning: cannot parse Drone command in {rel_path}: {error}");
+                            continue;
+                        }
+                    }
+                } else {
+                    Cow::Borrowed(command)
+                };
+                let command = strip_comment_lines(&command);
+                for word in command_words(&command) {
                     resolver.resolve(word, &mut gems);
                 }
             }

@@ -37,7 +37,7 @@ Parse Gemfile (ruby-prism AST)
 - `scanner.rs` — hand-rolled byte scanners (memchr/SIMD), no per-file regex
 - `introspect.rs` — discovers require paths and module names from installed gems or vendor/cache tarballs
 - `matcher.rs` — matches gems to scan results, produces evidence-backed results
-- `scripts.rs` — scans scripts (Rakefile/`*.rake`, shell, Make, Docker, Procfile, CI YAML) for gem executables run in command position (`bundle exec`, `bin/`, first word after `&&`/`;`/`|`…), mapping executables to gems via installed gemspecs, a curated table and `-`/`_` normalisation
+- `scripts.rs` — scans scripts (Rakefile/`*.rake`, shell, Make, Docker, Procfile, CI YAML including Drone `commands:`, and mise TOML tasks) for gem executables run in command position (`bundle exec`, `bin/`, first word after `&&`/`;`/`|`…), mapping executables to gems via installed gemspecs, a curated table and `-`/`_` normalisation
 
 ## Key Conventions
 
