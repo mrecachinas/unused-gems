@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::io::{ErrorKind, Write};
 use std::path::Path;
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime};
@@ -220,18 +221,54 @@ impl FileCache {
             version: CACHE_VERSION,
             entries,
         };
-        let Ok(data) = bincode::serialize(&cf) else {
-            return;
+        let data = match bincode::serialize(&cf) {
+            Ok(data) => data,
+            Err(err) => {
+                eprintln!("Failed to serialize cache: {err}");
+                return;
+            }
         };
-        let tmp_path = self
-            .cache_path
-            .with_file_name(format!("{CACHE_FILE}.{}.tmp", std::process::id()));
-        let written = std::fs::write(&tmp_path, data)
-            .and_then(|()| std::fs::rename(&tmp_path, &self.cache_path));
-        // Cache writes are best-effort (e.g. read-only checkouts).
-        if written.is_err() {
-            let _ = std::fs::remove_file(&tmp_path);
+        for attempt in 0..100 {
+            let name = if attempt == 0 {
+                format!("{CACHE_FILE}.{}.tmp", std::process::id())
+            } else {
+                format!("{CACHE_FILE}.{}.{attempt}.tmp", std::process::id())
+            };
+            let tmp_path = self.cache_path.with_file_name(name);
+            let mut file = match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&tmp_path)
+            {
+                Ok(file) => file,
+                Err(err) if err.kind() == ErrorKind::AlreadyExists => continue,
+                Err(err) => {
+                    eprintln!(
+                        "Failed to create cache temp file {}: {err}",
+                        tmp_path.display()
+                    );
+                    return;
+                }
+            };
+            let written = file.write_all(&data);
+            drop(file);
+            let written = written.and_then(|()| std::fs::rename(&tmp_path, &self.cache_path));
+            // Cache writes are best-effort (e.g. read-only checkouts).
+            if let Err(err) = written {
+                eprintln!("Failed to save cache {}: {err}", self.cache_path.display());
+                if let Err(err) = std::fs::remove_file(&tmp_path) {
+                    eprintln!(
+                        "Failed to remove cache temp file {}: {err}",
+                        tmp_path.display()
+                    );
+                }
+            }
+            return;
         }
+        eprintln!(
+            "Failed to save cache {}: exhausted temp file name retries",
+            self.cache_path.display()
+        );
     }
 
     pub fn is_enabled(&self) -> bool {
@@ -510,5 +547,39 @@ mod tests {
         cache.save();
         // No cache file created since nothing was put
         assert!(!dir.path().join(CACHE_FILE).exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_does_not_follow_temp_file_symlinks() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        std::fs::write(&target, b"keep intact").unwrap();
+        let tmp_path = dir
+            .path()
+            .join(format!("{CACHE_FILE}.{}.tmp", std::process::id()));
+        std::os::unix::fs::symlink(&target, &tmp_path).unwrap();
+
+        let mtime = SystemTime::UNIX_EPOCH + Duration::from_secs(1000000);
+        let mut cache = FileCache::load(dir.path());
+        cache.put(update("a.rb", mtime, 1));
+        cache.save();
+
+        assert_eq!(std::fs::read(&target).unwrap(), b"keep intact");
+        assert_eq!(std::fs::read_link(&tmp_path).unwrap(), target);
+        assert!(FileCache::load(dir.path()).get("a.rb", mtime, 1).is_some());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 3);
+    }
+
+    #[test]
+    fn save_cleans_up_temp_file_on_rename_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(CACHE_FILE)).unwrap();
+        let mut cache = FileCache::load(dir.path());
+        cache.put(update("a.rb", SystemTime::UNIX_EPOCH, 1));
+        cache.save();
+
+        assert!(dir.path().join(CACHE_FILE).is_dir());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
     }
 }
