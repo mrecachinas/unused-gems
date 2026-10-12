@@ -9,6 +9,7 @@ type ModuleEntry<'a> = (&'a str, &'a HashSet<String>);
 
 /// Shared indexes built once from scan results and reused across all gem matching.
 struct MatchIndexes<'a> {
+    scan_results: &'a ScanResults,
     requires: &'a HashMap<String, HashSet<String>>,
     prefix_map: HashMap<&'a str, Vec<(&'a str, &'a HashSet<String>)>>,
     declared_require_paths: HashSet<&'a str>,
@@ -80,6 +81,7 @@ impl<'a> MatchIndexes<'a> {
             .collect();
 
         MatchIndexes {
+            scan_results,
             requires,
             prefix_map,
             declared_require_paths: gems
@@ -117,17 +119,19 @@ impl GemMeta {
 fn build_gem_result(gem_entry: &GemEntry, meta: &GemMeta, indexes: &MatchIndexes<'_>) -> GemResult {
     let mut found_files: HashSet<String> = HashSet::new();
     let mut evidence: Vec<Evidence> = Vec::new();
+    let external_file =
+        |file: &&String| !indexes.scan_results.file_is_owned_by(file, &gem_entry.name);
 
     // Check each require path for this gem
     for req_path in &gem_entry.require_paths {
         if let Some(files) = indexes.requires.get(req_path) {
-            for f in files {
+            for f in files.iter().filter(external_file) {
                 evidence.push(Evidence::Require {
                     path: req_path.clone(),
                     file: f.clone(),
                 });
+                found_files.insert(f.clone());
             }
-            found_files.extend(files.iter().cloned());
         }
 
         // Check sub-requires via prefix map
@@ -139,13 +143,13 @@ fn build_gem_result(gem_entry: &GemEntry, meta: &GemMeta, indexes: &MatchIndexes
                     if *req_name != req_path && indexes.declared_require_paths.contains(*req_name) {
                         continue;
                     }
-                    for f in *files {
+                    for f in files.iter().filter(external_file) {
                         evidence.push(Evidence::Require {
                             path: req_name.to_string(),
                             file: f.clone(),
                         });
+                        found_files.insert(f.clone());
                     }
-                    found_files.extend(files.iter().cloned());
                 }
             }
         }
@@ -188,13 +192,13 @@ fn build_gem_result(gem_entry: &GemEntry, meta: &GemMeta, indexes: &MatchIndexes
                 false
             };
             if matches {
-                for f in *files {
+                for f in files.iter().filter(external_file) {
                     evidence.push(Evidence::Module {
                         name: original_name.to_string(),
                         file: f.clone(),
                     });
+                    found_files.insert(f.clone());
                 }
-                found_files.extend(files.iter().cloned());
             }
         }
     }
@@ -298,6 +302,7 @@ mod tests {
                 .insert(file.to_string());
         }
         ScanResults {
+            file_owners: HashMap::new(),
             requires: req_map,
             modules: mod_map,
             bundler_groups: HashSet::new(),

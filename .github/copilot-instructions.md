@@ -51,7 +51,7 @@ Parse Gemfile (ruby-prism AST)
 - Never re-read source files outside the walker: collect new per-file facts in `scan_file_bytes_with` and expose them via `FileResult`/`ScanResults`
 - Per-file dedup (borrowed `&[u8]` sets) before touching thread-wide maps; lexer memo caches (`LexCache`) keep malformed input linear
 
-**Comment filtering:** All scanners (Ruby and non-Ruby) filter `#` comment lines. Ruby files additionally filter `=begin`/`=end` blocks, heredoc content, string/regex/percent-literal interiors (keeping `#{}` code), the `__END__` data section, and inline comments (e.g., `x = 1 # require 'foo'`). Haml/Slim tag lines are parsed so only attributes, `=` output, script lines (with `,`/`\` continuations) and `#{}` are treated as Ruby. Script scanning strips comment lines before extracting commands; only command words (not arguments) are matched against gems.
+**Comment filtering:** All scanners (Ruby and non-Ruby) filter `#` comment lines. Ruby files (including extensionless Ruby-shebang scripts, classified from already-read bytes) additionally filter `=begin`/`=end` blocks, heredoc content, string/regex/percent-literal interiors (keeping `#{}` code), the `__END__` data section, and inline comments (e.g., `x = 1 # require 'foo'`). Haml/Slim tag lines are parsed so only attributes, `=` output, script lines (with `,`/`\` continuations) and `#{}` are treated as Ruby. Script scanning strips comment lines before extracting commands; only command words (not arguments) are matched against gems.
 
 **RuboCop configs:** `.rubocop*.yml` / `.standard*.yml` are parsed with serde_yaml (`require`/`plugins` strings, lists or single-key maps; `inherit_gem` keys) with a line-based fallback for non-YAML (ERB) configs.
 

@@ -206,6 +206,8 @@ flowchart LR
 
 A gem's source comes from `path:`, `git:`, the `github:`/`gitlab:`/`gist:`/`bitbucket:` shorthands, any custom `git_source(:name)`, or an enclosing `path`/`git`/`github` block. `source` blocks reset it and `eval_gemfile` inherits it. Path gems resolve to the directory itself or an immediate subdirectory holding `<name>.gemspec` (Bundler's `{,*,*/*}.gemspec` glob); `~` is expanded.
 
+For path gems inside the scanned tree, files under the gem's own directory do not count as usage evidence for that gem, but still count for other dependencies. The project itself (a root `gemspec` or `path: '.'`) is exempt.
+
 ### `eval_gemfile`
 
 - Evaluated inline, so gems appear in source order and inherit the enclosing `group`/`platforms`.
@@ -284,7 +286,7 @@ What is ignored:
 | File type | Filtered out |
 |---|---|
 | All | `#` comment lines |
-| Ruby | `=begin`/`=end`, heredoc bodies, string/regex/percent-literal interiors (except `#{}`), `__END__` data, inline comments |
+| Ruby (incl. extensionless Ruby-shebang scripts) | `=begin`/`=end`, heredoc bodies, string/regex/percent-literal interiors (except `#{}`), `__END__` data, inline comments |
 | Haml / Slim | Everything but attributes, `=` output, script lines (with `,`/`\` continuations) and `#{}` |
 | RuboCop / Standard YAML | Parsed with serde_yaml for `require`, `plugins`, `inherit_gem`; line-based fallback for ERB configs |
 
