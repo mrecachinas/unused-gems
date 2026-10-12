@@ -27,7 +27,11 @@ fn assert_gemfile_error(project: &Path, extra: &[&str], path: &Path, message: &s
     assert!(output.stdout.is_empty(), "must not emit successful results");
     assert!(stderr.contains("Error:"), "{stderr}");
     assert!(stderr.contains(message), "{stderr}");
-    assert!(stderr.contains(&path.display().to_string()), "{stderr}");
+    let canonical_path = path.canonicalize().unwrap();
+    assert!(
+        stderr.contains(&canonical_path.display().to_string()),
+        "{stderr}"
+    );
 }
 
 #[test]
