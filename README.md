@@ -117,7 +117,7 @@ unused-gems --gemfile engines/a/Gemfile --gemfile engines/b/Gemfile /path/to/pro
 |------|---------|
 | `0` | No unused gems (or `--fail-on none`, or `--fail-on new` without new unused gems) |
 | `1` | Unused gems found (per `--fail-on`) |
-| `2` | Fatal error: invalid directory, missing Gemfile, unreadable or invalid `--diff` baseline, bad CLI arguments |
+| `2` | Fatal error: invalid directory, missing, non-file, unreadable or syntactically invalid Gemfile, unreadable or invalid `--diff` baseline, bad CLI arguments |
 
 `--fail-on new` only has an effect together with `--diff`; without it a warning is printed
 and the exit code is `0`. With `-o json`, `--diff` prints
@@ -131,6 +131,11 @@ The default Gemfile is `<dir>/Gemfile`, falling back to `<dir>/gems.rb`. Each an
 Gemfile is paired with its own lockfile like Bundler does: `gems.locked` for `gems.rb`,
 otherwise `<gemfile>.lock` (so `--gemfile gemfiles/rails7.gemfile` reads
 `gemfiles/rails7.gemfile.lock`). Lockfiles of Gemfiles that are not analyzed are ignored.
+
+An existing `Gemfile` takes precedence over `gems.rb`, even if it is invalid.
+Every analyzed Gemfile (including resolved `eval_gemfile` targets) must be a readable
+regular file with valid Ruby syntax; otherwise analysis exits `2` with an error.
+`--allow-missing-gemfile` does not suppress these input errors.
 
 Every `gem` declaration is kept separately, as Bundler keeps each duplicate as its own
 dependency. A gem counts as loaded by `Bundler.require` when **any** declaration is in an

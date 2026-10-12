@@ -15,6 +15,112 @@ fn write(path: &Path, contents: &str) {
     std::fs::write(path, contents).unwrap();
 }
 
+fn assert_gemfile_error(project: &Path, extra: &[&str], path: &Path, message: &str) {
+    let output = Command::new(env!("CARGO_BIN_EXE_unused-gems"))
+        .args(["--output", "json", "--no-cache", "--quiet"])
+        .args(extra)
+        .arg(project)
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(2), "{stderr}");
+    assert!(output.stdout.is_empty(), "must not emit successful results");
+    assert!(stderr.contains("Error:"), "{stderr}");
+    assert!(stderr.contains(message), "{stderr}");
+    assert!(stderr.contains(&path.display().to_string()), "{stderr}");
+}
+
+#[test]
+fn invalid_gemfiles_fail_instead_of_returning_partial_results() {
+    for filename in ["Gemfile", "gems.rb", "custom.gemfile"] {
+        for source in ["gem(", "gem 'valid_gem'\ngem("] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join(filename);
+            write(&path, source);
+            if filename == "Gemfile" {
+                write(&dir.path().join("gems.rb"), "");
+            }
+            let extra = if filename == "custom.gemfile" {
+                vec!["--gemfile", filename, "--allow-missing-gemfile"]
+            } else {
+                vec!["--allow-missing-gemfile"]
+            };
+            assert_gemfile_error(dir.path(), &extra, &path, "Could not parse Gemfile");
+        }
+    }
+}
+
+#[test]
+fn gemfile_directories_fail_even_with_a_valid_fallback() {
+    for filename in ["Gemfile", "gems.rb", "custom.gemfile"] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(filename);
+        std::fs::create_dir(&path).unwrap();
+        if filename == "Gemfile" {
+            write(&dir.path().join("gems.rb"), "");
+        }
+        let extra = if filename == "custom.gemfile" {
+            vec!["--gemfile", filename, "--allow-missing-gemfile"]
+        } else {
+            vec!["--allow-missing-gemfile"]
+        };
+        assert_gemfile_error(dir.path(), &extra, &path, "not a regular file");
+    }
+}
+
+#[test]
+fn invalid_eval_gemfile_targets_fail() {
+    for directory in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        write(&dir.path().join("Gemfile"), "eval_gemfile 'shared.gemfile'");
+        let path = dir.path().join("shared.gemfile");
+        let message = if directory {
+            std::fs::create_dir(&path).unwrap();
+            "not a regular file"
+        } else {
+            write(&path, "gem(");
+            "Could not parse Gemfile"
+        };
+        assert_gemfile_error(dir.path(), &[], &path, message);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn unreadable_gemfiles_fail() {
+    use std::os::unix::fs::PermissionsExt;
+
+    for filename in ["Gemfile", "gems.rb", "custom.gemfile", "shared.gemfile"] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(filename);
+        write(&path, "gem 'valid_gem'");
+        if filename == "shared.gemfile" {
+            write(&dir.path().join("Gemfile"), "eval_gemfile 'shared.gemfile'");
+        }
+        let permissions = std::fs::metadata(&path).unwrap().permissions();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o0)).unwrap();
+        if std::fs::read(&path).is_ok() {
+            std::fs::set_permissions(&path, permissions).unwrap();
+            eprintln!("Skipping unreadable Gemfile test: process bypasses file permissions");
+            return;
+        }
+        let extra = if filename == "custom.gemfile" {
+            vec!["--gemfile", filename, "--allow-missing-gemfile"]
+        } else {
+            vec!["--allow-missing-gemfile"]
+        };
+        assert_gemfile_error(dir.path(), &extra, &path, "Could not read Gemfile");
+        std::fs::set_permissions(&path, permissions).unwrap();
+    }
+}
+
+#[test]
+fn empty_gemfiles_remain_valid() {
+    let dir = tempfile::tempdir().unwrap();
+    write(&dir.path().join("Gemfile"), "");
+    assert!(run_tool(dir.path()).is_empty());
+}
+
 /// Run the tool over `project` and return `name -> (status, groups)`.
 fn run_tool(project: &Path) -> BTreeMap<String, (String, Vec<String>)> {
     run_json(project, &[])
