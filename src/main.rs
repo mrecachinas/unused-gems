@@ -291,12 +291,13 @@ fn main() {
                     || {
                         timed!(
                             "scan_source_tree",
-                            scanner::scan_source_tree_with_threads_and_explicit_skips(
+                            scanner::scan_source_tree_with_path_gems(
                                 &dir,
                                 &skip_dirs,
                                 &extra_refs,
                                 cache_for_scan,
                                 walker_threads,
+                                &gems,
                             )
                         )
                     },
@@ -448,7 +449,7 @@ fn main() {
     }
 
     // 5. Merge script/CI evidence before lazy introspection check
-    merge_script_refs(&mut results, &script_refs, false);
+    merge_script_refs(&mut results, &script_refs, &scan_results, false);
 
     // 6. Lazy introspection: only resolve module names for gems not yet matched
     let unresolved: Vec<usize> = gems
@@ -511,7 +512,7 @@ fn main() {
             }
         });
         // Re-merge script refs for newly resolved gems
-        merge_script_refs(&mut results, &script_refs, true);
+        merge_script_refs(&mut results, &script_refs, &scan_results, true);
     }
 
     if !cli.quiet {
@@ -639,6 +640,7 @@ fn main() {
 fn merge_script_refs(
     results: &mut HashMap<String, types::GemResult>,
     script_refs: &HashMap<String, HashSet<String>>,
+    scan_results: &types::ScanResults,
     only_if_not_used: bool,
 ) {
     for (gem_name, files) in script_refs {
@@ -646,14 +648,20 @@ fn merge_script_refs(
             if only_if_not_used && (result.status == GemStatus::Used || files.is_empty()) {
                 continue;
             }
-            for f in files {
+            for f in files
+                .iter()
+                .filter(|f| !scan_results.file_is_owned_by(f, gem_name))
+            {
                 result
                     .evidence
                     .push(types::Evidence::Script { file: f.clone() });
             }
             // Dedup via HashSet then sort once — avoids quadratic per-iteration sort/dedup.
             let mut set: HashSet<String> = std::mem::take(&mut result.files).into_iter().collect();
-            for f in files {
+            for f in files
+                .iter()
+                .filter(|f| !scan_results.file_is_owned_by(f, gem_name))
+            {
                 set.insert(f.clone());
             }
             let mut merged: Vec<String> = set.into_iter().collect();

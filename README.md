@@ -158,6 +158,9 @@ shorthands, any custom `git_source(:name)` key, or an enclosing `path`/`git`/`gi
 block (`source` blocks reset it; `eval_gemfile` inherits it). Gems in a path source
 resolve to the directory itself or to the immediate subdirectory holding
 `<name>.gemspec`, following Bundler's `{,*,*/*}.gemspec` glob; `~` is expanded.
+For path gems inside the scanned tree, files under the gem's own directory do not
+count as usage evidence for that gem, but still count for other dependencies.
+The project itself (a root `gemspec` or `path: '.'`) is exempt.
 
 `eval_gemfile` is evaluated inline at its declaration site, so gems appear in source
 order and inherit the enclosing `group`/`platforms` context. Relative paths resolve

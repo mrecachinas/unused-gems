@@ -7,7 +7,7 @@ use once_cell::sync::Lazy;
 use regex::bytes::Regex as BytesRegex;
 use regex::Regex;
 
-use crate::types::{FileResult, ScanResults};
+use crate::types::{FileResult, GemEntry, GemSource, ScanResults};
 
 // YAML-specific regexes (rarely hit, not worth hand-rolling).
 // Use bytes-mode regex to avoid String::from_utf8_lossy allocations.
@@ -2950,6 +2950,49 @@ pub fn scan_source_tree_with_threads_and_explicit_skips(
     cache: Arc<crate::cache::FileCache>,
     threads: Option<usize>,
 ) -> (ScanResults, Vec<CacheUpdate>) {
+    scan_source_tree_with_path_gems(dir, skip_dirs, explicit_skip_dirs, cache, threads, &[])
+}
+
+pub fn scan_source_tree_with_path_gems(
+    dir: &Path,
+    skip_dirs: &[&str],
+    explicit_skip_dirs: &[&str],
+    cache: Arc<crate::cache::FileCache>,
+    threads: Option<usize>,
+    gems: &[GemEntry],
+) -> (ScanResults, Vec<CacheUpdate>) {
+    let mut path_gems = Vec::new();
+    if gems
+        .iter()
+        .any(|gem| matches!(gem.source, Some(GemSource::Path(_))))
+    {
+        match std::fs::canonicalize(dir) {
+            Ok(root) => {
+                for gem in gems {
+                    let Some(GemSource::Path(path)) = &gem.source else {
+                        continue;
+                    };
+                    match std::fs::canonicalize(dir.join(path)) {
+                        Ok(path) if path != root && path.starts_with(&root) => {
+                            path_gems.push((gem.name.clone(), path));
+                        }
+                        Ok(_) => {}
+                        Err(err) => eprintln!(
+                            "Warning: cannot resolve path gem {} at {}: {}",
+                            gem.name,
+                            path.display(),
+                            err
+                        ),
+                    }
+                }
+            }
+            Err(err) => eprintln!(
+                "Warning: cannot resolve scan root {} for path gem ownership: {}",
+                dir.display(),
+                err
+            ),
+        }
+    }
     let skip_set: HashSet<String> = skip_dirs.iter().map(|s| s.to_string()).collect();
     let explicit_skip_set: HashSet<String> =
         explicit_skip_dirs.iter().map(|s| s.to_string()).collect();
@@ -3029,8 +3072,10 @@ pub fn scan_source_tree_with_threads_and_explicit_skips(
     let cache_updates_clone = Arc::clone(&cache_updates);
     let cache_for_walk = Arc::clone(&cache);
     let dir_str_shared = Arc::new(dir_str);
+    let path_gems = Arc::new(path_gems);
 
     builder.build_parallel().run(move || {
+        let path_gems = Arc::clone(&path_gems);
         let shared = Arc::clone(&results_clone);
         let scripts = Arc::clone(&scripts_clone);
         let modules_shared = Arc::clone(&modules_clone);
@@ -3098,6 +3143,25 @@ pub fn scan_source_tree_with_threads_and_explicit_skips(
 
                     let is_source = is_scannable(&path_str, path);
                     let is_script = crate::scripts::is_script_file(&rel_path_cow, &file_name);
+                    let owners = if (is_source || is_script) && !path_gems.is_empty() {
+                        match std::fs::canonicalize(path) {
+                            Ok(source_path) => path_gems
+                                .iter()
+                                .filter(|(_, root)| source_path.starts_with(root))
+                                .map(|(name, _)| name.clone())
+                                .collect(),
+                            Err(err) => {
+                                eprintln!(
+                                    "Warning: cannot resolve file ownership for {}: {}",
+                                    path.display(),
+                                    err
+                                );
+                                Vec::new()
+                            }
+                        }
+                    } else {
+                        Vec::new()
+                    };
 
                     // Check if it's a scannable source file
                     if is_source {
@@ -3137,6 +3201,7 @@ pub fn scan_source_tree_with_threads_and_explicit_skips(
                             // owned entry back into cache so durability is preserved.
                             let file_result = FileResult {
                                 rel_path: rel.to_string(),
+                                owners: owners.clone(),
                                 requires: entry.requires.clone(),
                                 modules: Vec::new(),
                                 bundler_groups: entry.bundler_groups.clone(),
@@ -3154,6 +3219,7 @@ pub fn scan_source_tree_with_threads_and_explicit_skips(
                                 &mut flush_buf.local_modules,
                                 use_cache,
                             ) {
+                                file_result.owners = owners.clone();
                                 // The file's own unique module list doubles as its
                                 // cache entry (no scan of the thread-wide map).
                                 let file_modules = std::mem::take(&mut file_result.modules);
@@ -3181,6 +3247,13 @@ pub fn scan_source_tree_with_threads_and_explicit_skips(
 
                     // Check if it's a script file (can be both — e.g. bin/setup is scannable + script)
                     if is_script {
+                        if !is_source && !owners.is_empty() {
+                            flush_buf.buf.push(FileResult {
+                                rel_path: rel_path_cow.to_string(),
+                                owners,
+                                ..FileResult::default()
+                            });
+                        }
                         if let Ok(content) = std::fs::read(path) {
                             flush_buf
                                 .script_buf
@@ -3210,8 +3283,12 @@ pub fn scan_source_tree_with_threads_and_explicit_skips(
     let mut bundler_groups: HashSet<String> = HashSet::new();
     let mut bundler_require_all = false;
     let mut storage_services: HashSet<String> = HashSet::new();
+    let mut file_owners = HashMap::new();
 
     for r in all_results {
+        if !r.owners.is_empty() {
+            file_owners.insert(r.rel_path.clone(), r.owners);
+        }
         storage_services.extend(r.storage_services);
         for req in &r.requires {
             requires
@@ -3255,6 +3332,7 @@ pub fn scan_source_tree_with_threads_and_explicit_skips(
         ScanResults {
             requires,
             modules,
+            file_owners,
             bundler_groups,
             bundler_require_all,
             script_files: all_script_files,
@@ -3550,6 +3628,7 @@ fn scan_file_bytes_with(
 
     Some(FileResult {
         rel_path,
+        owners: Vec::new(),
         requires,
         modules: file_modules,
         bundler_groups,
@@ -5265,6 +5344,53 @@ require 'data_only'
         let (results2, updates2) = scan_source_tree(dir.path(), &[], cache2);
         assert!(results2.requires.contains_key("cached_gem"));
         assert!(updates2.is_empty()); // all cache hits
+    }
+
+    #[test]
+    fn path_gem_ownership_is_recomputed_on_cache_hits() {
+        let dir = tempfile::tempdir().unwrap();
+        let gem_dir = dir.path().join("engines/foopath");
+        std::fs::create_dir_all(&gem_dir).unwrap();
+        std::fs::write(
+            gem_dir.join("foopath.rb"),
+            "require 'foopath/internal'\nmodule Foopath\nend\n",
+        )
+        .unwrap();
+        let gems = [GemEntry {
+            name: "foopath".into(),
+            source: Some(GemSource::Path(gem_dir)),
+            ..GemEntry::default()
+        }];
+        // Populate the content cache without a path source in the Gemfile.
+        let cache = Arc::new(crate::cache::FileCache::load(dir.path()));
+        let (_, updates) = scan_source_tree(dir.path(), &[], cache);
+        let mut cache = crate::cache::FileCache::load(dir.path());
+        for update in updates {
+            cache.put(update);
+        }
+        cache.save();
+
+        let cache = Arc::new(crate::cache::FileCache::load(dir.path()));
+        let (warm, updates) =
+            scan_source_tree_with_path_gems(dir.path(), &[], &[], cache, None, &gems);
+        assert!(updates.is_empty());
+        assert!(warm.file_is_owned_by("engines/foopath/foopath.rb", "foopath"));
+        let (cold, _) = scan_source_tree_with_path_gems(
+            dir.path(),
+            &[],
+            &[],
+            Arc::new(crate::cache::FileCache::disabled()),
+            None,
+            &gems,
+        );
+        assert_eq!(warm.file_owners, cold.file_owners);
+        assert_eq!(warm.requires, cold.requires);
+        assert_eq!(warm.modules, cold.modules);
+
+        let cache = Arc::new(crate::cache::FileCache::load(dir.path()));
+        let (without_path, updates) = scan_source_tree(dir.path(), &[], cache);
+        assert!(updates.is_empty());
+        assert!(without_path.file_owners.is_empty());
     }
 
     #[test]
