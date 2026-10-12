@@ -144,7 +144,7 @@ pub struct FileResult {
     pub modules: Vec<String>,
     pub bundler_groups: Vec<String>,
     pub bundler_require_all: bool,
-    /// Active Storage services named by `has_*_attached ..., service: :name`.
+    /// Active Storage services selected by config settings or attachment declarations.
     pub storage_services: Vec<String>,
 }
 
@@ -156,7 +156,7 @@ pub struct ScanResults {
     pub bundler_require_all: bool,
     /// Script file contents collected during the walk: (rel_path, content_bytes)
     pub script_files: Vec<(String, Vec<u8>)>,
-    /// Active Storage services selected by attachment declarations in code.
+    /// Active Storage services selected by config settings or attachment declarations.
     pub storage_services: HashSet<String>,
 }
 

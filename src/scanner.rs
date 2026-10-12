@@ -2870,6 +2870,60 @@ fn collect_attachment_services(bytes: &[u8], mask: &[u8], services: &mut Vec<Str
     }
 }
 
+fn collect_storage_config_services(bytes: &[u8], mask: &[u8], services: &mut Vec<String>) {
+    for start in memmem::find_iter(bytes, b"config") {
+        if is_skipped(mask, start)
+            || (start > 0
+                && (is_word_char(bytes[start - 1])
+                    || matches!(bytes[start - 1], b'.' | b':' | b'@' | b'$')))
+        {
+            continue;
+        }
+        let mut i = start;
+        let mut matched = true;
+        for token in [
+            b"config".as_slice(),
+            b".",
+            b"active_storage",
+            b".",
+            b"service",
+            b"=",
+        ] {
+            i = skip_whitespace(bytes, i);
+            if !bytes[i..].starts_with(token)
+                || (i..i + token.len()).any(|pos| is_skipped(mask, pos))
+            {
+                matched = false;
+                break;
+            }
+            i += token.len();
+        }
+        if !matched {
+            continue;
+        }
+        i = skip_whitespace(bytes, i);
+        if i >= bytes.len() || is_skipped(mask, i) {
+            continue;
+        }
+        if bytes[i] == b':' {
+            i += 1;
+            let start = i;
+            while i < bytes.len() && is_word_char(bytes[i]) && !is_skipped(mask, i) {
+                i += 1;
+            }
+            if i > start {
+                services.push(String::from_utf8_lossy(&bytes[start..i]).into_owned());
+                continue;
+            }
+        }
+        if let Some((name, _)) = extract_quoted(bytes, i) {
+            if !name.contains(&b'\\') && !name.windows(2).any(|pair| pair == b"#{") {
+                services.push(String::from_utf8_lossy(name).into_owned());
+            }
+        }
+    }
+}
+
 #[inline]
 fn skip_whitespace_inline(bytes: &[u8], mut i: usize) -> usize {
     while i < bytes.len() && matches!(bytes[i], b' ' | b'\t') {
@@ -3449,6 +3503,14 @@ fn scan_file_bytes_with(
 
     if is_ruby && ATTACHED_FINDER.find(bytes).is_some() {
         collect_attachment_services(bytes, &mask, &mut storage_services);
+    }
+    let rel = Path::new(&rel_path);
+    if is_ruby
+        && (rel == Path::new("config/application.rb")
+            || (rel.parent() == Some(Path::new("config/environments"))
+                && rel.extension().is_some_and(|ext| ext == "rb")))
+    {
+        collect_storage_config_services(bytes, &mask, &mut storage_services);
     }
 
     if has_ruby_scan_tokens {
@@ -5252,6 +5314,64 @@ require 'real_regex'
             "second scan should be served from cache"
         );
         assert!(second.storage_services.contains("amazon"));
+    }
+
+    #[test]
+    fn storage_config_services_are_collected_from_code_only() {
+        let input = br##"config.active_storage.service = :amazon
+config . active_storage . service =
+  "google"
+config.active_storage.service = :'quoted'
+config.active_storage.service = "dynamic_#{region}"
+# config.active_storage.service = :comment
+text = "config.active_storage.service = :string"
+text = <<~DOC
+config.active_storage.service = :heredoc
+DOC
+other_config.active_storage.service = :other
+object.config.active_storage.service = :receiver
+config.active_storage.service_name = :suffix
+config.active_storage.service == :comparison
+config.active_storage.service = # :comment_value
+  :after_comment
+text = "#{config.active_storage.service = :interpolation}"
+"##;
+        let mask = build_skip_mask(input, true, LineCommentKind::Hash);
+        let mut services = Vec::new();
+        collect_storage_config_services(input, &mask, &mut services);
+        assert_eq!(services, ["amazon", "google", "quoted", "interpolation"]);
+    }
+
+    #[test]
+    fn storage_config_services_survive_cache_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("config/environments");
+        std::fs::create_dir_all(&cfg).unwrap();
+        std::fs::write(
+            cfg.join("production.rb"),
+            "config.active_storage.service = :amazon\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("unrelated.rb"),
+            "config.active_storage.service = :unrelated\n",
+        )
+        .unwrap();
+        let cache = Arc::new(crate::cache::FileCache::load(dir.path()));
+        let (first, updates) = scan_source_tree(dir.path(), &[], cache);
+        assert_eq!(
+            first.storage_services,
+            HashSet::from(["amazon".to_string()])
+        );
+        let mut cache = crate::cache::FileCache::load(dir.path());
+        for update in updates {
+            cache.put(update);
+        }
+        cache.save();
+        let cache = Arc::new(crate::cache::FileCache::load(dir.path()));
+        let (second, updates) = scan_source_tree(dir.path(), &[], cache);
+        assert!(updates.is_empty(), "expected cache hits");
+        assert_eq!(second.storage_services, first.storage_services);
     }
 
     #[test]
