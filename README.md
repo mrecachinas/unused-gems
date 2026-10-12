@@ -6,7 +6,7 @@ High-performance scanner for unused gems in Ruby projects, built in Rust with [r
 
 - **Gemfile parsing** via ruby-prism AST — handles `gem`, `group`, `platforms`, `install_if`, `require:`, `path:`, `git:`/`github:`/custom `git_source`, `path`/`git`/`github`/`source` blocks, `eval_gemfile` and `gemspec` directives; `Gemfile` or `gems.rb`
 - **Parallel source scanning** with rayon — scans Ruby/ERB/HAML/YAML files concurrently
-- **Gem introspection** — discovers actual require paths and top-level module names from installed gems (rbenv, rvm, mise, asdf, chruby, GEM_PATH/GEM_HOME, BUNDLE_PATH, git checkouts), without letting namespace-extension folders or reopened constants claim other gems' usage
+- **Gem introspection** — discovers actual require paths and top-level module names from installed gems (rbenv, rvm, mise, asdf, chruby, GEM_PATH/GEM_HOME, BUNDLE_PATH, git checkouts), without letting namespace-extension folders or reopened constants claim other gems' usage. Lockfile versions and git revisions constrain introspection: a missing locked installation warns once per gem and falls back to curated metadata, heuristics and matching `vendor/cache` artifacts, never another installed version or stale checkout. Without a lockfile constraint, registry gems use the newest installed version.
 - **Script/CI detection** — finds gem usage in Makefiles, Dockerfiles, CI configs
 - **Lockfile analysis** — counts unique transitive dependencies from `Gemfile.lock` / `gems.locked`
 - **Monorepo support** — merge multiple explicit Gemfiles with one source scan
