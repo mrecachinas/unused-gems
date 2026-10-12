@@ -542,7 +542,14 @@ fn expand_source_path(value: &str, base_dir: &Path) -> PathBuf {
     } else {
         value.strip_prefix("~/")
     };
-    let path = match (home_relative, std::env::var_os("HOME")) {
+    let home = std::env::var_os("HOME").or_else(|| {
+        if cfg!(windows) {
+            std::env::var_os("USERPROFILE")
+        } else {
+            None
+        }
+    });
+    let path = match (home_relative, home) {
         (Some(rest), Some(home)) => PathBuf::from(home).join(rest),
         _ => PathBuf::from(value),
     };
@@ -1807,7 +1814,16 @@ gem "after_blocks"
 
     #[test]
     fn path_option_expands_home_directory() {
-        let home = std::env::var_os("HOME").map(PathBuf::from).unwrap();
+        let home = std::env::var_os("HOME")
+            .or_else(|| {
+                if cfg!(windows) {
+                    std::env::var_os("USERPROFILE")
+                } else {
+                    None
+                }
+            })
+            .map(PathBuf::from)
+            .unwrap();
         let gems = parse_gems("gem 'homegem', path: '~/src/homegem'\n");
         assert_eq!(
             find_gem(&gems, "homegem").source,
