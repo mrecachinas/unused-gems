@@ -199,6 +199,83 @@ fn status_of(results: &BTreeMap<String, (String, Vec<String>)>, gem: &str) -> St
 }
 
 #[test]
+fn missing_locked_sources_do_not_supply_usage_evidence_and_warn_once() {
+    for git in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let source = if git {
+            ", git: 'https://example.test/locked_probe.git'"
+        } else {
+            ""
+        };
+        write(
+            &root.join("Gemfile"),
+            &format!("gem 'locked_probe', require: false{source}\n"),
+        );
+        write(&root.join(".bundle/config"), "BUNDLE_PATH: vendor/bundle\n");
+        let installed = root.join("vendor/bundle/gems/locked_probe-1.0.0/lib");
+        write(
+            &installed.join("legacy_thing.rb"),
+            "module LegacyThing; end\n",
+        );
+        write(
+            &installed.join("locked_probe.rb"),
+            "module LegacyThing; end\n",
+        );
+        if git {
+            let checkout = root.join("vendor/bundle/bundler/gems/locked_probe-aaaaaaaaaaaa");
+            write(
+                &checkout.join("lib/legacy_thing.rb"),
+                "module LegacyThing; end\n",
+            );
+            write(
+                &checkout.join("lib/locked_probe.rb"),
+                "module LegacyThing; end\n",
+            );
+            write(&checkout.join("locked_probe.gemspec"), "");
+        }
+        write(
+            &root.join("app/probe.rb"),
+            "require 'legacy_thing'\nLegacyThing.call\n",
+        );
+        for constrained in [false, true] {
+            if constrained {
+                let lock = if git {
+                    "GIT\n  remote: https://example.test/locked_probe.git\n  revision: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n  specs:\n    locked_probe (1.0.0)\n"
+                } else {
+                    "GEM\n  specs:\n    locked_probe (2.0.0)\n"
+                };
+                write(&root.join("Gemfile.lock"), lock);
+            }
+            let output = Command::new(env!("CARGO_BIN_EXE_unused-gems"))
+                .args(["--output", "json", "--no-cache", "--quiet"])
+                .arg(root)
+                .output()
+                .unwrap();
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert_eq!(
+                output.status.code(),
+                Some(i32::from(constrained)),
+                "git={git}, constrained={constrained}: {stderr}"
+            );
+            let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(
+                json["results"][0]["status"],
+                if constrained { "unused" } else { "used" },
+                "git={git}, constrained={constrained}"
+            );
+            assert_eq!(
+                stderr
+                    .matches("Warning: locked artifact for gem 'locked_probe'")
+                    .count(),
+                usize::from(constrained),
+                "{stderr}"
+            );
+        }
+    }
+}
+
+#[test]
 fn nested_eval_gemfile_context_and_resolution() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();

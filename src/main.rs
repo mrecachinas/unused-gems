@@ -341,6 +341,17 @@ fn main() {
         &lockfile_paths,
         &mut gem_index,
     );
+    for gem in &gems {
+        if !gem_index.contains_key(&gem.name)
+            && !lockfile.artifacts(&gem.name).is_empty()
+            && !matches!(gem.source, Some(types::GemSource::Path(_)))
+        {
+            eprintln!(
+                "Warning: locked artifact for gem '{}' is not installed; falling back to curated metadata, heuristics and vendor/cache",
+                gem.name
+            );
+        }
+    }
     // Attachment `service:` symbols come from the parallel source walk.
     let storage_adapters = timed!(
         "scan_storage_adapters",

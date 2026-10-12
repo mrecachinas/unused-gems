@@ -911,6 +911,9 @@ fn select_gem_artifact(
             return Some(path.clone());
         }
     }
+    if !lockfile.artifacts(gem_name).is_empty() {
+        return None;
+    }
 
     candidates.into_iter().max_by(|a, b| {
         let a_name = candidate_full_name(a).unwrap_or_default();
@@ -959,6 +962,12 @@ pub fn index_declared_gem_sources(
                         read_locked_git_sources(lockfile_paths),
                     )
                 });
+                if locked
+                    .get(&gem.name)
+                    .is_some_and(|source| !source.revision.is_empty())
+                {
+                    index.remove(&gem.name);
+                }
                 if let Some(path) = find_git_checkout(roots, &gem.name, url, locked.get(&gem.name))
                 {
                     index.insert(gem.name.clone(), path);
@@ -1069,7 +1078,7 @@ fn is_checkout_suffix(suffix: &str) -> bool {
 /// after the repository, not the gem, and one repo may hold several gems
 /// (rails/activesupport/activesupport.gemspec), so candidates are matched by
 /// repo basename (lockfile remote, Gemfile URL, gem name) with a hex suffix,
-/// preferring the locked revision, then resolved to the dir holding
+/// requiring the locked revision when present, then resolved to the dir holding
 /// `<gem>.gemspec`. As a last resort every checkout is searched for it.
 fn find_git_checkout(
     roots: &[PathBuf],
@@ -1097,7 +1106,15 @@ fn find_git_checkout(
     for root in roots {
         if let Ok(entries) = std::fs::read_dir(root) {
             for entry in entries.flatten() {
-                if entry.path().is_dir() {
+                let matches_revision = revision.is_empty()
+                    || entry
+                        .file_name()
+                        .to_string_lossy()
+                        .rsplit_once('-')
+                        .is_some_and(|(_, suffix)| {
+                            is_checkout_suffix(suffix) && revision.starts_with(suffix)
+                        });
+                if entry.path().is_dir() && matches_revision {
                     checkouts.push(entry.path());
                 }
             }
@@ -1105,28 +1122,25 @@ fn find_git_checkout(
     }
     checkouts.sort();
 
-    let mut matching: Vec<(bool, &PathBuf)> = checkouts
+    let matching: Vec<&PathBuf> = checkouts
         .iter()
         .filter_map(|path| {
             let dir_name = path.file_name()?.to_string_lossy().to_string();
-            let suffix = basenames.iter().find_map(|base| {
+            basenames.iter().find_map(|base| {
                 dir_name
                     .strip_prefix(base.as_str())
                     .and_then(|rest| rest.strip_prefix('-'))
                     .filter(|suffix| is_checkout_suffix(suffix))
             })?;
-            let locked_rev = !revision.is_empty() && revision.starts_with(suffix);
-            Some((locked_rev, path))
+            Some(path)
         })
         .collect();
-    // Locked revision first; otherwise keep sorted (deterministic) order.
-    matching.sort_by_key(|(locked_rev, _)| !locked_rev);
-    for (_, checkout) in &matching {
+    for checkout in &matching {
         if let Some(dir) = gem_dir_in_checkout(checkout, gem_name) {
             return Some(dir);
         }
     }
-    for (_, checkout) in &matching {
+    for checkout in &matching {
         if looks_like_gem_source(checkout) {
             return Some((*checkout).clone());
         }
@@ -2368,6 +2382,32 @@ mod tests {
     }
 
     #[test]
+    fn missing_locked_artifact_is_not_replaced_by_installed_or_cached_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let gems_dir = dir.path().join("gems");
+        let cache_dir = dir.path().join("vendor/cache");
+        std::fs::create_dir_all(gems_dir.join("versioned-1.0.0")).unwrap();
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        std::fs::write(cache_dir.join("versioned-1.0.0.gem"), "").unwrap();
+        std::fs::write(
+            dir.path().join("Gemfile.lock"),
+            "GEM\n  specs:\n    versioned (2.0.0)\n",
+        )
+        .unwrap();
+        let lockfile = crate::lockfile::parse_gemfile_lock(dir.path());
+
+        let installed =
+            build_gem_index_for_lock(&[dir.path().to_path_buf()], &lockfile, Some("ruby"));
+        let cached = build_vendor_cache_path_index_for_lock(dir.path(), &lockfile, Some("ruby"));
+        assert!(!installed.contains_key("versioned"));
+        assert!(!cached.contains_key("versioned"));
+
+        std::fs::write(cache_dir.join("versioned-2.0.0.gem"), "").unwrap();
+        let cached = build_vendor_cache_path_index_for_lock(dir.path(), &lockfile, Some("ruby"));
+        assert_eq!(cached["versioned"], cache_dir.join("versioned-2.0.0.gem"));
+    }
+
+    #[test]
     fn build_gem_index_prefers_normalized_locked_native_then_ruby_artifact() {
         let dir = tempfile::tempdir().unwrap();
         let gems_dir = dir.path().join("gems");
@@ -2601,6 +2641,52 @@ PLATFORMS
         let lockfile = crate::lockfile::lockfile_path_for(&project.join("gems.rb"));
         let mut index = HashMap::new();
         index_declared_gem_sources(&project, &gems, &[gem_home], &[lockfile], &mut index);
+        assert_eq!(index["foo"], locked);
+    }
+
+    #[test]
+    fn missing_locked_git_checkout_does_not_use_stale_or_registry_sources() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Gemfile.lock"),
+            "GIT\n  remote: https://github.com/acme/foo.git\n  revision: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n  specs:\n    foo (1.0.0)\n",
+        )
+        .unwrap();
+        let home = dir.path().join("gem_home");
+        let checkouts = home.join("bundler/gems");
+        for path in [
+            home.join("gems/foo-1.0.0"),
+            checkouts.join("foo-aaaaaaaaaaaa"),
+            checkouts.join("other-cccccccccccc"),
+        ] {
+            std::fs::create_dir_all(path.join("lib")).unwrap();
+            std::fs::write(path.join("foo.gemspec"), "").unwrap();
+        }
+        let gems = vec![git_gem("foo", "https://github.com/acme/foo.git")];
+        let lockfile = crate::lockfile::parse_gemfile_lock(dir.path());
+        let mut index =
+            build_gem_index_for_lock(std::slice::from_ref(&home), &lockfile, Some("ruby"));
+        assert!(!index.contains_key("foo"));
+        index.insert("foo".into(), home.join("gems/foo-1.0.0"));
+        index_declared_gem_sources(
+            dir.path(),
+            &gems,
+            std::slice::from_ref(&home),
+            &[dir.path().join("Gemfile.lock")],
+            &mut index,
+        );
+        assert!(!index.contains_key("foo"));
+
+        let locked = checkouts.join("other-bbbbbbbbbbbb");
+        std::fs::create_dir_all(locked.join("lib")).unwrap();
+        std::fs::write(locked.join("foo.gemspec"), "").unwrap();
+        index_declared_gem_sources(
+            dir.path(),
+            &gems,
+            &[home],
+            &[dir.path().join("Gemfile.lock")],
+            &mut index,
+        );
         assert_eq!(index["foo"], locked);
     }
 
