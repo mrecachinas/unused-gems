@@ -11,11 +11,11 @@ const DEFAULT_DEVELOPMENT_GROUP: &str = "development";
 /// Returns `<dir>/Gemfile` when neither exists so callers report that name.
 pub fn default_gemfile_path(dir: &Path) -> PathBuf {
     let gemfile = dir.join("Gemfile");
-    if gemfile.is_file() {
+    if gemfile.exists() {
         return gemfile;
     }
     let gems_rb = dir.join("gems.rb");
-    if gems_rb.is_file() {
+    if gems_rb.exists() {
         return gems_rb;
     }
     gemfile
@@ -107,7 +107,8 @@ enum ScopeSource {
 fn eval_gemfile_file(ctx: &mut ParseCtx, path: &Path, scope: &DslScope) {
     let path = lexical_normalize(path);
     if !path.is_file() {
-        return;
+        eprintln!("Error: Gemfile {} is not a regular file", path.display());
+        std::process::exit(2);
     }
 
     let key = dedupe_key(&path);
@@ -131,12 +132,21 @@ fn eval_gemfile_file(ctx: &mut ParseCtx, path: &Path, scope: &DslScope) {
     let source = match std::fs::read(&path) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("Warning: Could not read Gemfile {}: {}", path.display(), e);
-            return;
+            eprintln!("Error: Could not read Gemfile {}: {}", path.display(), e);
+            std::process::exit(2);
         }
     };
 
     let parse_result = ruby_prism::parse(&source);
+    if let Some(error) = parse_result.errors().next() {
+        eprintln!(
+            "Error: Could not parse Gemfile {}:{}: {}",
+            path.display(),
+            line_of(&source, error.location().start_offset()),
+            error.message()
+        );
+        std::process::exit(2);
+    }
     let base_dir = path
         .parent()
         .map(Path::to_path_buf)
@@ -344,7 +354,7 @@ impl GemfileVisitor<'_, '_> {
             }
         };
 
-        if !target.is_file() {
+        if !target.exists() {
             eprintln!(
                 "Warning: eval_gemfile target {} (from {}) does not exist — ignored",
                 target.display(),
