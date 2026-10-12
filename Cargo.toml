@@ -2,7 +2,11 @@
 name = "unused-gems"
 version = "0.2.0"
 edition = "2021"
+rust-version = "1.88"
 description = "High-performance scanner for unused gems in Ruby projects"
+
+[lib]
+path = "src/lib.rs"
 
 [dependencies]
 ruby-prism = "1"

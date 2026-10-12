@@ -59,7 +59,7 @@ tar xzf "unused-gems-$TARGET.tar.gz" && sudo mv unused-gems /usr/local/bin/
 
 ### From source
 
-Requires [Rust](https://www.rust-lang.org/tools/install) 1.70+.
+Requires [Rust](https://www.rust-lang.org/tools/install) 1.88+ (the MSRV tested in CI).
 
 ```bash
 cargo install --path .

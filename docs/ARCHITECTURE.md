@@ -56,10 +56,11 @@ Set `BENCH=1` to print the duration of every `timed!` stage.
 
 ## Module map
 
-All modules live flat under `src/` and are function-based (no traits).
+All modules live flat under `src/` and are function-based (no traits). They are exposed by the `unused_gems` library in `src/lib.rs`; `main.rs`, integration tests and benchmarks import that library instead of recompiling the modules.
 
 | Module | Responsibility |
 |---|---|
+| `lib.rs` | Library root exporting every module below |
 | `main.rs` | CLI (clap), pipeline orchestration, Rails config scanners, exit codes |
 | `types.rs` | Shared types: `GemEntry`, `GemDeclaration`, `ScanResults`, `GemResult`, `Evidence` |
 | `gemfile.rs` | Gemfile / `gems.rb` / gemspec parsing via the ruby-prism AST |
@@ -371,18 +372,23 @@ cargo bench -- --save-baseline main
 cargo bench -- --baseline main   # after a change
 ```
 
+The end-to-end benchmark runs the binary from `UNUSED_GEMS_BIN` when set; otherwise it looks in `$CARGO_TARGET_DIR/release` or `<manifest>/target/release`, with the platform's executable suffix. Set `UNUSED_GEMS_BIN` for other profiles, cross-compilation, or target directories configured only through Cargo config files.
+
 ## Testing
+
+Rust 1.88 is the MSRV; CI builds and tests the locked dependencies on that toolchain.
 
 ```bash
 cargo test                           # everything
-cargo test --test byte_scanner_test  # byte scanners vs. regex baselines
+cargo test --test byte_scanner_test  # production scanner vs. regex oracles
 cargo test --test accuracy           # end-to-end fixtures
 ```
 
 | Suite | Covers |
 |---|---|
-| `tests/byte_scanner_test.rs` | Byte scanners agree with regex baselines |
+| `tests/byte_scanner_test.rs` | Production scanner compared with regex oracles; intentional differences (lexical filtering, Bundler semantics) asserted explicitly |
 | `tests/accuracy.rs` | End-to-end fixtures in `tests/accuracy_fixtures/` (see its README) |
 | `tests/gemfile_semantics.rs` | Bundler-compatible Gemfile behavior |
 | `tests/script_formats.rs` | Script and CI format detection |
+| `tests/benchmark_path.rs` | Benchmark binary path resolution |
 | Unit tests | Edge cases per module: inline comments, heredocs, YAML comments, group handling, gemspec detection |
