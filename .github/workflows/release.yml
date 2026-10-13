@@ -84,8 +84,13 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.ref_name }}
         run: |
-          gh release create "$TAG" \
+          if ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "$TAG" \
+              --generate-notes
+          fi
+          gh release upload "$TAG" \
             --repo "$GITHUB_REPOSITORY" \
-            --title "$TAG" \
-            --generate-notes \
+            --clobber \
             unused-gems-*.tar.gz unused-gems-*.zip
