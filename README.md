@@ -176,4 +176,6 @@ cargo test
 BENCH=1 cargo run -- path/to/project   # per-stage timings
 ```
 
+A [dev container](.devcontainer/devcontainer.json) (VS Code, Codespaces) ships stable Rust with clippy/rustfmt, the 1.88.0 MSRV toolchain (`cargo +1.88.0 build --locked`), the libclang that `ruby-prism`'s bindgen build needs, and Ruby + Bundler for scanning real projects. `target/` lives on a container volume.
+
 Architecture, module map and detailed semantics live in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
